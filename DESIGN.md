@@ -670,3 +670,70 @@ return {
 4. **Change 1** — plugin embedded, `state_file.rs`, discovery merge, activity rule. Verify live: trigger a permission prompt, see `WAIT:perm`, reply, see it clear.
 5. **Change 3** — `local` preset, footer, remove `v S`.
 6. **Change 6** — `fleet setup`; README + DESIGN updated; one commit per change.
+
+# fleet v0.3 — close a task
+
+**Settled:** works on any worktree (by task, folder, branch, tmux session or path) · removes agents, tmux, worktree, *local* branch, registry task, rename symlinks; remote branches untouched · refuses when something would be lost, `--force` overrides · all-or-nothing with rollback, irreversible steps last · TUI confirm popup listing everything, force only when blocked.
+
+## Background (terms used below)
+
+- **Task**: a git worktree + its branch + a tmux session (agent pane, nvim, shells) + agent processes + a registry row (fleet-started tasks only) + rename symlinks (left at old paths by `fleet agent rename`).
+- **Transaction**: an ordered list of steps that either all happen, or the ones done are undone in reverse order when a later one fails.
+- **Blocker**: something `close` would lose; it refuses unless `--force`.
+
+# SECTION 1 — Decisions
+
+## Q1. Level: **Decided: close acts on the whole task, from any row.**
+`fleet worktree close TARGET` (alias `fleet close`); TUI `w x` on a worktree, agent, session or pane row closes that row's task. A destructive key must not change meaning with the cursor position. `fleet agent stop` (`a x`) and tmux kill (`K`) stay the narrow verbs. The old `w D` (bare `git worktree remove`, leaving branch, session and registry row behind) is replaced by `w x`. A review row with several local worktrees asks you to select one.
+
+## Q2. Closing from inside the task: **Decided: the pane/session/agent hosting `fleet` is killed last.**
+`fleet` walks its own parent processes; a step whose target hosts it is ranked after everything else, and the summary is logged before it runs. So `fleet close` typed in the task's own session works, and an agent can close its own task with `--force --yes`.
+
+## Q3. "Would be lost" commits: **Decided: commits reachable from no remote branch, no tag and no other local branch; a merged review downgrades them to a note.**
+`git rev-list HEAD --not --exclude=<own branch> --branches --remotes --tags`. Today's gc rule (`ahead > 0`) misses a branch that was never pushed (no upstream ⇒ ahead = 0). Counting other local branches too means commits already merged into a local `main` are not "lost". A merged MR/PR (squash merge leaves the branch commits on no remote) is a note, not a blocker. gc uses the same rule, so it no longer removes a detached `$TMPDIR` worktree holding the only copy of a commit.
+
+# SECTION 2 — Changes
+
+## Change 1 🔴 Transaction engine (`cmd/txn.rs`), shared by close and gc
+
+`Step` carries everything its undo needs (captured at plan time); `Step::rank` is the one place the order lives; `Txn::new` sorts by it; `apply(txn, exec, log)` runs steps, and on the first failure undoes the done reversible steps in reverse, returning a `TxnReport` (done, failed, rolled_back with per-step errors, not_restorable). `Exec` is a trait: `Real` (git, tmux, registry, fs, signals) and a fake in tests. Running a step whose target is already gone succeeds (re-runs are safe).
+
+| # | Step | Runs | Undo on a later failure | Cannot be restored |
+|---|---|---|---|---|
+| 1 | close registry task(s) | `closed_at = now` | reopen (`closed_at = NULL`) | — |
+| 2 | remove rename symlink(s) | `rm` | re-create the link | — |
+| 3 | stop agent(s) (only reached with `--force`) | kill its tmux pane (SIGHUP), else SIGTERM; SIGKILL after 5 s; waits for exit | none | the process; the conversation resumes with `opencode -s <session>` |
+| 4 | remove worktree | `git worktree remove [-f [-f]]` (`-f` only when forced and dirty, `-f -f` when forced and locked) | `git worktree add <path> <branch>` / `--detach <sha>` | with `--force`: uncommitted and untracked files; always: ignored files (build output) |
+| 5 | delete local branch | `git branch -D` (gc: `-d`, a refusal is fine) | `git branch <b> <sha>` + `--set-upstream-to` | — |
+| 6 | kill tmux | `kill-session` when every pane is in the worktree or it is the task's registered session, else `kill-pane` per pane | none | scrollback, unsaved editor buffers |
+| 7 | kill what hosts `fleet` (Q2) | as 3 / 6 | never needed: nothing runs after it | as 3 / 6 |
+
+Why this order: cheap reversible steps first, so most failures happen before anything is lost; agents stopped before their folder goes, so nothing writes into it; worktree before branch because git refuses to delete a checked-out branch; tmux kills are the only irreversible step of a normal close, so they come last. A future `--remote` adds `DeleteRemoteBranch` right after step 5 (`CloseOpts` has the seam).
+
+If an undo itself fails, the report says *rollback incomplete* and lists what is left in which state (exit 1). Proven end-to-end: a `reference-transaction` hook refusing the branch delete makes close fail at step 5 and restore steps 4, 2, 1 with the tmux session untouched.
+
+## Change 2 🔴 `cmd/close.rs`: resolve → gather → plan → apply
+
+- **resolve**: a path (any folder inside a worktree, or a rename symlink; any repo: `git rev-parse --git-common-dir` finds the main clone, configured or not), else a registry slug, worktree folder name, branch or tmux session. Several matches → error listing them (the cwd's project breaks ties).
+- **gather** (all reads): porcelain entry (full sha, branch, upstream, lock), `git status --porcelain`, commits only here (Q3), merged review from the snapshot, whether the branch must stay (project base, or checked out elsewhere), registry tasks for the path or any old path, agents and panes inside the worktree (not inside a nested one), sessions (whole or shared), the ancestors of this process. When git no longer lists the worktree but a registry task remains (an earlier close stopped after step 4), it finishes the job.
+- **plan** (pure, unit-tested): refuses the main clone (even forced); blockers = dirty, commits only here, running agents, lock; steps per the table; notes (merged review, branch kept, folder already gone, own session last, remote untouched). `ClosePlan::forced()` re-plans from the stored facts (the popup's `F`).
+- **apply**: gathers and plans again; refuses when blocked, and when the steps differ from what you confirmed ("changed since you confirmed, nothing was done").
+
+## Change 3 🟠 gc on the same planner
+
+Each `gc_verdict = yes` worktree goes through `close::plan(force: false, gc: true)`: blocked plans become `blocked`, others become one transaction (labelled with the gc reason). Orphans keep small transactions: a session whose cwd is gone, a task whose worktree is gone (+ its links), links of a task whose agent is gone. Transactions apply independently. `fleet worktree gc --json` is now `{txns: [{label, steps: [{kind, …}]}], blocked}` (was `{actions}`); the gc popup toggles per transaction. `git worktree prune` (which pruned every stale entry of the repo) is no longer used: `git worktree remove` on a missing folder drops just that entry.
+
+## Change 4 🟠 CLI and TUI
+
+- `fleet worktree close TARGET [--force] [--yes] [--json]`, alias `fleet close`: prints the steps with their undo, notes, and (forced) what will be lost; blocked → the refusal with every file/commit/agent, exit 1; TTY → `[y/N]`; no TTY and no `--yes` → dry run. On failure: the failed step, what was rolled back, what could not be, exit 1.
+- TUI `w x` (`worktree.close`): the plan is built in a background task and opens a popup (border yellow when blocked, red when forced). Blocked: `Enter` does nothing, `F` arms force; then `Enter` closes. `fleet agent stop` now waits for the agent to exit (same routine as step 3).
+
+## Tests
+
+Unit: planner (order, each blocker with exact contents, force, merged note, main clone, kept branch, detached restore, missing folder, half-finished re-run, shared session, own session/agent last, lock), name resolution, transaction rollback at every failure index and a failing undo, registry reopen and old-path lookup, porcelain `locked`, popup keys. End-to-end: `scripts/e2e-close.sh` (42 checks; scratch repo + bare origin under `/tmp`, isolated registry, opencode data dir and tmux server, a stub `opencode` binary).
+
+## Known gaps
+
+- No on-disk journal: if `fleet` itself is killed mid-transaction, nothing is rolled back; re-running `close` finishes the job (every step is idempotent and a half-closed task is still resolvable through its registry row).
+- A locked worktree is re-added unlocked by a rollback.
+- Remote branches are never deleted (future `--remote`).

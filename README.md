@@ -76,6 +76,7 @@ fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--mode plan|build] [--no-
 fleet agent list | attach NAME | send NAME TEXT | rename OLD NEW | stop NAME
 fleet review list [--source S] | review start ID|URL        (re-review when it already exists)
 fleet worktree list | worktree gc [--yes]                   (dry run first)
+fleet worktree close TARGET [--force] [--yes] [--json]      (alias: fleet close; TARGET = task, folder, branch, session or path)
 fleet project list | project add [PATH] [--name N] [--reviews S] [--worktrees DIR] [--base B]
 fleet tmux list
 fleet setup [--remove|--check] | config [--init] | keys
@@ -91,6 +92,28 @@ fleet setup [--remove|--check] | config [--init] | keys
 (`fix/sfs-content-type`), moves the worktree, leaves a symlink at the old path
 while the agent is alive (opencode keeps absolute paths), renames the tmux
 session and updates the registry. With a name, everything is named up front.
+
+### Close a task
+
+`fleet close feat-x` (or `w x` on any row of that task in the TUI) finishes a task and removes
+everything that belonged to it, in this order: close the registry task, remove rename symlinks,
+stop its agents, `git worktree remove`, delete the **local** branch, kill its tmux panes/sessions
+(a session that also has panes elsewhere loses only the task's panes). Remote branches are not
+touched. It works on any worktree, fleet-started or not; the target is a task name, folder name,
+branch, tmux session or path.
+
+It **refuses** (exit 1, nothing changed) and lists exactly what would be lost when the worktree
+has uncommitted or untracked files, commits that are on no remote branch, tag or other local
+branch, a running agent, or a `git worktree lock`. A merged MR/PR turns "commits only here" into
+a note (squash merges leave them behind). `--force` closes anyway. The main clone is never
+closed. Without `--yes` it asks; without a terminal it is a dry run.
+
+All-or-nothing: if a step fails, the steps already done are undone in reverse (task reopened,
+symlink re-created, worktree re-added from its branch, branch re-created at its old commit) and
+fleet says what it could not restore: a stopped agent (its conversation resumes with
+`opencode -s <session>`), killed tmux panes, and with `--force` the uncommitted files. Ignored
+files (build output) go with the folder. Run inside the task's own tmux session, fleet kills that
+session last. A re-run finishes a close that was interrupted (crash, kill) half-way.
 
 ### tmux status bar
 
@@ -125,7 +148,7 @@ foldable section per project plus "outside projects". `:project [name|all]` and 
 | `:` | run any `fleet …` subcommand, or `:project X` |
 | `g a/t/w/v` | this row in Agents / Tmux / Worktrees / Reviews |
 | `a a/s/m/n/x/o/c` | agent: attach, start, message, rename, stop, open plan, copy plan |
-| `w s/p/P/D/g/c/o` | worktree: shell, push -u, pull --ff-only, remove, gc, columns, open review |
+| `w s/p/P/x/g/c/o` | worktree: shell, push -u, pull --ff-only, close task (popup lists every step and blocker; `F` forces), gc, columns, open review |
 | `v o/c/r/w/a/f` | review: open, copy, review/re-review, worktrees, agents, filter preset (all/local/mine/others/needs-me/failed) |
 | `K`, `n` (Tmux) | kill / rename session |
 
