@@ -4,7 +4,7 @@ pub mod db;
 pub mod http;
 pub mod plannotator;
 
-use super::{AgentAdapter, LaunchSpec, SendTarget};
+use super::{AgentAdapter, DiscoverCtx, LaunchSpec, SendTarget};
 use crate::model::{Activity, AgentRow};
 use crate::procs::{canon, ProcTable};
 use crate::tmux;
@@ -26,6 +26,29 @@ impl Default for OpenCode {
             session_window_secs: 14 * 86_400,
         }
     }
+}
+
+/// Pick the session for one process: the one whose title matches the hint (a tmux pane
+/// title like `OC | Review MR 514…`, possibly truncated), else the newest in the directory.
+pub fn pick_session<'a>(
+    candidates: &[&'a db::DbSession],
+    hint: Option<&str>,
+) -> Option<&'a db::DbSession> {
+    if let Some(h) = hint {
+        let h = h
+            .strip_prefix("OC | ")
+            .unwrap_or(h)
+            .trim_end_matches('…')
+            .trim();
+        if !h.is_empty() {
+            if let Some(s) = candidates.iter().find(|s| {
+                s.title.starts_with(h) || h.starts_with(s.title.as_str()) && !s.title.is_empty()
+            }) {
+                return Some(s);
+            }
+        }
+    }
+    candidates.first().copied()
 }
 
 /// Pure: turn the facts about one process into an `AgentRow`.
@@ -82,11 +105,8 @@ impl AgentAdapter for OpenCode {
         name == "opencode"
     }
 
-    async fn discover(
-        &self,
-        procs: &ProcTable,
-        known_ports: &HashMap<u32, u16>,
-    ) -> Result<Vec<AgentRow>> {
+    async fn discover(&self, procs: &ProcTable, ctx: &DiscoverCtx) -> Result<Vec<AgentRow>> {
+        let known_ports = &ctx.known_ports;
         let pids: Vec<u32> = procs.named("opencode").iter().map(|p| p.pid).collect();
         if pids.is_empty() {
             return Ok(vec![]);
@@ -98,10 +118,10 @@ impl AgentAdapter for OpenCode {
             .await
             .map_err(|e| anyhow::anyhow!("db task: {e}"))??;
 
-        // Newest session per canonical directory.
-        let mut by_dir: HashMap<PathBuf, &db::DbSession> = HashMap::new();
+        // Sessions per canonical directory, newest first.
+        let mut by_dir: HashMap<PathBuf, Vec<&db::DbSession>> = HashMap::new();
         for s in &sessions {
-            by_dir.entry(canon(&s.directory)).or_insert(s);
+            by_dir.entry(canon(&s.directory)).or_default().push(s);
         }
 
         let ports = plannotator::listening_ports(&pids).await;
@@ -130,7 +150,10 @@ impl AgentAdapter for OpenCode {
                 .and_then(|p| p.cwd.clone())
                 .map(|c| canon(&c))
                 .unwrap_or_default();
-            let session = by_dir.get(&cwd).copied();
+            let session = pick_session(
+                by_dir.get(&cwd).map(Vec::as_slice).unwrap_or(&[]),
+                ctx.title_hints.get(&pid).map(String::as_str),
+            );
             let mut plan = None;
             let mut port = known_ports.get(&pid).copied();
             for (p_pid, p, pl, is_oc) in &probe_results {
@@ -280,6 +303,31 @@ mod tests {
             row_from_facts(1, "/w".into(), None, None, None, None).activity,
             Activity::Idle
         );
+    }
+
+    #[test]
+    fn picks_session_by_pane_title() {
+        let mut a = sess(true, None);
+        a.id = "a".into();
+        a.title = "Review GitLab MR 536 in monid-services".into();
+        let mut b = sess(true, None);
+        b.id = "b".into();
+        b.title = "Multi-Agent Orchestration for Local Worktrees".into();
+        let c = [&a, &b];
+        assert_eq!(
+            pick_session(&c, Some("OC | Multi-Agent Orchestration for Local W…"))
+                .unwrap()
+                .id,
+            "b"
+        );
+        assert_eq!(
+            pick_session(&c, Some("OC | Review GitLab MR 536 in monid-services"))
+                .unwrap()
+                .id,
+            "a"
+        );
+        assert_eq!(pick_session(&c, Some("mac")).unwrap().id, "a");
+        assert_eq!(pick_session(&c, None).unwrap().id, "a");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Run every collector, join, return a `Fleet`. Reviews are cached for `review_ttl_secs`
 //! and refreshed in the background so the UI never waits on the forge.
 
-use crate::agents::{self, AgentAdapter};
+use crate::agents::{self, AgentAdapter, DiscoverCtx};
 use crate::config::Config;
 use crate::join::{self, Inputs};
 use crate::model::{Fleet, ReviewRow, WorktreeRow};
@@ -115,7 +115,9 @@ impl Engine {
         let mut warnings = vec![];
         let procs = tokio::task::spawn_blocking(ProcTable::snapshot).await.ok();
 
-        let panes_f = tmux::list_panes();
+        // Panes are needed both by the join and (as title hints) by the agent adapters.
+        let panes_for_hints = tmux::list_panes().await.unwrap_or_default();
+        let panes_f = async { Ok::<_, anyhow::Error>(panes_for_hints.clone()) };
         let worktrees_f = async {
             let mut all: Vec<WorktreeRow> = vec![];
             let mut errs = vec![];
@@ -131,9 +133,14 @@ impl Engine {
             let mut all = vec![];
             let mut errs = vec![];
             if let Some(p) = procs.as_ref() {
-                let known = self.known_ports(p).await;
+                let known_ports = self.known_ports(p).await;
+                let title_hints = title_hints(p, &panes_for_hints).await;
+                let ctx = DiscoverCtx {
+                    known_ports,
+                    title_hints,
+                };
                 for a in &self.agent_adapters {
-                    match a.discover(p, &known).await {
+                    match a.discover(p, &ctx).await {
                         Ok(v) => all.extend(v),
                         Err(e) => errs.push(format!("{}: {e}", a.name())),
                     }
@@ -249,6 +256,18 @@ impl Engine {
         self.reviews.lock().await.fetched_instant = None;
         self.fetch_reviews().await;
     }
+}
+
+/// `pid -> pane title` for every agent process whose ancestor is a tmux pane shell.
+async fn title_hints(procs: &ProcTable, panes: &[crate::model::PaneRow]) -> HashMap<u32, String> {
+    let by_pid: HashMap<u32, usize> = panes.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
+    let mut out = HashMap::new();
+    for p in procs.named("opencode") {
+        if let Some(i) = procs.ancestor_in(p.pid, &by_pid) {
+            out.insert(p.pid, panes[i].title.clone());
+        }
+    }
+    out
 }
 
 async fn fetch_all(

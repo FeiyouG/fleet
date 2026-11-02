@@ -22,7 +22,7 @@ fn main() {
         .unwrap();
     println!("git: {:?} ({} wts)", t.elapsed(), w.len());
     let t = Instant::now();
-    let known = std::collections::HashMap::new();
+    let known = fleet_core::agents::DiscoverCtx::default();
     let oc = fleet_core::agents::opencode::OpenCode::default();
     use fleet_core::agents::AgentAdapter;
     let a = rt.block_on(oc.discover(&p, &known)).unwrap();

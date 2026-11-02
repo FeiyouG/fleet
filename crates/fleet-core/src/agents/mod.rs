@@ -19,6 +19,13 @@ pub struct LaunchSpec {
     pub extra_args: Vec<String>,
 }
 
+/// Extra facts the engine knows that help an adapter identify its sessions.
+#[derive(Debug, Default, Clone)]
+pub struct DiscoverCtx {
+    pub known_ports: HashMap<u32, u16>,
+    pub title_hints: HashMap<u32, String>,
+}
+
 /// Where to deliver a message.
 #[derive(Debug, Clone)]
 pub enum SendTarget {
@@ -32,13 +39,11 @@ pub enum SendTarget {
 pub trait AgentAdapter: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// Every running agent of this adapter. `ports` = registry-known `pid -> port` for
-    /// fleet-started agents (lets the adapter use the HTTP API).
-    async fn discover(
-        &self,
-        procs: &ProcTable,
-        known_ports: &HashMap<u32, u16>,
-    ) -> Result<Vec<AgentRow>>;
+    /// Every running agent of this adapter. `ctx.known_ports` = registry-known `pid -> port`
+    /// for fleet-started agents (lets the adapter use the HTTP API); `ctx.title_hints` =
+    /// `pid -> text` naming the session (the tmux pane title), used to pick the right
+    /// session when several agents share one directory.
+    async fn discover(&self, procs: &ProcTable, ctx: &DiscoverCtx) -> Result<Vec<AgentRow>>;
 
     /// Deliver a message to a running agent.
     async fn send(&self, target: &SendTarget, text: &str) -> Result<()>;

@@ -450,6 +450,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fleet-core",
+ "futures",
  "open",
  "ratatui",
  "serde",
