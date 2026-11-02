@@ -103,17 +103,28 @@ touched. It works on any worktree, fleet-started or not; the target is a task na
 branch, tmux session or path.
 
 It **refuses** (exit 1, nothing changed) and lists exactly what would be lost when the worktree
-has uncommitted or untracked files, commits that are on no remote branch, tag or other local
-branch, a running agent, or a `git worktree lock`. A merged MR/PR turns "commits only here" into
-a note (squash merges leave them behind). `--force` closes anyway. The main clone is never
-closed. Without `--yes` it asks; without a terminal it is a dry run.
+has uncommitted or untracked files, commits that deleting the branch would lose, a running agent,
+or a `git worktree lock`. "Would lose" means reachable from no branch that exists on the remote
+*now* (`git ls-remote`, so a stale `origin/<branch>` left after the forge deleted a merged branch
+does not count), no tag and no other local branch. Commits inside a **merged** MR/PR of the branch
+(looked up on the forge with `glab`/`gh`; squash merges leave them behind) are a note, not a
+blocker; a commit added after the merge still blocks. `--force` closes anyway. The main clone is
+never closed. Without `--yes` it asks; without a terminal it is a dry run.
+
+Leftovers close too: when the worktree folder is already gone (deleted by hand, or a close
+interrupted half-way), `fleet close <folder name | branch | tmux session>` finds the branch
+(registry, else the branch named like the folder that is checked out nowhere), the tmux sessions
+whose panes still sit in the vanished folder, and the registry task, and removes what is left.
 
 All-or-nothing: if a step fails, the steps already done are undone in reverse (task reopened,
 symlink re-created, worktree re-added from its branch, branch re-created at its old commit) and
 fleet says what it could not restore: a stopped agent (its conversation resumes with
-`opencode -s <session>`), killed tmux panes, and with `--force` the uncommitted files. Ignored
-files (build output) go with the folder. Run inside the task's own tmux session, fleet kills that
-session last. A re-run finishes a close that was interrupted (crash, kill) half-way.
+`opencode -s` / `claude --resume` / `codex resume <session>`), killed tmux panes, and with
+`--force` the uncommitted files. Ignored files (build output) go with the folder. Run inside the
+task's own tmux session, fleet kills that session last.
+
+gc uses the same planner and the same merged-review lookup, so `fleet worktree list` shows
+`yes: merged` for a worktree whose MR/PR was merged even though the forge only lists open ones.
 
 ### tmux status bar
 

@@ -737,3 +737,43 @@ Unit: planner (order, each blocker with exact contents, force, merged note, main
 - No on-disk journal: if `fleet` itself is killed mid-transaction, nothing is rolled back; re-running `close` finishes the job (every step is idempotent and a half-closed task is still resolvable through its registry row).
 - A locked worktree is re-added unlocked by a rollback.
 - Remote branches are never deleted (future `--remote`).
+
+## Revision after a real-world run (v0.3.1)
+
+Three squash-merged GitLab MRs in monid-services were closed with the first build. Two closed, but
+only by luck; one could not be closed at all.
+
+**Fix A 🔴 Stale remote-tracking refs counted as "pushed".** The "commits only here" check used
+`--remotes`, i.e. local `refs/remotes/*`. GitLab had already deleted the merged branches, but
+`origin/<branch>` still existed locally, so the commits looked safe. After `git fetch --prune` the
+same close would have been blocked. Now the anchors are the branch tips that exist on the remotes
+*now* (`git ls-remote --heads <remote>`, restricted to commits present locally, 20 s timeout, no
+prompts). When a remote is unreachable fleet falls back to the tracking refs and says so in a note.
+
+**Fix B 🔴 A merged review could never be seen.** Both forges are fetched open-only
+(`state=opened`, `--state open`), so `review_merged` and `gc_verdict`'s `merged` rule were dead.
+`ReviewAdapter::merged_for_branch(branch)` (GitLab `merge_requests?state=merged&source_branch=`,
+GitHub `gh pr list --head <b> --state merged`) is asked:
+- by the snapshot, for every non-main worktree branch with no open review (cached per
+  `(source, branch)` for `review_ttl_secs`, looked up in the background in the TUI, awaited by
+  one-shot CLI commands); the joiner matches these to worktrees only, never to Reviews rows, so
+  `gc_verdict` sees `merged`;
+- by `close::gather` directly (live), when the snapshot has none.
+"Landed" is then precise rather than trusting the status: the commits only here are recomputed
+with the merged review's head sha as an extra anchor. Commits it contains become a note; commits
+after it (or when its head is not in the clone: a note says `git fetch`) still block.
+
+**Fix C 🔴 A worktree-less task could not be closed.** `internal-api-deno`: folder and git entry
+gone, but branch `refactor/internal-api-deno` and a 2-pane session remained; every target failed.
+`Resolved` is now `{project, path: Option, branch: Option}`. Name resolution runs in two tiers:
+listed worktrees, registry slugs and sessions on listed worktrees first; only when none match,
+leftovers — tmux panes in a vanished folder (by session name or folder name; the project is the
+one whose repo or worktrees dir contains the folder) and local branches checked out nowhere named
+`<target>` or `*/<target>`. A vanished folder and exactly one branch named like it merge into one
+candidate. `gather` plans the remaining steps (close registry task, delete branch, kill session),
+with a note when the branch was matched by name only. A relative `refactor/x` that does not exist
+on disk is treated as a name, not a path.
+
+Also: blockers and resume hints name the agent's adapter (`claude --resume`, `codex resume`), and
+the e2e script drives tmux only through an explicit socket (see `AGENTS.md`): run from inside your
+own tmux, a bare `tmux kill-server` ignores `TMUX_TMPDIR` and kills your server.
