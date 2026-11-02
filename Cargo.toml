@@ -6,7 +6,7 @@ members = ["crates/fleet-core", "crates/fleet"]
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/feiyoug/fleet"
+repository = "https://github.com/FeiyouG/fleet"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -149,3 +149,12 @@ for other frontends is the planned next step. Status rules live in
 `status.rs` and are unit-tested on fixtures captured from a real machine.
 
 See `DESIGN.md` for the approved design (screens, state model, sequence diagrams).
+
+## Status
+
+v0.2, built for one person's workflow (opencode + tmux + GitLab/GitHub). Issues and PRs welcome at
+[github.com/FeiyouG/fleet](https://github.com/FeiyouG/fleet).
+
+## License
+
+[MIT](LICENSE)
