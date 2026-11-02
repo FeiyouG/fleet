@@ -119,6 +119,7 @@ mod tests {
             plan_title: None,
             port: None,
             last_activity: None,
+            pane_target: None,
         }
     }
     fn review(status: ReviewStatus, ci: Ci) -> ReviewRow {

@@ -1,6 +1,9 @@
-//! `~/.config/fleet/config.toml`
+//! `~/.config/fleet/init.lua` — a Lua file that *returns* the config table (nvim convention).
+//!
+//! Lua 5.4 is embedded (mlua, vendored) with a restricted standard library: string, table,
+//! math, plus `os.getenv`. No `io`, no `os.execute`, no `require`.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,34 +11,67 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub worktrees_dir: PathBuf,
-    pub review_ttl_secs: u64,
-    pub refresh_secs: u64,
-    pub default_mode: String,
-    pub nvim_pane: bool,
-    pub notify: bool,
-    /// Extra command-line arguments for the agent (e.g. `["--model", "anthropic/claude-opus-5"]`).
+    pub defaults: Defaults,
+    /// Extra command-line arguments for the agent (e.g. `{"--model", "anthropic/claude-opus-5"}`).
     pub agent_args: Vec<String>,
-    pub repos: Vec<RepoConfig>,
+    pub projects: Vec<Project>,
     pub agents: AgentsConfig,
-    /// action -> key chord, e.g. `"agent.start" = "a s"`.
+    /// action -> key chord, e.g. `["agent.start"] = "a s"`.
     pub keys: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoConfig {
+#[serde(default)]
+pub struct Defaults {
+    pub mode: String,
+    pub nvim_pane: bool,
+    pub notify: bool,
+    pub refresh_secs: u64,
+    pub review_ttl_secs: u64,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            mode: "plan".into(),
+            nvim_pane: true,
+            notify: true,
+            refresh_secs: 2,
+            review_ttl_secs: 60,
+        }
+    }
+}
+
+/// One repo you work in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
     pub name: String,
-    pub path: PathBuf,
-    /// `gitlab:group/project`. Optional: a repo with no review source is still tracked.
+    /// The main clone.
+    pub repo: PathBuf,
+    /// Where `fleet agent start` creates worktrees for this project. Defaults to
+    /// `~/.local/share/fleet/worktrees/<name>`. Discovery lists every worktree git knows
+    /// for the repo, wherever it lives; this only decides where new ones go.
     #[serde(default)]
-    pub review_source: Option<String>,
-    /// Default base branch for new work. Defaults to `main`.
+    pub worktrees: Option<PathBuf>,
+    /// `gitlab:group/project` or `github:owner/repo`. Optional: a project without one is
+    /// still tracked, it just has no Reviews.
+    #[serde(default)]
+    pub reviews: Option<String>,
+    /// Base branch for new work. Defaults to `main`.
     #[serde(default = "default_base")]
     pub base: String,
 }
 
 fn default_base() -> String {
     "main".into()
+}
+
+impl Project {
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.worktrees
+            .clone()
+            .unwrap_or_else(|| data_dir().join("worktrees").join(&self.name))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,23 +91,18 @@ impl Default for AgentsConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            worktrees_dir: data_dir().join("worktrees"),
-            review_ttl_secs: 60,
-            refresh_secs: 2,
-            default_mode: "plan".into(),
-            nvim_pane: true,
-            notify: true,
+            defaults: Defaults::default(),
             agent_args: vec![],
-            repos: vec![],
+            projects: vec![],
             agents: AgentsConfig::default(),
             keys: BTreeMap::new(),
         }
     }
 }
 
+// ───────────────────────── paths ─────────────────────────
+
 /// XDG-style on every platform (macOS included): `$XDG_CONFIG_HOME/fleet` or `~/.config/fleet`.
-/// This matches opencode, plannotator and tmux on this machine; `~/Library/Application Support`
-/// is deliberately not used.
 pub fn config_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("FLEET_CONFIG_DIR") {
         return PathBuf::from(p);
@@ -84,7 +115,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
-    config_dir().join("config.toml")
+    config_dir().join("init.lua")
 }
 
 /// `$XDG_DATA_HOME/fleet` or `~/.local/share/fleet`.
@@ -118,60 +149,240 @@ pub fn expand(p: &Path) -> PathBuf {
     }
 }
 
+// ───────────────────────── loading ─────────────────────────
+
 impl Config {
     pub fn load() -> Result<Self> {
         Self::load_from(&config_path())
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        let mut cfg: Config = match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        cfg.worktrees_dir = expand(&cfg.worktrees_dir);
-        for r in &mut cfg.repos {
-            r.path = expand(&r.path);
-        }
+        let mut cfg = Self::from_lua(&src, &path.to_string_lossy())?;
+        cfg.normalise();
         Ok(cfg)
     }
 
-    pub fn repo_by_name(&self, name: &str) -> Option<&RepoConfig> {
-        self.repos.iter().find(|r| r.name == name)
+    /// Run the Lua source in a sandbox and convert the returned table.
+    pub fn from_lua(src: &str, chunk_name: &str) -> Result<Self> {
+        use mlua::{Lua, LuaSerdeExt, StdLib, Value};
+        let run = || -> mlua::Result<Option<Config>> {
+            let lua = Lua::new_with(
+                StdLib::STRING | StdLib::TABLE | StdLib::MATH,
+                mlua::LuaOptions::default(),
+            )?;
+            // A tiny `os` with only getenv.
+            let os = lua.create_table()?;
+            os.set(
+                "getenv",
+                lua.create_function(|_, k: String| Ok(std::env::var(k).ok()))?,
+            )?;
+            lua.globals().set("os", os)?;
+            let value: Value = lua.load(src).set_name(chunk_name).eval()?;
+            if matches!(value, Value::Nil) {
+                return Ok(None);
+            }
+            Ok(Some(lua.from_value(value)?))
+        };
+        match run() {
+            Ok(Some(cfg)) => Ok(cfg),
+            Ok(None) => bail!("{chunk_name}: the file must `return {{ ... }}` a config table"),
+            Err(e) => bail!("{chunk_name}: {}", lua_error(e)),
+        }
     }
 
-    /// The configured repo that contains `path` (by canonical prefix), if any.
-    pub fn repo_for_path(&self, path: &Path) -> Option<&RepoConfig> {
+    fn normalise(&mut self) {
+        for p in &mut self.projects {
+            p.repo = expand(&p.repo);
+            if let Some(w) = &p.worktrees {
+                p.worktrees = Some(expand(w));
+            }
+        }
+    }
+
+    pub fn project(&self, name: &str) -> Option<&Project> {
+        self.projects.iter().find(|p| p.name == name)
+    }
+
+    /// The configured project whose repo contains `path` (by canonical prefix), if any.
+    pub fn project_for_path(&self, path: &Path) -> Option<&Project> {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.repos.iter().find(|r| {
-            let rc = r.path.canonicalize().unwrap_or_else(|_| r.path.clone());
+        self.projects.iter().find(|p| {
+            let rc = p.repo.canonicalize().unwrap_or_else(|_| p.repo.clone());
             canon.starts_with(&rc)
         })
     }
 
-    pub fn example() -> String {
-        r#"# fleet configuration
-worktrees_dir = "~/.local/share/fleet/worktrees"
-review_ttl_secs = 60
-refresh_secs = 2
-default_mode = "plan"      # opencode agent to start with: plan | build
-nvim_pane = true           # open an nvim pane next to the agent
-notify = true              # macOS banner when an agent starts waiting for you
-agent_args = []            # extra args for `opencode`, e.g. ["--model", "anthropic/claude-opus-5"]
+    pub fn example(projects: &[Project]) -> String {
+        let mut s = String::from(
+            r#"-- ~/.config/fleet/init.lua
+-- Lua 5.4, sandboxed: string/table/math + os.getenv. The file must return the config table.
+local home = os.getenv("HOME")
 
-[[repos]]
-name = "monid-services"
-path = "~/Projects/monid/monid-services"
-review_source = "gitlab:monid-ai/monid-services"
-base = "main"
+return {
+  defaults = {
+    mode = "plan",          -- opencode agent to start with: plan | build
+    nvim_pane = true,       -- open an nvim pane next to the agent
+    notify = true,          -- macOS banner when an agent starts waiting for you
+    refresh_secs = 2,
+    review_ttl_secs = 60,
+  },
+  agent_args = {},          -- extra args for `opencode`, e.g. { "--model", "anthropic/claude-opus-5" }
 
-[agents]
-adapters = ["opencode"]
+  -- fleet:projects (fleet project add appends here)
+  projects = {
+"#,
+        );
+        for p in projects {
+            s.push_str(&project_block(p));
+        }
+        s.push_str(
+            r#"  },
+  -- fleet:projects:end
 
-[keys]
-# action = "key" or "prefix key"; see `fleet keys` for every action
-# "agent.start" = "a s"
-"#
-        .into()
+  keys = {
+    -- action = "key" or "prefix key"; `fleet keys` lists every action
+    -- ["agent.start"] = "C-n",
+  },
+}
+"#,
+        );
+        s
+    }
+}
+
+/// Render one project as a Lua table literal (used by `--init` and `project add`).
+pub fn project_block(p: &Project) -> String {
+    let home = home().to_string_lossy().into_owned();
+    let path = |x: &Path| {
+        let s = x.to_string_lossy();
+        match s.strip_prefix(&home) {
+            Some(rest) => format!("home .. {:?}", rest),
+            None => format!("{s:?}"),
+        }
+    };
+    let mut s = format!(
+        "    {{\n      name = {:?},\n      repo = {},\n",
+        p.name,
+        path(&p.repo)
+    );
+    if let Some(w) = &p.worktrees {
+        s.push_str(&format!("      worktrees = {},\n", path(w)));
+    }
+    if let Some(r) = &p.reviews {
+        s.push_str(&format!("      reviews = {r:?},\n"));
+    }
+    s.push_str(&format!("      base = {:?},\n    }},\n", p.base));
+    s
+}
+
+fn lua_error(e: mlua::Error) -> String {
+    match e {
+        mlua::Error::SyntaxError { message, .. } => message,
+        mlua::Error::RuntimeError(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// `git@gitlab.com:g/p.git` / `https://github.com/o/r` -> `gitlab:g/p` / `github:o/r`.
+pub fn review_source_from_remote(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches(".git");
+    let (host, path) = if let Some(rest) = url.strip_prefix("git@") {
+        rest.split_once(':')?
+    } else {
+        let no_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+        no_scheme.split_once('/')?
+    };
+    let kind = match host {
+        "gitlab.com" => "gitlab",
+        "github.com" => "github",
+        _ => return None,
+    };
+    Some(format!("{kind}:{}", path.trim_matches('/')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_lua() {
+        let src = r#"
+            local home = os.getenv("HOME")
+            return {
+              defaults = { mode = "build" },
+              projects = {
+                { name = "svc", repo = home .. "/x", reviews = "gitlab:a/b" },
+                { name = "cli", repo = "~/y", worktrees = "~/wt", base = "develop" },
+              },
+              keys = { ["agent.start"] = "C-n" },
+            }"#;
+        let mut c = Config::from_lua(src, "test.lua").unwrap();
+        c.normalise();
+        assert_eq!(c.defaults.mode, "build");
+        assert_eq!(c.defaults.refresh_secs, 2);
+        assert_eq!(c.projects.len(), 2);
+        assert_eq!(c.projects[0].repo, home().join("x"));
+        assert_eq!(c.projects[1].repo, home().join("y"));
+        assert_eq!(c.projects[1].worktrees, Some(home().join("wt")));
+        assert_eq!(c.projects[1].base, "develop");
+        assert_eq!(
+            c.projects[0].worktrees_dir(),
+            data_dir().join("worktrees").join("svc")
+        );
+        assert_eq!(c.keys["agent.start"], "C-n");
+    }
+
+    #[test]
+    fn sandbox_and_errors() {
+        assert!(Config::from_lua("return { projects = io.open('x') }", "t")
+            .unwrap_err()
+            .to_string()
+            .contains("io"));
+        let e = Config::from_lua("return { projects = 5 }", "t")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("expected table"), "{e}");
+        assert!(Config::from_lua("return {", "t").is_err());
+        assert!(Config::from_lua("x = 1", "t")
+            .unwrap_err()
+            .to_string()
+            .contains("return"));
+    }
+
+    #[test]
+    fn example_roundtrips() {
+        let p = vec![Project {
+            name: "svc".into(),
+            repo: home().join("Projects/svc"),
+            worktrees: None,
+            reviews: Some("gitlab:a/b".into()),
+            base: "main".into(),
+        }];
+        let src = Config::example(&p);
+        let c = Config::from_lua(&src, "ex").unwrap();
+        assert_eq!(c.projects[0].name, "svc");
+        assert_eq!(c.projects[0].repo, home().join("Projects/svc"));
+    }
+
+    #[test]
+    fn remotes() {
+        assert_eq!(
+            review_source_from_remote("git@gitlab.com:monid-ai/monid-services.git").unwrap(),
+            "gitlab:monid-ai/monid-services"
+        );
+        assert_eq!(
+            review_source_from_remote("git@github.com:monid-ai/cli.git").unwrap(),
+            "github:monid-ai/cli"
+        );
+        assert_eq!(
+            review_source_from_remote("https://github.com/o/r").unwrap(),
+            "github:o/r"
+        );
+        assert_eq!(review_source_from_remote("https://bitbucket.org/o/r"), None);
     }
 }

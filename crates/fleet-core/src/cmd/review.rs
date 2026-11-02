@@ -3,7 +3,7 @@
 
 use super::{free_port, Progress};
 use crate::agents::{LaunchSpec, SendTarget};
-use crate::config::RepoConfig;
+use crate::config::Project;
 use crate::registry::{Registry, Task};
 use crate::snapshot::Engine;
 use crate::tmux;
@@ -34,16 +34,16 @@ pub enum ReviewOutcome {
     },
 }
 
-fn resolve_repo<'a>(engine: &'a Engine, opts: &ReviewOpts) -> Result<(&'a RepoConfig, u64)> {
+fn resolve_repo<'a>(engine: &'a Engine, opts: &ReviewOpts) -> Result<(&'a Project, u64)> {
     let cfg = &engine.config;
-    let candidates: Vec<&RepoConfig> = match &opts.repo {
+    let candidates: Vec<&Project> = match &opts.repo {
         Some(n) => vec![cfg
-            .repo_by_name(n)
+            .project(n)
             .with_context(|| format!("repo `{n}` not in config"))?],
-        None => cfg.repos.iter().collect(),
+        None => cfg.projects.iter().collect(),
     };
     for repo in candidates {
-        let Some(src) = &repo.review_source else {
+        let Some(src) = &repo.reviews else {
             continue;
         };
         let Some(adapter) = engine.review_adapter(src) else {
@@ -76,7 +76,7 @@ pub fn review_prompt(
 pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<ReviewOutcome> {
     let cfg = &engine.config;
     let (repo, id) = resolve_repo(engine, &opts)?;
-    let source = repo.review_source.clone().unwrap();
+    let source = repo.reviews.clone().unwrap();
     let adapter = engine.review_adapter(&source).context("review adapter")?;
     let review = adapter.review(id).await?;
     let reg = Registry::open()?;
@@ -85,13 +85,13 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         .context("opencode adapter not enabled")?;
 
     log(&format!("fetch origin {}", adapter.fetch_refspec(id)));
-    git::fetch(&repo.path, "origin", &adapter.fetch_refspec(id)).await?;
+    git::fetch(&repo.repo, "origin", &adapter.fetch_refspec(id)).await?;
 
     if let Some(task) = reg.find_review(&source, id)? {
         // Re-review: same worktree, same session, new prompt.
         let old_sha = task.head_sha.clone().unwrap_or_default();
         // FETCH_HEAD belongs to the main repo, not the worktree: resolve it to a sha first.
-        let sha = git::git(&repo.path, &["rev-parse", "FETCH_HEAD"])
+        let sha = git::git(&repo.repo, &["rev-parse", "FETCH_HEAD"])
             .await?
             .trim()
             .to_string();
@@ -125,7 +125,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     }
 
     let slug = format!("review-{id}");
-    let path = cfg.worktrees_dir.join(&repo.name).join(&slug);
+    let path = repo.worktrees_dir().join(&slug);
     if path.exists() {
         bail!(
             "{} already exists but is not in the registry; remove it or run `fleet worktree gc`",
@@ -137,7 +137,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         "worktree add --detach {} FETCH_HEAD",
         path.display()
     ));
-    git::worktree_add_detached(&repo.path, &path, "FETCH_HEAD").await?;
+    git::worktree_add_detached(&repo.repo, &path, "FETCH_HEAD").await?;
 
     let port = free_port()?;
     reg.insert(&Task {
@@ -174,7 +174,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     });
     log(&format!("tmux new-session -s {slug}"));
     tmux::new_session(&slug, &path).await?;
-    let target = if cfg.nvim_pane {
+    let target = if cfg.defaults.nvim_pane {
         tmux::split_window(&format!("{slug}:1"), &path, None).await?;
         tmux::send_keys(&format!("{slug}:1.0"), "nvim").await.ok();
         format!("{slug}:1.1")

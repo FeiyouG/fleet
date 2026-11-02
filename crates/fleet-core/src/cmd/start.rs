@@ -2,7 +2,7 @@
 
 use super::{free_port, Progress};
 use crate::agents::LaunchSpec;
-use crate::config::{Config, RepoConfig};
+use crate::config::{Config, Project};
 use crate::registry::{Registry, Task};
 use crate::slug;
 use crate::snapshot::Engine;
@@ -45,14 +45,14 @@ pub fn prompt_header(slug: &str, repo: &str, branch: &str, base: &str) -> String
     h
 }
 
-pub fn worktree_path(cfg: &Config, repo: &RepoConfig, slug: &str) -> PathBuf {
-    cfg.worktrees_dir.join(&repo.name).join(slug)
+pub fn worktree_path(_cfg: &Config, repo: &Project, slug: &str) -> PathBuf {
+    repo.worktrees_dir().join(slug)
 }
 
 pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<Started> {
     let cfg = &engine.config;
     let repo = cfg
-        .repo_by_name(&opts.repo)
+        .project(&opts.repo)
         .with_context(|| format!("repo `{}` is not in config", opts.repo))?;
     let prompt = opts.prompt.trim().to_string();
     if prompt.is_empty() {
@@ -81,13 +81,13 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         .context("opencode adapter not enabled")?;
 
     log(&format!("fetch origin {base}"));
-    git::fetch(&repo.path, "origin", &base).await?;
+    git::fetch(&repo.repo, "origin", &base).await?;
     std::fs::create_dir_all(path.parent().unwrap())?;
     log(&format!(
         "worktree add -b {branch} {} origin/{base}",
         path.display()
     ));
-    git::worktree_add_branch(&repo.path, &path, &branch, &format!("origin/{base}")).await?;
+    git::worktree_add_branch(&repo.repo, &path, &branch, &format!("origin/{base}")).await?;
 
     let port = free_port()?;
     let reg = Registry::open()?;
@@ -103,7 +103,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         mode: Some(
             opts.mode
                 .clone()
-                .unwrap_or_else(|| cfg.default_mode.clone()),
+                .unwrap_or_else(|| cfg.defaults.mode.clone()),
         ),
         review_source: None,
         review_id: None,
@@ -113,7 +113,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         closed_at: None,
     })?;
 
-    let mode = opts.mode.unwrap_or_else(|| cfg.default_mode.clone());
+    let mode = opts.mode.unwrap_or_else(|| cfg.defaults.mode.clone());
     let full_prompt = format!(
         "{}\n\n{prompt}",
         prompt_header(&slug, &repo.name, &branch, &base)
@@ -128,7 +128,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
 
     log(&format!("tmux new-session -s {slug}"));
     tmux::new_session(&slug, &path).await?;
-    let agent_target = if opts.nvim.unwrap_or(cfg.nvim_pane) {
+    let agent_target = if opts.nvim.unwrap_or(cfg.defaults.nvim_pane) {
         tmux::split_window(&format!("{slug}:1"), &path, None).await?;
         tmux::send_keys(&format!("{slug}:1.0"), "nvim").await.ok();
         format!("{slug}:1.1")

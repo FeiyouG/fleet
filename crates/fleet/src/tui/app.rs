@@ -49,7 +49,7 @@ pub enum Msg {
     Suspend(Box<dyn FnOnce() -> Result<()> + Send>),
 }
 
-pub async fn run(cfg: Config) -> Result<()> {
+pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
     let keymap = Keymap::from_config(&cfg);
     for e in &keymap.overrides_errors {
         eprintln!("fleet: {e}");
@@ -61,7 +61,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     {
         let engine = engine.clone();
         let tx = tx.clone();
-        let every = Duration::from_secs(cfg.refresh_secs.max(1));
+        let every = Duration::from_secs(cfg.defaults.refresh_secs.max(1));
         tokio::spawn(async move {
             loop {
                 let f = engine.snapshot(false).await;
@@ -73,14 +73,22 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
+    let project_names: Vec<String> = cfg.projects.iter().map(|p| p.name.clone()).collect();
     let mut app = App {
-        notifier: Notifier::new(cfg.notify),
+        notifier: Notifier::new(cfg.defaults.notify),
         cfg,
         engine,
         keymap,
         fleet: Fleet::default(),
-        tab: Tab::Overview,
-        tabs: tabs::TabStates::default(),
+        tab: Tab::Agents,
+        tabs: {
+            let mut t = tabs::TabStates {
+                project,
+                ..Default::default()
+            };
+            t.unfold_projects(&project_names);
+            t
+        },
         pending: vec![],
         menu: None,
         popup: None,
@@ -110,7 +118,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.fleet = f; app.loading = false; app.tabs.clamp(&app.fleet); }
+                    Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.fleet = f; app.loading = false; }
                     Some(Msg::Status(s, err)) => app.set_status(s, err),
                     Some(Msg::Suspend(work)) => {
                         leave(&mut term)?;
@@ -255,14 +263,18 @@ impl App {
             Bottom => st.selected = count.saturating_sub(1),
             PageUp => st.up(10),
             PageDown => st.down(10, count),
-            Tab1 => self.tab = Tab::Overview,
+            Tab1 => self.tab = Tab::Agents,
             Tab2 => self.tab = Tab::Tmux,
             Tab3 => self.tab = Tab::Worktrees,
             Tab4 => self.tab = Tab::Reviews,
             NextTab => self.tab = self.tab.next(),
             PrevTab => self.tab = self.tab.prev(),
-            Collapse => st.expanded = false,
-            Expand => st.expanded = true,
+            Collapse => tabs::collapse(self),
+            Expand => tabs::expand(self),
+            FoldAll => tabs::fold_all(self),
+            UnfoldAll => tabs::unfold_all(self),
+            ProjectNext => self.cycle_project(1),
+            ProjectPrev => self.cycle_project(-1),
             Sort => {
                 self.sort = match self.sort {
                     SortMode::Severity => SortMode::Activity,
@@ -300,11 +312,10 @@ impl App {
                     None => self.set_status("nothing to copy".into(), true),
                 }
             }
-            GotoOverview => self.goto(Tab::Overview),
+            GotoAgents | ReviewGotoAgents => self.goto(Tab::Agents),
             GotoTmux => self.goto(Tab::Tmux),
             GotoWorktree | ReviewGotoWorktrees => self.goto(Tab::Worktrees),
             GotoReview => self.goto(Tab::Reviews),
-            ReviewGotoAgents => self.goto(Tab::Overview),
             AgentAttach => self.attach_selected().await?,
             AgentStart => self.popup = Some(Popup::start(&self.cfg)),
             AgentSend => {
@@ -384,38 +395,7 @@ impl App {
             }
             ReviewStart => {
                 if let Some(r) = self.selected_review() {
-                    let id = r.display_id.clone();
-                    let source = r.source.clone();
-                    let repo = self
-                        .cfg
-                        .repos
-                        .iter()
-                        .find(|x| x.review_source.as_deref() == Some(&source))
-                        .map(|x| x.name.clone());
-                    let engine = self.engine.clone();
-                    let tx = self.tx.clone();
-                    self.spawn("review", async move {
-                        let out = cmd::review::start(
-                            &engine,
-                            cmd::review::ReviewOpts {
-                                id_or_url: id.clone(),
-                                repo,
-                                attach: false,
-                            },
-                            &cmd::quiet(),
-                        )
-                        .await?;
-                        let msg = match out {
-                            cmd::review::ReviewOutcome::Started { slug, .. } => {
-                                format!("started {slug}")
-                            }
-                            cmd::review::ReviewOutcome::ReReviewed { slug, .. } => {
-                                format!("re-review sent to {slug}")
-                            }
-                        };
-                        let _ = tx;
-                        Ok(msg)
-                    });
+                    self.start_review(r.display_id.clone());
                 }
             }
             ReviewFilter => {
@@ -423,17 +403,6 @@ impl App {
                 s.preset = (s.preset + 1) % tabs::reviews::PRESETS.len();
                 let name = tabs::reviews::PRESETS[s.preset];
                 self.set_status(format!("filter: {name}"), false);
-            }
-            ReviewSource => {
-                let mut sources: Vec<String> = self
-                    .fleet
-                    .reviews
-                    .iter()
-                    .map(|r| r.review.source.clone())
-                    .collect();
-                sources.sort();
-                sources.dedup();
-                self.popup = Some(Popup::source(sources, self.tabs.source.clone()));
             }
             TmuxKill => {
                 if let Some(s) = self.selected_session() {
@@ -456,12 +425,25 @@ impl App {
         use popups::PopupCmd::*;
         match c {
             SetFilter(s) => self.tabs.state_mut(self.tab).filter = s,
-            SetSource(s) => self.tabs.source = s,
+            SetProject(p) => self.set_project(p),
+            StartReview(id) => self.start_review(id),
             RunCommand(line) => {
+                // `:project [name]` is handled in-process (it is TUI state, not a subcommand).
+                let words = shell_words::split(&line)?;
+                if words.first().map(String::as_str) == Some("project") {
+                    match words.get(1) {
+                        Some(n) if n == "all" => self.set_project(None),
+                        Some(n) => self.set_project(Some(n.clone())),
+                        None => {
+                            self.popup = Some(Popup::project(&self.cfg, self.tabs.project.clone()))
+                        }
+                    }
+                    return Ok(());
+                }
                 // `:agent send lev8 hi` -> run `fleet agent send lev8 hi` as a child process,
                 // suspended so interactive commands (attach, $EDITOR) work.
                 let exe = std::env::current_exe()?;
-                let args = shell_words::split(&line)?;
+                let args = words;
                 let _ = self.tx.send(Msg::Suspend(Box::new(move || {
                     let st = std::process::Command::new(exe).args(&args).status()?;
                     if !st.success() {
@@ -535,7 +517,7 @@ impl App {
                 Ok(format!("renamed {old} -> {new}"))
             }),
             RemoveWorktree { repo, path } => {
-                let rp = self.cfg.repo_by_name(&repo).map(|r| r.path.clone());
+                let rp = self.cfg.project(&repo).map(|r| r.repo.clone());
                 self.spawn("remove", async move {
                     let rp = rp.ok_or_else(|| anyhow::anyhow!("repo {repo} not in config"))?;
                     fleet_core::worktrees::git::worktree_remove(&rp, &path, false).await?;
@@ -564,23 +546,130 @@ impl App {
     }
 
     fn goto(&mut self, to: Tab) {
-        let key = tabs::selected_key(self);
+        let keys = tabs::selected_keys(self);
         self.tab = to;
-        if let Some(k) = key {
-            tabs::select_by_key(self, &k);
+        if !keys.is_empty() {
+            tabs::select_by_keys(self, &keys);
         }
     }
 
+    /// Start (or re-run) a review agent for a review id like `!514` / `#12`.
+    pub fn start_review(&mut self, id: String) {
+        let num: String = id.trim_start_matches(['!', '#']).to_string();
+        let source = self.selected_review().map(|r| r.source).or_else(|| {
+            self.fleet
+                .reviews
+                .iter()
+                .find(|r| r.review.display_id == id)
+                .map(|r| r.review.source.clone())
+        });
+        let repo = source.and_then(|s| {
+            self.cfg
+                .projects
+                .iter()
+                .find(|x| x.reviews.as_deref() == Some(s.as_str()))
+                .map(|x| x.name.clone())
+        });
+        let engine = self.engine.clone();
+        self.spawn("review", async move {
+            let out = cmd::review::start(
+                &engine,
+                cmd::review::ReviewOpts {
+                    id_or_url: num,
+                    repo,
+                    attach: false,
+                },
+                &cmd::quiet(),
+            )
+            .await?;
+            Ok(match out {
+                cmd::review::ReviewOutcome::Started { slug, .. } => format!("started {slug}"),
+                cmd::review::ReviewOutcome::ReReviewed { slug, .. } => {
+                    format!("re-review sent to {slug}")
+                }
+            })
+        });
+    }
+
+    /// `p` / `P`: project1 → project2 → … → all.
+    fn cycle_project(&mut self, dir: i32) {
+        let names: Vec<Option<String>> = self
+            .cfg
+            .projects
+            .iter()
+            .map(|p| Some(p.name.clone()))
+            .chain(std::iter::once(None))
+            .collect();
+        if names.len() <= 1 {
+            return;
+        }
+        let cur = names
+            .iter()
+            .position(|n| *n == self.tabs.project)
+            .unwrap_or(names.len() - 1) as i32;
+        let next = (cur + dir).rem_euclid(names.len() as i32) as usize;
+        self.set_project(names[next].clone());
+    }
+
+    pub fn set_project(&mut self, p: Option<String>) {
+        if let Some(n) = &p {
+            if self.cfg.project(n).is_none() {
+                self.set_status(format!("unknown project `{n}`"), true);
+                return;
+            }
+        }
+        self.tabs.project = p;
+        for t in Tab::ALL {
+            self.tabs.state_mut(t).selected = 0;
+        }
+        self.set_status(
+            format!("project: {}", self.tabs.project.as_deref().unwrap_or("all")),
+            false,
+        );
+    }
+
+    /// `Enter`, per node kind.
     fn primary(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + '_>> {
         Box::pin(async move {
-            match self.tab {
-                Tab::Overview | Tab::Tmux => self.attach_selected().await,
-                Tab::Worktrees => self.act(Action::WorktreeShell).await,
-                Tab::Reviews => {
-                    if self.selected_review_local_pane().is_some() {
-                        self.attach_selected().await
+            let Some(n) = tabs::selected(self) else {
+                return Ok(());
+            };
+            match &n.data {
+                tabs::NodeData::Project { .. } => {
+                    if n.unfolded {
+                        tabs::collapse(self)
                     } else {
-                        self.act(Action::ReviewStart).await
+                        tabs::expand(self)
+                    }
+                    Ok(())
+                }
+                tabs::NodeData::Agent { .. }
+                | tabs::NodeData::Session { .. }
+                | tabs::NodeData::Pane(_) => self.attach_selected().await,
+                tabs::NodeData::Worktree(v) => {
+                    if v.agents.is_empty() && n.pane_target().is_none() {
+                        self.act(Action::WorktreeShell).await
+                    } else {
+                        self.attach_selected().await
+                    }
+                }
+                tabs::NodeData::Review(v) => {
+                    if n.has_children {
+                        if !n.unfolded {
+                            tabs::expand(self);
+                        } else {
+                            self.attach_selected().await?;
+                        }
+                        Ok(())
+                    } else {
+                        let id = v.review.display_id.clone();
+                        self.popup = Some(Popup::confirm(
+                            format!(
+                                "Start a review agent for {id}? (detached worktree + tmux session)"
+                            ),
+                            popups::PopupCmd::StartReview(id),
+                        ));
+                        Ok(())
                     }
                 }
             }
@@ -633,12 +722,5 @@ impl App {
 
     pub fn selected_send_target(&self) -> Option<SendTarget> {
         tabs::selected_send_target(self)
-    }
-
-    fn selected_review_local_pane(&self) -> Option<String> {
-        if self.tab != Tab::Reviews {
-            return None;
-        }
-        tabs::selected_pane_target(self)
     }
 }

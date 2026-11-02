@@ -1,6 +1,6 @@
 //! git worktrees of a repo, with sync state.
 
-use crate::config::RepoConfig;
+use crate::config::Project;
 use crate::model::WorktreeRow;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -76,13 +76,13 @@ pub fn parse_porcelain(s: &str) -> Vec<Porcelain> {
 }
 
 /// All worktrees of a configured repo, with sync state. Missing folders are reported, not skipped.
-pub async fn worktrees(repo: &RepoConfig) -> Result<Vec<WorktreeRow>> {
-    let listing = git(&repo.path, &["worktree", "list", "--porcelain"]).await?;
+pub async fn worktrees(repo: &Project) -> Result<Vec<WorktreeRow>> {
+    let listing = git(&repo.repo, &["worktree", "list", "--porcelain"]).await?;
     let entries = parse_porcelain(&listing);
     let main_path = repo
-        .path
+        .repo
         .canonicalize()
-        .unwrap_or_else(|_| repo.path.clone());
+        .unwrap_or_else(|_| repo.repo.clone());
 
     let futs = entries
         .into_iter()
@@ -91,7 +91,7 @@ pub async fn worktrees(repo: &RepoConfig) -> Result<Vec<WorktreeRow>> {
     Ok(futures::future::join_all(futs).await)
 }
 
-async fn row_for(repo: &RepoConfig, main_path: &Path, e: Porcelain) -> WorktreeRow {
+async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow {
     {
         let missing = e.prunable || !e.path.exists();
         let path = if missing {

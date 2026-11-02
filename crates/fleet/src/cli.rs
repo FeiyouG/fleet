@@ -14,9 +14,12 @@ use std::path::PathBuf;
     about = "Track and launch your local coding agents across tmux, worktrees and reviews."
 )]
 pub struct Cli {
-    /// Config file (default: ~/.config/fleet/config.toml)
+    /// Config file (default: ~/.config/fleet/init.lua)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Start scoped to this project (default: the project containing the cwd)
+    #[arg(long, global = true)]
+    project: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -49,10 +52,13 @@ enum Cmd {
     Start(StartArgs),
     /// Print the config path and an example config
     Config {
-        /// Write the example config if none exists
+        /// Write the example config if none exists (the cwd's repo becomes the first project)
         #[arg(long)]
         init: bool,
     },
+    /// Projects: list, add
+    #[command(subcommand)]
+    Project(ProjectCmd),
     /// Print every action and its current key binding
     Keys,
 }
@@ -139,6 +145,30 @@ enum WorktreeCmd {
 }
 
 #[derive(Subcommand)]
+enum ProjectCmd {
+    /// List configured projects with worktree and agent counts
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a project to init.lua (name = folder name, reviews from `origin`, base from origin/HEAD)
+    Add {
+        /// Path inside the repo (default: cwd)
+        path: Option<PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+        /// `gitlab:group/project` or `github:owner/repo`
+        #[arg(long)]
+        reviews: Option<String>,
+        /// Where new worktrees go (default: ~/.local/share/fleet/worktrees/<name>)
+        #[arg(long)]
+        worktrees: Option<PathBuf>,
+        #[arg(long)]
+        base: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum TmuxCmd {
     List {
         #[arg(long)]
@@ -156,8 +186,26 @@ pub fn run() -> Result<()> {
         Some(p) => Config::load_from(p)?,
         None => Config::load()?,
     };
+    if let Some(p) = &cli.project {
+        if cfg.project(p).is_none() {
+            bail!(
+                "unknown project `{p}` (configured: {})",
+                cfg.projects
+                    .iter()
+                    .map(|x| x.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(dispatch(cli, cfg))
+}
+
+fn cli_config_path(explicit: &Option<PathBuf>) -> PathBuf {
+    explicit
+        .clone()
+        .unwrap_or_else(fleet_core::config::config_path)
 }
 
 async fn snapshot(cfg: &Config) -> Fleet {
@@ -170,15 +218,14 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 }
 
 async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
+    let cli_config = cli.config.clone();
+    let project = cli.project.clone().or_else(|| cwd_project_strict(&cfg));
     match cli.cmd.unwrap_or(Cmd::Tui) {
         Cmd::Tui => {
-            if cfg.repos.is_empty() {
-                eprintln!(
-                    "fleet: no repos configured. Run `fleet config --init` and edit {}",
-                    fleet_core::config::config_path().display()
-                );
+            if cfg.projects.is_empty() {
+                eprintln!("fleet: no projects configured. Run `fleet config --init` inside a repo, or `fleet project add <path>`.");
             }
-            tui::run(cfg).await
+            tui::run(cfg, project).await
         }
         Cmd::Status { json, short } => {
             let f = snapshot(&cfg).await;
@@ -382,19 +429,104 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
         Cmd::Config { init } => {
             let p = fleet_core::config::config_path();
             println!("{}", p.display());
+            let detected = match std::env::current_dir() {
+                Ok(cwd) => cmd::project::detect(&cwd, None, None, None, None)
+                    .await
+                    .ok()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                Err(_) => vec![],
+            };
             if init {
                 if p.exists() {
                     bail!("{} already exists", p.display());
                 }
                 std::fs::create_dir_all(p.parent().unwrap())?;
-                std::fs::write(&p, Config::example())?;
-                println!("wrote example config");
+                std::fs::write(&p, Config::example(&detected))?;
+                println!("wrote {} with {} project(s)", p.display(), detected.len());
             } else if !p.exists() {
-                println!("(not found; `fleet config --init` writes an example)\n");
-                print!("{}", Config::example());
+                println!("(not found; `fleet config --init` writes this)\n");
+                print!("{}", Config::example(&detected));
             }
             Ok(())
         }
+        Cmd::Project(pc) => match pc {
+            ProjectCmd::List { json } => {
+                let f = snapshot(&cfg).await;
+                #[derive(serde::Serialize)]
+                struct Row<'a> {
+                    name: &'a str,
+                    repo: String,
+                    worktrees_dir: String,
+                    reviews: Option<&'a str>,
+                    base: &'a str,
+                    worktrees: usize,
+                    agents: usize,
+                }
+                let rows: Vec<Row> = cfg
+                    .projects
+                    .iter()
+                    .map(|p| Row {
+                        name: &p.name,
+                        repo: p.repo.display().to_string(),
+                        worktrees_dir: p.worktrees_dir().display().to_string(),
+                        reviews: p.reviews.as_deref(),
+                        base: &p.base,
+                        worktrees: f
+                            .worktrees
+                            .iter()
+                            .filter(|w| w.worktree.repo == p.name)
+                            .count(),
+                        agents: f
+                            .worktrees
+                            .iter()
+                            .filter(|w| w.worktree.repo == p.name)
+                            .map(|w| w.agents.len())
+                            .sum(),
+                    })
+                    .collect();
+                if json {
+                    return print_json(&rows);
+                }
+                println!(
+                    "{:<18} {:<4} {:<4} {:<30} {:<8} {}",
+                    "NAME", "WT", "AG", "REVIEWS", "BASE", "REPO"
+                );
+                for r in rows {
+                    println!(
+                        "{:<18} {:<4} {:<4} {:<30} {:<8} {}",
+                        r.name,
+                        r.worktrees,
+                        r.agents,
+                        r.reviews.unwrap_or("—"),
+                        r.base,
+                        r.repo
+                    );
+                }
+                Ok(())
+            }
+            ProjectCmd::Add {
+                path,
+                name,
+                reviews,
+                worktrees,
+                base,
+            } => {
+                let path = path.unwrap_or(std::env::current_dir()?);
+                let p =
+                    cmd::project::detect(&path, name, reviews, worktrees.as_deref(), base).await?;
+                let cfg_path = cli_config_path(&cli_config);
+                cmd::project::add_to_config(&cfg, &cfg_path, &p)?;
+                println!(
+                    "added project `{}` ({}, reviews {}) to {}",
+                    p.name,
+                    p.repo.display(),
+                    p.reviews.as_deref().unwrap_or("none"),
+                    cfg_path.display()
+                );
+                Ok(())
+            }
+        },
         Cmd::Keys => {
             for (action, key) in tui::keys::Keymap::from_config(&cfg).list() {
                 println!("{action:<22} {key}");
@@ -404,15 +536,23 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
     }
 }
 
+/// The project whose repo contains the cwd (no single-project fallback).
+fn cwd_project_strict(cfg: &Config) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    cfg.project_for_path(&cwd).map(|r| r.name.clone())
+}
+
 fn cwd_repo(cfg: &Config) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    cfg.repo_for_path(&cwd).map(|r| r.name.clone()).or_else(|| {
-        if cfg.repos.len() == 1 {
-            Some(cfg.repos[0].name.clone())
-        } else {
-            None
-        }
-    })
+    cfg.project_for_path(&cwd)
+        .map(|r| r.name.clone())
+        .or_else(|| {
+            if cfg.projects.len() == 1 {
+                Some(cfg.projects[0].name.clone())
+            } else {
+                None
+            }
+        })
 }
 
 async fn agent(a: AgentCmd, cfg: Config) -> Result<()> {

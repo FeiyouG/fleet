@@ -1,6 +1,7 @@
 //! Commands that change the world: start, rename, review, send, gc.
 
 pub mod gc;
+pub mod project;
 pub mod rename;
 pub mod review;
 pub mod send;

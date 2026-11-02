@@ -94,6 +94,9 @@ pub struct AgentRow {
     /// HTTP port when started by fleet (`--port`).
     pub port: Option<u16>,
     pub last_activity: Option<DateTime<Utc>>,
+    /// tmux target (`sess:w.p`) of the pane hosting this process, filled by the joiner.
+    #[serde(default)]
+    pub pane_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -322,6 +325,7 @@ pub struct ReviewView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeView {
     pub worktree: WorktreeRow,
+    pub overall: Overall,
     pub agents: Vec<AgentRow>,
     pub panes: Vec<PaneRow>,
     pub review: Option<ReviewRow>,

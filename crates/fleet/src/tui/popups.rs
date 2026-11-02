@@ -12,7 +12,8 @@ use tui_textarea::TextArea;
 #[derive(Debug, Clone)]
 pub enum PopupCmd {
     SetFilter(String),
-    SetSource(Option<String>),
+    SetProject(Option<String>),
+    StartReview(String),
     RunCommand(String),
     Start {
         name: Option<String>,
@@ -58,7 +59,7 @@ pub enum Popup {
         checked: Vec<bool>,
         selected: usize,
     },
-    Source {
+    ProjectPick {
         options: Vec<Option<String>>,
         selected: usize,
     },
@@ -140,11 +141,12 @@ impl Popup {
             selected: 0,
         }
     }
-    pub fn source(sources: Vec<String>, current: Option<String>) -> Popup {
-        let mut options = vec![None];
-        options.extend(sources.into_iter().map(Some));
+    pub fn project(cfg: &Config, current: Option<String>) -> Popup {
+        let mut options: Vec<Option<String>> =
+            cfg.projects.iter().map(|p| Some(p.name.clone())).collect();
+        options.push(None);
         let selected = options.iter().position(|o| *o == current).unwrap_or(0);
-        Popup::Source { options, selected }
+        Popup::ProjectPick { options, selected }
     }
     pub fn start(cfg: &Config) -> Popup {
         let mut name = TextArea::default();
@@ -154,17 +156,17 @@ impl Popup {
         prompt
             .set_placeholder_text("first prompt for the agent (C-e opens $EDITOR) · C-s to start");
         prompt.set_cursor_line_style(Style::default());
-        let repos: Vec<String> = cfg.repos.iter().map(|r| r.name.clone()).collect();
+        let repos: Vec<String> = cfg.projects.iter().map(|r| r.name.clone()).collect();
         let cwd_repo = std::env::current_dir()
             .ok()
-            .and_then(|c| cfg.repo_for_path(&c).map(|r| r.name.clone()));
+            .and_then(|c| cfg.project_for_path(&c).map(|r| r.name.clone()));
         let repo_idx = cwd_repo
             .and_then(|n| repos.iter().position(|r| *r == n))
             .unwrap_or(0);
         let modes = vec!["plan".to_string(), "build".to_string()];
         let mode_idx = modes
             .iter()
-            .position(|m| *m == cfg.default_mode)
+            .position(|m| *m == cfg.defaults.mode)
             .unwrap_or(0);
         Popup::Start(StartForm {
             name,
@@ -320,21 +322,21 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 selected,
             }),
         },
-        Popup::Source {
+        Popup::ProjectPick {
             options,
             mut selected,
         } => match ev.code {
             KeyCode::Esc | KeyCode::Char('q') => Outcome::Close,
             KeyCode::Char('j') | KeyCode::Down => {
                 selected = (selected + 1).min(options.len() - 1);
-                Outcome::Keep(Popup::Source { options, selected })
+                Outcome::Keep(Popup::ProjectPick { options, selected })
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 selected = selected.saturating_sub(1);
-                Outcome::Keep(Popup::Source { options, selected })
+                Outcome::Keep(Popup::ProjectPick { options, selected })
             }
-            KeyCode::Enter => Outcome::Submit(PopupCmd::SetSource(options[selected].clone())),
-            _ => Outcome::Keep(Popup::Source { options, selected }),
+            KeyCode::Enter => Outcome::Submit(PopupCmd::SetProject(options[selected].clone())),
+            _ => Outcome::Keep(Popup::ProjectPick { options, selected }),
         },
         Popup::Start(mut form) => {
             let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
@@ -504,7 +506,7 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 let (name, _, label) = a.spec();
                 let g = name.split('.').next().unwrap_or("");
                 let g = match g {
-                    "goto" | "top" | "bottom" => "navigation",
+                    "goto" | "top" | "bottom" | "fold" | "unfold" | "project" => "navigation",
                     "agent" => "agent",
                     "worktree" => "worktree",
                     "review" => "review",
@@ -601,7 +603,7 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 rect,
             );
         }
-        Popup::Source { options, selected } => {
+        Popup::ProjectPick { options, selected } => {
             let items: Vec<ListItem> = options
                 .iter()
                 .enumerate()
@@ -619,7 +621,7 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 .collect();
             let rect = centered(area, 50, items.len() as u16 + 2);
             f.render_widget(Clear, rect);
-            f.render_widget(List::new(items).block(frame_block("review source")), rect);
+            f.render_widget(List::new(items).block(frame_block("project")), rect);
         }
         Popup::Start(form) => {
             let rect = centered(area, 90, 20);
@@ -689,11 +691,13 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             } else {
                 fleet_core::slug::branch_for(&name_s)
             };
-            let preview = format!(
-                " → {}/{}/{slug} on {branch}",
-                app.cfg.worktrees_dir.display(),
-                form.repos.get(form.repo_idx).cloned().unwrap_or_default()
-            );
+            let wt_dir = form
+                .repos
+                .get(form.repo_idx)
+                .and_then(|n| app.cfg.project(n))
+                .map(|p| p.worktrees_dir().display().to_string())
+                .unwrap_or_default();
+            let preview = format!(" → {wt_dir}/{slug} on {branch}");
             let prect = Rect {
                 x: inner.x,
                 y: inner.y + inner.height.saturating_sub(1),

@@ -53,6 +53,15 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
         }
     }
 
+    // Stamp each agent with its pane target.
+    let agents: Vec<AgentRow> = agents
+        .into_iter()
+        .map(|mut a| {
+            a.pane_target = agent_pane.get(&a.pid).map(|&i| panes[i].target());
+            a
+        })
+        .collect();
+
     // reviews by source branch
     let mut review_by_branch: HashMap<&str, Vec<&ReviewRow>> = HashMap::new();
     for r in &reviews {
@@ -130,6 +139,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
             last_activity,
         });
         worktree_views.push(WorktreeView {
+            overall: status::overall(Some(w), &ags, primary_review),
             gc: status::gc_verdict(w, &ags, primary_review),
             worktree: w.clone(),
             agents: sort_agents(ags),
@@ -272,6 +282,7 @@ mod tests {
             plan_title: None,
             port: None,
             last_activity: None,
+            pane_target: None,
         }
     }
 

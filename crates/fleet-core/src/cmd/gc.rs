@@ -140,7 +140,7 @@ pub async fn apply(plan: &GcPlan, cfg: &Config, log: &Progress) -> Vec<(GcAction
                 missing,
                 ..
             } => {
-                let repo_path = cfg.repo_by_name(repo).map(|r| r.path.clone());
+                let repo_path = cfg.project(repo).map(|r| r.repo.clone());
                 match repo_path {
                     None => Err(anyhow::anyhow!("repo {repo} not in config")),
                     Some(rp) => {

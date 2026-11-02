@@ -1,48 +1,74 @@
-use super::render_table;
+//! Reviews tab: [project section] → review → local worktrees → agents.
+
+use super::{agent_cell, pane_cell, render_table, tree_label, Node, NodeData, RowKey, TreeNode};
 use crate::tui::app::{App, SortMode};
-use crate::tui::util::{self, activity_style, dim, review_style, trunc};
+use crate::tui::util::{self, dim, review_style, trunc};
 use fleet_core::model::{ReviewStatus, ReviewView};
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Row};
 
-pub const PRESETS: &[&str] = &["all", "mine", "others", "needs-me", "failed"];
+pub const PRESETS: &[&str] = &["all", "local", "mine", "others", "needs-me", "failed"];
 
-fn me() -> String {
-    // glab's identity; cached once per process.
-    static ME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The user's forge identities (`glab` and `gh`), cached once per process.
+fn me() -> &'static [String] {
+    static ME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     ME.get_or_init(|| {
-        std::process::Command::new("glab")
+        let mut v = vec![];
+        if let Some(u) = std::process::Command::new("glab")
             .args(["api", "user"])
             .output()
             .ok()
             .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-            .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
-            .unwrap_or_default()
+            .and_then(|j| j.get("username").and_then(|u| u.as_str()).map(String::from))
+        {
+            v.push(u);
+        }
+        if let Some(u) = std::process::Command::new("gh")
+            .args(["api", "user", "--jq", ".login"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            v.push(u);
+        }
+        v
     })
-    .clone()
 }
 
-pub fn visible(app: &App) -> Vec<&ReviewView> {
-    let st = &app.tabs.reviews;
-    let me = me();
-    let preset = PRESETS[st.preset];
+pub fn is_me(user: &str) -> bool {
+    me().iter().any(|m| m == user)
+}
+
+/// Reviews of the scoped project(s) after the preset filter, sorted.
+pub fn scoped(app: &App) -> Vec<&ReviewView> {
+    let preset = PRESETS[app.tabs.reviews.preset];
+    let sources: Vec<&str> = match &app.tabs.project {
+        Some(p) => app
+            .cfg
+            .project(p)
+            .and_then(|x| x.reviews.as_deref())
+            .into_iter()
+            .collect(),
+        None => app
+            .cfg
+            .projects
+            .iter()
+            .filter_map(|p| p.reviews.as_deref())
+            .collect(),
+    };
     let mut rows: Vec<&ReviewView> = app
         .fleet
         .reviews
         .iter()
-        .filter(|r| {
-            app.tabs
-                .source
-                .as_deref()
-                .map(|s| r.review.source == s)
-                .unwrap_or(true)
-        })
+        .filter(|r| sources.contains(&r.review.source.as_str()))
         .filter(|r| match preset {
-            "mine" => r.review.author == me,
-            "others" => r.review.author != me,
+            "local" => !r.worktrees.is_empty(),
+            "mine" => is_me(&r.review.author),
+            "others" => !is_me(&r.review.author),
             "needs-me" => {
-                r.review.author != me
-                    && !r.review.approvals.contains(&me)
+                !is_me(&r.review.author)
+                    && !r.review.approvals.iter().any(|a| is_me(a))
                     && !r.review.status.is_done()
             }
             "failed" => matches!(
@@ -50,22 +76,6 @@ pub fn visible(app: &App) -> Vec<&ReviewView> {
                 ReviewStatus::CiFailed | ReviewStatus::Conflicts
             ),
             _ => true,
-        })
-        .filter(|r| {
-            let hay = format!(
-                "{} {} {} {} {} {}",
-                r.review.display_id,
-                r.review.title,
-                r.review.author,
-                r.review.source_branch,
-                r.review.status.label(),
-                r.worktrees
-                    .iter()
-                    .map(|w| w.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            util::fuzzy_match(&hay, &st.filter)
         })
         .collect();
     match app.sort {
@@ -87,187 +97,234 @@ pub fn visible(app: &App) -> Vec<&ReviewView> {
     rows
 }
 
-pub fn selected(app: &App) -> Option<&ReviewView> {
-    visible(app).get(app.tabs.reviews.selected).copied()
+fn review_node(app: &App, v: &ReviewView) -> TreeNode {
+    let children: Vec<TreeNode> = v
+        .worktrees
+        .iter()
+        .map(|w| {
+            let view = app
+                .fleet
+                .worktrees
+                .iter()
+                .find(|x| x.worktree.path == w.path);
+            let agents: Vec<TreeNode> = v
+                .agents
+                .iter()
+                .filter(|a| a.cwd.starts_with(&w.path))
+                .map(|a| {
+                    let pane = view.and_then(|vw| {
+                        a.pane_target
+                            .as_ref()
+                            .and_then(|t| vw.panes.iter().find(|p| p.target() == *t))
+                            .cloned()
+                    });
+                    TreeNode::leaf(
+                        RowKey::Agent(a.pid),
+                        NodeData::Agent {
+                            agent: a.clone(),
+                            worktree: Some(w.clone()),
+                            review: Some(v.review.clone()),
+                            pane,
+                            project: Some(w.repo.clone()),
+                        },
+                    )
+                })
+                .collect();
+            match view {
+                Some(vw) => TreeNode::new(
+                    RowKey::Dir(w.path.clone()),
+                    NodeData::Worktree(vw.clone()),
+                    agents,
+                ),
+                None => TreeNode::new(
+                    RowKey::Dir(w.path.clone()),
+                    NodeData::Worktree(fleet_core::model::WorktreeView {
+                        worktree: w.clone(),
+                        overall: fleet_core::model::Overall::Dead,
+                        agents: vec![],
+                        panes: vec![],
+                        review: Some(v.review.clone()),
+                        gc: fleet_core::model::GcVerdict::No("unknown".into()),
+                    }),
+                    agents,
+                ),
+            }
+        })
+        .collect();
+    TreeNode::new(
+        RowKey::Review(v.review.source.clone(), v.review.id),
+        NodeData::Review(v.clone()),
+        children,
+    )
 }
 
-pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
-    let rows_v = visible(app);
-    let me = me();
-    let rows: Vec<Row> = rows_v
+pub fn build(app: &App) -> Vec<TreeNode> {
+    let rows = scoped(app);
+    match &app.tabs.project {
+        Some(_) => rows.iter().map(|v| review_node(app, v)).collect(),
+        None => app
+            .cfg
+            .projects
+            .iter()
+            .filter_map(|p| {
+                let src = p.reviews.as_deref()?;
+                let mine: Vec<&ReviewView> = rows
+                    .iter()
+                    .copied()
+                    .filter(|r| r.review.source == src)
+                    .collect();
+                let local = mine.iter().filter(|r| !r.worktrees.is_empty()).count();
+                Some(TreeNode::new(
+                    RowKey::Project(p.name.clone()),
+                    NodeData::Project {
+                        name: p.name.clone(),
+                        summary: format!("{src} · {} open · {local} local", mine.len()),
+                    },
+                    mine.iter().map(|v| review_node(app, v)).collect(),
+                ))
+            })
+            .collect(),
+    }
+}
+
+pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected: usize) {
+    let rows: Vec<Row> = nodes
         .iter()
-        .map(|v| {
-            let r = &v.review;
-            let comments = if r.threads.total == 0 {
-                Line::from(Span::styled("0", dim()))
-            } else {
-                Line::from(vec![
-                    Span::raw(format!("{} ", r.threads.total)),
+        .map(|n| match &n.data {
+            NodeData::Project { name, summary } => Row::new(vec![
+                Cell::from(Line::from(vec![
+                    Span::styled(if n.unfolded { "▾ " } else { "▸ " }, dim()),
                     Span::styled(
-                        format!("✔{}", r.threads.resolved),
-                        Style::default().fg(Color::Green),
+                        name.clone(),
+                        Style::default()
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Cyan),
                     ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("✘{}", r.threads.unresolved),
-                        if r.threads.unresolved > 0 {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            dim()
-                        },
+                ])),
+                Cell::from(Span::styled(summary.clone(), dim())),
+            ]),
+            NodeData::Review(v) => {
+                let r = &v.review;
+                let comments = if r.threads.total == 0 {
+                    Line::from(Span::styled("0", dim()))
+                } else {
+                    Line::from(vec![
+                        Span::raw(format!("{} ", r.threads.total)),
+                        Span::styled(
+                            format!("✔{}", r.threads.resolved),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("✘{}", r.threads.unresolved),
+                            if r.threads.unresolved > 0 {
+                                Style::default().fg(Color::Yellow)
+                            } else {
+                                dim()
+                            },
+                        ),
+                    ])
+                };
+                let local = match (v.worktrees.len(), v.agents.first()) {
+                    (0, _) => Line::from(Span::styled("—", dim())),
+                    (w, None) => {
+                        Line::from(format!("{w} worktree{}", if w > 1 { "s" } else { "" }))
+                    }
+                    (w, Some(a)) => Line::from(vec![
+                        Span::raw(format!("{w} wt · {} ag · ", v.agents.len())),
+                        Span::styled(
+                            format!("{} {}", a.activity.glyph(), a.activity.label()),
+                            util::activity_style(a.activity),
+                        ),
+                    ]),
+                };
+                let author = if is_me(&r.author) {
+                    "me".to_string()
+                } else {
+                    trunc(&r.author, 10)
+                };
+                Row::new(vec![
+                    Cell::from(tree_label(n, &r.display_id)),
+                    Cell::from(trunc(&r.title, 44)),
+                    Cell::from(Span::styled(author, dim())),
+                    Cell::from(Span::styled(
+                        r.status.label().to_string(),
+                        review_style(r.status),
+                    )),
+                    Cell::from(r.ci.glyph()),
+                    Cell::from(format!("{}", r.approvals.len())),
+                    Cell::from(comments),
+                    Cell::from(local),
+                ])
+            }
+            NodeData::Worktree(v) => {
+                let w = &v.worktree;
+                Row::new(vec![
+                    Cell::from(tree_label(n, &trunc(&w.name, 30))),
+                    Cell::from(Line::from(vec![
+                        Span::raw(w.branch.as_deref().unwrap_or("(detached)").to_string()),
+                        Span::styled(
+                            format!(" {}{}", w.sync_glyph(), if w.dirty { " *" } else { "" }),
+                            dim(),
+                        ),
+                    ])),
+                    Cell::from(""),
+                    Cell::from(Span::styled(
+                        v.overall.label().to_string(),
+                        util::overall_style(v.overall),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(format!("{} agents", v.agents.len()), dim())),
+                    pane_cell(
+                        v.agents.first().and_then(|a| a.pane_target.as_deref()).or(v
+                            .panes
+                            .first()
+                            .map(|p| p.target())
+                            .as_deref()),
+                        v.panes.iter().any(|p| p.attached),
                     ),
                 ])
-            };
-            let wts = match v.worktrees.len() {
-                0 => Line::from(Span::styled("0", dim())),
-                n => Line::from(vec![
-                    Span::raw(format!("{n} · ")),
-                    Span::raw(trunc(&v.worktrees[0].name, 18)),
-                    Span::styled(
-                        if n > 1 {
-                            format!(" +{}", n - 1)
-                        } else {
-                            String::new()
-                        },
-                        dim(),
-                    ),
-                ]),
-            };
-            let ags = match v.agents.first() {
-                None => Line::from(Span::styled("0", dim())),
-                Some(a) => Line::from(vec![
-                    Span::raw(format!("{} · ", v.agents.len())),
-                    Span::styled(format!("{} ", a.mode.as_deref().unwrap_or("?")), dim()),
-                    Span::styled(
-                        format!("{} {}", a.activity.glyph(), a.activity.label()),
-                        activity_style(a.activity),
-                    ),
-                    Span::styled(
-                        if v.agents.len() > 1 {
-                            format!(" +{}", v.agents.len() - 1)
-                        } else {
-                            String::new()
-                        },
-                        dim(),
-                    ),
-                ]),
-            };
-            let author = if r.author == me {
-                "me".to_string()
-            } else {
-                trunc(&r.author, 10)
-            };
-            Row::new(vec![
-                Cell::from(r.display_id.clone()),
-                Cell::from(trunc(&r.title, 40)),
-                Cell::from(Span::styled(author, dim())),
-                Cell::from(Span::styled(
-                    r.status.label().to_string(),
-                    review_style(r.status),
+            }
+            NodeData::Agent { agent, pane, .. } => Row::new(vec![
+                Cell::from(tree_label(
+                    n,
+                    &trunc(agent.title.as_deref().unwrap_or("(no title)"), 30),
                 )),
-                Cell::from(r.ci.glyph()),
-                Cell::from(format!("{}", r.approvals.len())),
-                Cell::from(comments),
-                Cell::from(wts),
-                Cell::from(ags),
-            ])
+                agent_cell(agent),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(Span::styled(
+                    format!("{} ago", util::ago(agent.last_activity)),
+                    dim(),
+                )),
+                pane_cell(
+                    agent.pane_target.as_deref(),
+                    pane.as_ref().map(|p| p.attached).unwrap_or(false),
+                ),
+            ]),
+            _ => Row::new(vec![Cell::from("")]),
         })
         .collect();
     render_table(
         f,
         area,
         vec![
-            "ID",
-            "TITLE",
-            "AUTHOR",
-            "STATUS",
-            "CI",
-            "👍",
-            "COMMENTS",
-            "WORKTREES",
-            "AGENTS",
+            "ID", "TITLE", "AUTHOR", "STATUS", "CI", "👍", "COMMENTS", "LOCAL",
         ],
         vec![
-            Constraint::Length(6),
-            Constraint::Length(40),
+            Constraint::Length(32),
+            Constraint::Length(44),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(12),
-            Constraint::Length(26),
-            Constraint::Min(22),
+            Constraint::Min(26),
         ],
         rows,
-        app.tabs.reviews.selected,
+        selected,
     );
-}
-
-pub fn detail(app: &App) -> Text<'static> {
-    let Some(v) = selected(app) else {
-        return Text::from("");
-    };
-    let r = &v.review;
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!(" {} ", r.display_id), util::accent()),
-        Span::raw(format!(
-            "{} · by {} · {} → {} · updated {} ago",
-            trunc(&r.title, 80),
-            r.author,
-            r.source_branch,
-            r.target_branch,
-            util::ago(r.updated_at)
-        )),
-    ])];
-    lines.push(Line::from(vec![
-        Span::raw("   "),
-        Span::styled(r.status.label().to_string(), review_style(r.status)),
-        Span::raw(format!(
-            " · CI {} · approved by {} · {} comments: {} resolved, {} open · ",
-            r.ci.glyph(),
-            if r.approvals.is_empty() {
-                "nobody".into()
-            } else {
-                r.approvals.join(", ")
-            },
-            r.threads.total,
-            r.threads.resolved,
-            r.threads.unresolved
-        )),
-        Span::styled(r.url.clone(), dim()),
-    ]));
-    if v.worktrees.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "   no local worktree · v r (or Enter) starts a review agent",
-            dim(),
-        )));
-    }
-    for w in &v.worktrees {
-        let ags: Vec<String> = v
-            .agents
-            .iter()
-            .filter(|a| a.cwd.starts_with(&w.path))
-            .map(|a| {
-                format!(
-                    "{} {} {}",
-                    a.mode.as_deref().unwrap_or("?"),
-                    a.activity.glyph(),
-                    a.activity.label()
-                )
-            })
-            .collect();
-        lines.push(Line::from(format!(
-            "   worktree {} ({} {}{}) · agents: {}",
-            w.name,
-            w.branch.as_deref().unwrap_or("detached"),
-            w.sync_glyph(),
-            if w.dirty { " *" } else { "" },
-            if ags.is_empty() {
-                "none".into()
-            } else {
-                ags.join(", ")
-            }
-        )));
-    }
-    Text::from(lines)
 }

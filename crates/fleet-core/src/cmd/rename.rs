@@ -29,9 +29,9 @@ pub async fn rename(cfg: &Config, old: &str, new: &str, log: &Progress) -> Resul
         .get(old)?
         .with_context(|| format!("`{old}` is not a fleet-started task (see `fleet agent list`)"))?;
     let repo = cfg
-        .repo_by_name(&task.repo)
+        .project(&task.repo)
         .with_context(|| format!("repo `{}` not in config", task.repo))?;
-    let new_path = cfg.worktrees_dir.join(&repo.name).join(new);
+    let new_path = repo.worktrees_dir().join(new);
     if new_path.exists() {
         bail!("{} already exists", new_path.display());
     }
@@ -44,7 +44,7 @@ pub async fn rename(cfg: &Config, old: &str, new: &str, log: &Progress) -> Resul
         Some(b) if task.kind == "start" => {
             let nb = slug::branch_for(new);
             log(&format!("git branch -m {b} {nb}"));
-            git::branch_rename(&repo.path, b, &nb).await?;
+            git::branch_rename(&repo.repo, b, &nb).await?;
             Some(nb)
         }
         other => other.clone(),
@@ -55,7 +55,7 @@ pub async fn rename(cfg: &Config, old: &str, new: &str, log: &Progress) -> Resul
         task.path.display(),
         new_path.display()
     ));
-    git::worktree_move(&repo.path, &task.path, &new_path).await?;
+    git::worktree_move(&repo.repo, &task.path, &new_path).await?;
     // Keep the old absolute path valid for the running agent.
     std::os::unix::fs::symlink(&new_path, &task.path)
         .with_context(|| format!("symlink {} -> {}", task.path.display(), new_path.display()))?;

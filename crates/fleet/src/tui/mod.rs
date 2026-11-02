@@ -8,6 +8,6 @@ pub mod util;
 use anyhow::Result;
 use fleet_core::Config;
 
-pub async fn run(cfg: Config) -> Result<()> {
-    app::run(cfg).await
+pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
+    app::run(cfg, project).await
 }

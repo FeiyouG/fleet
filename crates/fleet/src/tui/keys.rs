@@ -32,7 +32,7 @@ pub enum Action {
     Expand,
     Sort,
     // goto
-    GotoOverview,
+    GotoAgents,
     GotoTmux,
     GotoWorktree,
     GotoReview,
@@ -59,7 +59,10 @@ pub enum Action {
     ReviewGotoWorktrees,
     ReviewGotoAgents,
     ReviewFilter,
-    ReviewSource,
+    ProjectNext,
+    ProjectPrev,
+    FoldAll,
+    UnfoldAll,
     // tmux
     TmuxKill,
     TmuxRename,
@@ -92,7 +95,7 @@ impl Action {
         Action::Collapse,
         Action::Expand,
         Action::Sort,
-        Action::GotoOverview,
+        Action::GotoAgents,
         Action::GotoTmux,
         Action::GotoWorktree,
         Action::GotoReview,
@@ -116,7 +119,10 @@ impl Action {
         Action::ReviewGotoWorktrees,
         Action::ReviewGotoAgents,
         Action::ReviewFilter,
-        Action::ReviewSource,
+        Action::ProjectNext,
+        Action::ProjectPrev,
+        Action::FoldAll,
+        Action::UnfoldAll,
         Action::TmuxKill,
         Action::TmuxRename,
     ];
@@ -138,7 +144,7 @@ impl Action {
             Action::Bottom => ("bottom", "G", "bottom"),
             Action::PageUp => ("page.up", "C-u", "page up"),
             Action::PageDown => ("page.down", "C-d", "page down"),
-            Action::Tab1 => ("tab.overview", "1", "Overview tab"),
+            Action::Tab1 => ("tab.agents", "1", "Agents tab"),
             Action::Tab2 => ("tab.tmux", "2", "Tmux tab"),
             Action::Tab3 => ("tab.worktrees", "3", "Worktrees tab"),
             Action::Tab4 => ("tab.reviews", "4", "Reviews tab"),
@@ -150,7 +156,7 @@ impl Action {
             Action::Collapse => ("collapse", "h", "collapse"),
             Action::Expand => ("expand", "l", "expand"),
             Action::Sort => ("sort", "S", "cycle sort"),
-            Action::GotoOverview => ("goto.overview", "g o", "this row in Overview"),
+            Action::GotoAgents => ("goto.agents", "g a", "this row in Agents"),
             Action::GotoTmux => ("goto.tmux", "g t", "this row in Tmux"),
             Action::GotoWorktree => ("goto.worktree", "g w", "this row in Worktrees"),
             Action::GotoReview => ("goto.review", "g v", "this row in Reviews"),
@@ -178,7 +184,10 @@ impl Action {
                 "v f",
                 "filter: all/mine/others/needs-me/failed",
             ),
-            Action::ReviewSource => ("review.source", "v S", "source picker"),
+            Action::ProjectNext => ("project.next", "p", "next project (… → all)"),
+            Action::ProjectPrev => ("project.prev", "P", "previous project"),
+            Action::FoldAll => ("fold.all", "z c", "fold all"),
+            Action::UnfoldAll => ("unfold.all", "z o", "unfold all"),
             Action::TmuxKill => ("tmux.kill", "K", "kill session (confirm)"),
             Action::TmuxRename => ("tmux.rename", "n", "rename session"),
         }
@@ -427,6 +436,7 @@ impl Keymap {
                     "agent" => "agent",
                     "worktree" => "worktree",
                     "review" => "review",
+                    "fold" | "unfold" => "fold",
                     _ => "more",
                 };
                 if !v.iter().any(|(x, _)| *x == k[0]) {
@@ -460,11 +470,11 @@ mod tests {
         let km = Keymap::from_config(&cfg);
         assert!(km.overrides_errors.is_empty());
         assert_eq!(km.chord_for(Action::AgentStart).unwrap(), "C-n");
-        assert_eq!(km.chord_for(Action::GotoOverview).unwrap(), "g o");
+        assert_eq!(km.chord_for(Action::GotoAgents).unwrap(), "g a");
         let g = Key::parse("g").unwrap();
         match km.resolve(&[g]) {
             Resolution::Prefix(menu) => {
-                assert!(menu.iter().any(|(_, a)| *a == Action::GotoOverview))
+                assert!(menu.iter().any(|(_, a)| *a == Action::GotoAgents))
             }
             _ => panic!("g should be a prefix"),
         }

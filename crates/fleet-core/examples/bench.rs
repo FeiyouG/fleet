@@ -18,7 +18,7 @@ fn main() {
     let cfg = fleet_core::Config::load().unwrap();
     let t = Instant::now();
     let w = rt
-        .block_on(fleet_core::worktrees::git::worktrees(&cfg.repos[0]))
+        .block_on(fleet_core::worktrees::git::worktrees(&cfg.projects[0]))
         .unwrap();
     println!("git: {:?} ({} wts)", t.elapsed(), w.len());
     let t = Instant::now();
@@ -33,8 +33,7 @@ fn main() {
         a.iter().filter(|x| x.plan_url.is_some()).count()
     );
     let t = Instant::now();
-    let gl =
-        fleet_core::reviews::adapter_for(cfg.repos[0].review_source.as_ref().unwrap()).unwrap();
+    let gl = fleet_core::reviews::adapter_for(cfg.projects[0].reviews.as_ref().unwrap()).unwrap();
     use fleet_core::reviews::ReviewAdapter;
     let r = rt.block_on(gl.open_reviews()).unwrap();
     println!("reviews: {:?} ({} rows)", t.elapsed(), r.len());

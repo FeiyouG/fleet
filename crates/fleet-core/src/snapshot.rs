@@ -37,9 +37,9 @@ impl Engine {
     pub fn new(config: Config) -> Self {
         let agent_adapters = agents::adapters(&config.agents.adapters);
         let mut sources: Vec<String> = config
-            .repos
+            .projects
             .iter()
-            .filter_map(|r| r.review_source.clone())
+            .filter_map(|r| r.reviews.clone())
             .collect();
         sources.sort();
         sources.dedup();
@@ -127,7 +127,7 @@ impl Engine {
         let worktrees_f = async {
             let mut all: Vec<WorktreeRow> = vec![];
             let mut errs = vec![];
-            for repo in &self.config.repos {
+            for repo in &self.config.projects {
                 match git::worktrees(repo).await {
                     Ok(v) => all.extend(v),
                     Err(e) => errs.push(format!("{}: {e}", repo.name)),
@@ -175,9 +175,9 @@ impl Engine {
 
         let repo_sources = self
             .config
-            .repos
+            .projects
             .iter()
-            .filter_map(|r| r.review_source.clone().map(|s| (r.name.clone(), s)))
+            .filter_map(|r| r.reviews.clone().map(|s| (r.name.clone(), s)))
             .collect();
         let mut fleet = join::join(Inputs {
             panes,
@@ -198,7 +198,7 @@ impl Engine {
         &self,
         wait: bool,
     ) -> (Vec<ReviewRow>, Option<DateTime<Utc>>, Option<String>) {
-        let ttl = Duration::from_secs(self.config.review_ttl_secs);
+        let ttl = Duration::from_secs(self.config.defaults.review_ttl_secs);
         let stale = {
             let c = self.reviews.lock().await;
             c.fetched_instant.map(|t| t.elapsed() > ttl).unwrap_or(true) && !c.in_flight

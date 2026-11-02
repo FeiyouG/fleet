@@ -92,6 +92,7 @@ pub fn row_from_facts(
         plan_title: plan.and_then(|p| p.title.clone()),
         port,
         last_activity: session.map(|s| s.updated),
+        pane_target: None,
     }
 }
 
