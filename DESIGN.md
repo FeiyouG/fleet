@@ -670,3 +670,33 @@ return {
 4. **Change 1** — plugin embedded, `state_file.rs`, discovery merge, activity rule. Verify live: trigger a permission prompt, see `WAIT:perm`, reply, see it clear.
 5. **Change 3** — `local` preset, footer, remove `v S`.
 6. **Change 6** — `fleet setup`; README + DESIGN updated; one commit per change.
+
+---
+
+# fleet v0.3 — choose the agent and model, at start and per message
+
+## What can be switched, and where the list comes from
+
+- **Models**: `opencode models` (run in the project repo, so the repo's `opencode.json` counts) prints every `provider/model` opencode has credentials for. The list is the same for every opencode agent.
+- **Agents (modes)**: `opencode agent list` header lines `name (primary|all)`; `opencode debug agent NAME` gives `hidden` (internal agents such as `compaction`, `summary`, `title` are dropped) and the agent's own `model`; `opencode debug config` gives the global `model`. "Default" for an agent = its own model, else the global one. If `debug` fails, the three internal names are dropped by name.
+- Discovery lives behind `AgentAdapter::choices(cwd) -> Choices { agents, models, default_model }` (`agents/opencode/choices.rs`), cached 5 minutes per directory. Another agent CLI answers from its own source (Claude Code has no list command; an adapter would return its aliases).
+- The model an agent is using now = the model of its session's last message in opencode's DB (assistant `providerID/modelID`, user `model.{providerID,modelID}`), shown in `fleet agent list` and the TUI.
+
+## Starting with a model
+
+`fleet agent start --model P/M`, config `defaults.model`, and the TUI start popup's `model` row (filterable picker) set `LaunchSpec.model`, which adds `--model P/M` to the `opencode` command line only when set. `--mode`/`--model` are checked against `choices` (unknown model → up to five close matches); if discovery itself fails the start goes ahead unchecked.
+
+## Sending with a model / agent: the plugin control endpoint
+
+Finding while planning: three fleet-started agents had no listener on their registry port. Their processes ran as plain `opencode` (no `--port`), i.e. they had been restarted by hand, so `fleet agent send` to them failed, and hand-started agents never had an API port. An end-to-end test confirmed `--port` itself works on opencode 1.18.30 when fleet launches the agent.
+
+The plugin (`assets/fleet.ts`, state file `version: 2`) therefore opens its own endpoint: `Bun.serve` on `127.0.0.1:0`, a random bearer token, `control_url` + `token` written to the state file (mode 0600; the token is never serialised into `fleet status --json`). `POST /send {text, model?, agent?}`:
+
+- no override → `client.tui.appendPrompt` + `submitPrompt` (exactly as if typed);
+- override → `client.session.promptAsync` on the plugin's `current_session` (the root session the user last worked in, tracked from `session.created/updated` parent ids and `message.updated`), with `agent` defaulting to the session's last user agent (otherwise opencode would fall back to its default agent), then a TUI toast: the TUI's own selector does not follow an API message, so the next message you type uses the TUI's model again.
+
+`SendTarget` is `Control { url, token }` (plugin v2) or `Pane` (tmux keys; an override there errors with "run `fleet setup` and restart the agent"). `SendTarget::Port` and `/tui/submit-prompt` over the agent's port are gone: one send path. Re-review (`review start` on an existing review) uses the same target selection.
+
+Verified [LOCAL] on throwaway agents (temp repo, temp data dir, free models): start with `--model opencode/big-pickle` → reply from Big Pickle; `send --model opencode/glm-5.3-flash-free` → that turn from GLM with agent `build` kept; a following plain `send` → back to Big Pickle; bad token → 401.
+
+Deploy order: old plugin + new fleet → no `control_url`, plain messages go by tmux keys, overrides error with the setup hint. New plugin + old fleet → extra state-file fields are ignored; old fleet's port-based send works as before where the port listens.

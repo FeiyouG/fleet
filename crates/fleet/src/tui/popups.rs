@@ -20,10 +20,13 @@ pub enum PopupCmd {
         prompt: String,
         repo: String,
         mode: Option<String>,
+        model: Option<String>,
     },
     Message {
         name: String,
         text: String,
+        model: Option<String>,
+        agent: Option<String>,
     },
     Rename {
         old: String,
@@ -54,6 +57,7 @@ pub enum Popup {
         cmd: PopupCmd,
     },
     Start(StartForm),
+    Message(MessageForm),
     Gc {
         plan: GcPlan,
         checked: Vec<bool>,
@@ -69,7 +73,6 @@ pub enum Popup {
 pub enum InputKind {
     Filter,
     Command,
-    Message(String),
     Rename(String),
     TmuxRename(String),
 }
@@ -79,10 +82,154 @@ pub struct StartForm {
     pub prompt: TextArea<'static>,
     pub repos: Vec<String>,
     pub repo_idx: usize,
-    pub modes: Vec<String>,
-    pub mode_idx: usize,
-    /// 0 name, 1 repo, 2 mode, 3 prompt
+    /// opencode agent; cycles through the agents discovered for the repo.
+    pub mode: String,
+    /// `None` = default (the agent's own model, else opencode's global one).
+    pub model: Option<String>,
+    pub picker: Option<Picker>,
+    /// 0 name, 1 repo, 2 mode, 3 model, 4 prompt
     pub focus: usize,
+}
+
+const START_FIELDS: usize = 5;
+const FOCUS_PROMPT: usize = 4;
+
+impl StartForm {
+    pub fn repo_dir(&self, cfg: &Config) -> Option<std::path::PathBuf> {
+        let name = self.repos.get(self.repo_idx)?;
+        cfg.project(name).map(|p| p.repo.clone())
+    }
+}
+
+/// A message to a running agent, optionally switching agent and/or model for it.
+pub struct MessageForm {
+    pub name: String,
+    /// The agent's directory: where its choices come from.
+    pub cwd: Option<std::path::PathBuf>,
+    /// What the agent uses now (shown, and the meaning of "unchanged").
+    pub current_mode: Option<String>,
+    pub current_model: Option<String>,
+    pub text: String,
+    /// `None` = unchanged.
+    pub agent: Option<String>,
+    /// `None` = unchanged.
+    pub model: Option<String>,
+    pub picker: Option<Picker>,
+}
+
+/// The filterable model list opened from a form.
+#[derive(Default)]
+pub struct Picker {
+    pub filter: String,
+    pub selected: usize,
+}
+
+enum Picked {
+    Keep,
+    Cancel,
+    Pick(Option<String>),
+}
+
+/// Entries of the picker: `None` first (default / unchanged), then models matching every
+/// space-separated word of the filter (case-insensitive).
+fn picker_items(models: &[String], filter: &str) -> Vec<Option<String>> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    let mut out = vec![];
+    if words.is_empty() {
+        out.push(None);
+    }
+    out.extend(
+        models
+            .iter()
+            .filter(|m| {
+                let l = m.to_lowercase();
+                words.iter().all(|w| l.contains(w))
+            })
+            .map(|m| Some(m.clone())),
+    );
+    out
+}
+
+fn picker_key(p: &mut Picker, ev: &KeyEvent, models: &[String]) -> Picked {
+    let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+    let items = picker_items(models, &p.filter);
+    match ev.code {
+        KeyCode::Esc => return Picked::Cancel,
+        KeyCode::Enter => {
+            return match items.get(p.selected) {
+                Some(i) => Picked::Pick(i.clone()),
+                None => Picked::Keep,
+            }
+        }
+        KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+        KeyCode::Char('p') | KeyCode::Char('k') if ctrl => {
+            p.selected = p.selected.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            p.selected = (p.selected + 1).min(items.len().saturating_sub(1))
+        }
+        KeyCode::Char('n') | KeyCode::Char('j') if ctrl => {
+            p.selected = (p.selected + 1).min(items.len().saturating_sub(1))
+        }
+        KeyCode::PageDown => p.selected = (p.selected + 10).min(items.len().saturating_sub(1)),
+        KeyCode::PageUp => p.selected = p.selected.saturating_sub(10),
+        KeyCode::Backspace => {
+            p.filter.pop();
+            p.selected = 0;
+        }
+        KeyCode::Char('u') if ctrl => {
+            p.filter.clear();
+            p.selected = 0;
+        }
+        KeyCode::Char(c) if !ctrl => {
+            p.filter.push(c);
+            p.selected = 0;
+        }
+        _ => {}
+    }
+    Picked::Keep
+}
+
+/// The models offered for `dir`, or empty while loading / on error.
+fn models_for(app: &App, dir: Option<&std::path::Path>) -> Vec<String> {
+    dir.and_then(|d| app.choices_for(d))
+        .and_then(|r| r.as_ref().ok())
+        .map(|c| c.models.clone())
+        .unwrap_or_default()
+}
+
+/// Agent names offered for `dir`; while loading (or on error) the two built-ins.
+fn agents_for(app: &App, dir: Option<&std::path::Path>) -> Vec<String> {
+    match dir
+        .and_then(|d| app.choices_for(d))
+        .and_then(|r| r.as_ref().ok())
+    {
+        Some(c) if !c.agents.is_empty() => c.agent_names(),
+        _ => vec!["plan".into(), "build".into()],
+    }
+}
+
+/// `loading…` / the error / `None` when the choices for `dir` are ready.
+fn choices_note(app: &App, dir: Option<&std::path::Path>) -> Option<String> {
+    match dir.and_then(|d| app.choices_for(d)) {
+        None if dir.is_some() => Some("loading agents and models…".into()),
+        None => Some("no repo".into()),
+        Some(Err(e)) => Some(format!("could not list models: {e}")),
+        Some(Ok(_)) => None,
+    }
+}
+
+fn cycle(list: &[String], cur: &str, back: bool) -> String {
+    if list.is_empty() {
+        return cur.to_string();
+    }
+    let n = list.len();
+    let next = match list.iter().position(|x| x == cur) {
+        Some(i) if back => (i + n - 1) % n,
+        Some(i) => (i + 1) % n,
+        None => 0,
+    };
+    list[next].clone()
 }
 
 pub enum Outcome {
@@ -109,12 +256,17 @@ impl Popup {
             kind: InputKind::Command,
         }
     }
-    pub fn message(name: String) -> Popup {
-        Popup::Input {
-            title: format!("message to {name}"),
-            value: String::new(),
-            kind: InputKind::Message(name),
-        }
+    pub fn message(name: String, agent: Option<fleet_core::model::AgentRow>) -> Popup {
+        Popup::Message(MessageForm {
+            name,
+            cwd: agent.as_ref().map(|a| a.cwd.clone()),
+            current_mode: agent.as_ref().and_then(|a| a.mode.clone()),
+            current_model: agent.and_then(|a| a.model),
+            text: String::new(),
+            agent: None,
+            model: None,
+            picker: None,
+        })
     }
     pub fn rename(old: String) -> Popup {
         Popup::Input {
@@ -163,19 +315,15 @@ impl Popup {
         let repo_idx = cwd_repo
             .and_then(|n| repos.iter().position(|r| *r == n))
             .unwrap_or(0);
-        let modes = vec!["plan".to_string(), "build".to_string()];
-        let mode_idx = modes
-            .iter()
-            .position(|m| *m == cfg.defaults.mode)
-            .unwrap_or(0);
         Popup::Start(StartForm {
             name,
             prompt,
             repos,
             repo_idx,
-            modes,
-            mode_idx,
-            focus: 3,
+            mode: cfg.defaults.mode.clone(),
+            model: cfg.defaults.model.clone(),
+            picker: None,
+            focus: FOCUS_PROMPT,
         })
     }
 }
@@ -200,13 +348,6 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                                 Outcome::Close
                             } else {
                                 Outcome::Submit(PopupCmd::RunCommand(v))
-                            }
-                        }
-                        InputKind::Message(name) => {
-                            if v.is_empty() {
-                                Outcome::Close
-                            } else {
-                                Outcome::Submit(PopupCmd::Message { name, text: v })
                             }
                         }
                         InputKind::Rename(old) => {
@@ -340,6 +481,15 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
         },
         Popup::Start(mut form) => {
             let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+            let dir = form.repo_dir(&app.cfg);
+            if let Some(mut p) = form.picker.take() {
+                match picker_key(&mut p, ev, &models_for(app, dir.as_deref())) {
+                    Picked::Keep => form.picker = Some(p),
+                    Picked::Cancel => {}
+                    Picked::Pick(m) => form.model = m,
+                }
+                return Outcome::Keep(Popup::Start(form));
+            }
             if esc {
                 return Outcome::Close;
             }
@@ -353,7 +503,8 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                     name: if name.is_empty() { None } else { Some(name) },
                     prompt,
                     repo: form.repos.get(form.repo_idx).cloned().unwrap_or_default(),
-                    mode: form.modes.get(form.mode_idx).cloned(),
+                    mode: Some(form.mode.clone()),
+                    model: form.model.clone(),
                 });
             }
             if ctrl && ev.code == KeyCode::Char('e') {
@@ -374,9 +525,9 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 let back =
                     ev.code == KeyCode::BackTab || ev.modifiers.contains(KeyModifiers::SHIFT);
                 form.focus = if back {
-                    (form.focus + 3) % 4
+                    (form.focus + START_FIELDS - 1) % START_FIELDS
                 } else {
-                    (form.focus + 1) % 4
+                    (form.focus + 1) % START_FIELDS
                 };
                 return Outcome::Keep(Popup::Start(form));
             }
@@ -385,30 +536,48 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                     if ev.code != KeyCode::Enter {
                         form.name.input(*ev);
                     } else {
-                        form.focus = 3;
+                        form.focus = FOCUS_PROMPT;
                     }
                 }
-                1 => match ev.code {
-                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') => {
-                        form.repo_idx =
-                            (form.repo_idx + form.repos.len().max(1) - 1) % form.repos.len().max(1)
+                1 => {
+                    let n = form.repos.len().max(1);
+                    let before = form.repo_idx;
+                    match ev.code {
+                        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') => {
+                            form.repo_idx = (form.repo_idx + n - 1) % n
+                        }
+                        KeyCode::Right
+                        | KeyCode::Char('l')
+                        | KeyCode::Char('j')
+                        | KeyCode::Char(' ')
+                        | KeyCode::Enter => form.repo_idx = (form.repo_idx + 1) % n,
+                        _ => {}
                     }
-                    KeyCode::Right
-                    | KeyCode::Char('l')
-                    | KeyCode::Char('j')
-                    | KeyCode::Char(' ')
-                    | KeyCode::Enter => {
-                        form.repo_idx = (form.repo_idx + 1) % form.repos.len().max(1)
+                    if form.repo_idx != before {
+                        if let Some(d) = form.repo_dir(&app.cfg) {
+                            app.want_choices(d);
+                        }
                     }
-                    _ => {}
-                },
-                2 => match ev.code {
-                    KeyCode::Left
-                    | KeyCode::Right
-                    | KeyCode::Char('h')
-                    | KeyCode::Char('l')
-                    | KeyCode::Char(' ')
-                    | KeyCode::Enter => form.mode_idx = (form.mode_idx + 1) % form.modes.len(),
+                }
+                2 => {
+                    let agents = agents_for(app, dir.as_deref());
+                    match ev.code {
+                        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') => {
+                            form.mode = cycle(&agents, &form.mode, true)
+                        }
+                        KeyCode::Right
+                        | KeyCode::Char('l')
+                        | KeyCode::Char('j')
+                        | KeyCode::Char(' ')
+                        | KeyCode::Enter => form.mode = cycle(&agents, &form.mode, false),
+                        _ => {}
+                    }
+                }
+                3 => match ev.code {
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
+                        form.picker = Some(Picker::default())
+                    }
+                    KeyCode::Backspace | KeyCode::Delete => form.model = None,
                     _ => {}
                 },
                 _ => {
@@ -416,6 +585,48 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 }
             }
             Outcome::Keep(Popup::Start(form))
+        }
+        Popup::Message(mut form) => {
+            let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+            if let Some(mut p) = form.picker.take() {
+                match picker_key(&mut p, ev, &models_for(app, form.cwd.as_deref())) {
+                    Picked::Keep => form.picker = Some(p),
+                    Picked::Cancel => {}
+                    Picked::Pick(m) => form.model = m,
+                }
+                return Outcome::Keep(Popup::Message(form));
+            }
+            match ev.code {
+                KeyCode::Esc => return Outcome::Close,
+                KeyCode::Enter => {
+                    let text = form.text.trim().to_string();
+                    if text.is_empty() {
+                        return Outcome::Close;
+                    }
+                    return Outcome::Submit(PopupCmd::Message {
+                        name: form.name,
+                        text,
+                        model: form.model,
+                        agent: form.agent,
+                    });
+                }
+                // Tab cycles the agent: unchanged -> each agent -> unchanged.
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let mut opts = vec![String::new()];
+                    opts.extend(agents_for(app, form.cwd.as_deref()));
+                    let cur = form.agent.clone().unwrap_or_default();
+                    let next = cycle(&opts, &cur, ev.code == KeyCode::BackTab);
+                    form.agent = (!next.is_empty()).then_some(next);
+                }
+                KeyCode::Char('o') if ctrl => form.picker = Some(Picker::default()),
+                KeyCode::Backspace => {
+                    form.text.pop();
+                }
+                KeyCode::Char('u') if ctrl => form.text.clear(),
+                KeyCode::Char(c) if !ctrl => form.text.push(c),
+                _ => {}
+            }
+            Outcome::Keep(Popup::Message(form))
         }
     }
 }
@@ -623,8 +834,53 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             f.render_widget(Clear, rect);
             f.render_widget(List::new(items).block(frame_block("project")), rect);
         }
+        Popup::Message(form) => {
+            let rect = centered(area, 90, 6);
+            f.render_widget(Clear, rect);
+            let title = format!(
+                "message to {}  ·  Enter send · Tab agent · C-o model · Esc cancel",
+                form.name
+            );
+            let block = frame_block(&title);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let now = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".into());
+            let agent = match &form.agent {
+                Some(a) => Span::styled(a.clone(), accent()),
+                None => Span::raw(format!("unchanged ({})", now(&form.current_mode))),
+            };
+            let model = match &form.model {
+                Some(m) => Span::styled(m.clone(), accent()),
+                None => Span::raw(format!("unchanged ({})", now(&form.current_model))),
+            };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::raw(format!(" {}", form.text)),
+                    Span::styled("▏", accent()),
+                ]),
+                Line::from(vec![
+                    Span::styled(" agent ", dim()),
+                    agent,
+                    Span::styled("   model ", dim()),
+                    model,
+                ]),
+            ];
+            let note = choices_note(app, form.cwd.as_deref()).or_else(|| {
+                (form.agent.is_some() || form.model.is_some()).then(|| {
+                    "applies to this message; the agent's TUI keeps its own selection".into()
+                })
+            });
+            if let Some(n) = note {
+                lines.push(Line::from(Span::styled(format!(" {n}"), dim())));
+            }
+            f.render_widget(Paragraph::new(lines), inner);
+            if let Some(p) = &form.picker {
+                let label = format!("unchanged ({})", now(&form.current_model));
+                draw_picker(f, area, p, &models_for(app, form.cwd.as_deref()), &label);
+            }
+        }
         Popup::Start(form) => {
-            let rect = centered(area, 90, 20);
+            let rect = centered(area, 90, 21);
             f.render_widget(Clear, rect);
             let block =
                 frame_block("start agent  ·  Tab fields · C-e $EDITOR · C-s start · Esc cancel");
@@ -634,9 +890,19 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 Constraint::Length(2),
                 Constraint::Length(1),
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Min(5),
             ])
             .split(inner);
+            let dir = form.repo_dir(&app.cfg);
+            let loaded = dir
+                .as_deref()
+                .and_then(|d| app.choices_for(d))
+                .and_then(|r| r.as_ref().ok());
+            let default_label = match loaded.and_then(|c| c.default_for(&form.mode)) {
+                Some(m) => format!("default ({m})"),
+                None => "default (opencode decides)".into(),
+            };
             let focus = |i: usize| if form.focus == i { accent() } else { dim() };
             // name
             let mut name = form.name.clone();
@@ -666,19 +932,34 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             ]);
             f.render_widget(Paragraph::new(repo_line), rows[1]);
             let mode_line = Line::from(vec![
-                Span::styled("mode  ", focus(2)),
-                Span::raw(form.modes[form.mode_idx].clone()),
+                Span::styled("agent ", focus(2)),
+                Span::raw(form.mode.clone()),
                 Span::styled("  ← → to change", dim()),
             ]);
             f.render_widget(Paragraph::new(mode_line), rows[2]);
+            let model_line = Line::from(vec![
+                Span::styled("model ", focus(3)),
+                match &form.model {
+                    Some(m) => Span::raw(m.clone()),
+                    None => Span::raw(default_label.clone()),
+                },
+                Span::styled(
+                    match choices_note(app, dir.as_deref()) {
+                        Some(n) => format!("  {n}"),
+                        None => "  Enter to pick · Backspace = default".into(),
+                    },
+                    dim(),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(model_line), rows[3]);
             let mut prompt = form.prompt.clone();
             prompt.set_block(
                 Block::default()
                     .borders(Borders::TOP)
                     .border_style(dim())
-                    .title(Span::styled("prompt", focus(3))),
+                    .title(Span::styled("prompt", focus(FOCUS_PROMPT))),
             );
-            f.render_widget(&prompt, rows[3]);
+            f.render_widget(&prompt, rows[4]);
             // preview
             let name_s = form.name.lines().join("").trim().to_string();
             let slug = if name_s.is_empty() {
@@ -705,6 +986,92 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 height: 1,
             };
             f.render_widget(Paragraph::new(Span::styled(preview, dim())), prect);
+            if let Some(p) = &form.picker {
+                draw_picker(f, area, p, &models_for(app, dir.as_deref()), &default_label);
+            }
         }
+    }
+}
+
+/// The model picker, drawn over its form. `none_label` names the `None` entry.
+fn draw_picker(f: &mut Frame, area: Rect, p: &Picker, models: &[String], none_label: &str) {
+    let items = picker_items(models, &p.filter);
+    let rect = centered(area, 70, 22);
+    f.render_widget(Clear, rect);
+    let block = frame_block("model  ·  type to filter · ↑ ↓ · Enter pick · Esc back");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" / ", accent()),
+            Span::raw(p.filter.clone()),
+            Span::styled("▏", accent()),
+            Span::styled(format!("   {} models", models.len()), dim()),
+        ])),
+        rows[0],
+    );
+    let h = rows[1].height as usize;
+    let start = p.selected.saturating_sub(h.saturating_sub(1));
+    let list: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Span::styled(
+            if models.is_empty() {
+                " (no models loaded)"
+            } else {
+                " no match"
+            },
+            dim(),
+        ))]
+    } else {
+        items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(h)
+            .map(|(i, m)| {
+                let style = if i == p.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Span::styled(
+                    format!(" {}", m.as_deref().unwrap_or(none_label)),
+                    style,
+                ))
+            })
+            .collect()
+    };
+    f.render_widget(List::new(list), rows[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picker_filters_by_every_word() {
+        let models: Vec<String> = [
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-sonnet-5",
+            "openai/gpt-5.4",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(picker_items(&models, "").len(), 4);
+        assert_eq!(picker_items(&models, "")[0], None);
+        assert_eq!(
+            picker_items(&models, "ANTH opus"),
+            vec![Some("anthropic/claude-opus-5-5".to_string())]
+        );
+        assert!(picker_items(&models, "nothing").is_empty());
+    }
+
+    #[test]
+    fn cycles() {
+        let l = ["plan", "build"].map(String::from).to_vec();
+        assert_eq!(cycle(&l, "plan", false), "build");
+        assert_eq!(cycle(&l, "build", false), "plan");
+        assert_eq!(cycle(&l, "plan", true), "build");
+        assert_eq!(cycle(&l, "custom", false), "plan");
     }
 }

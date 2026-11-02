@@ -18,6 +18,8 @@ pub struct StartOpts {
     pub prompt: String,
     pub repo: String,
     pub mode: Option<String>,
+    /// `provider/model`; `None` = `defaults.model`, else the agent CLI's own default.
+    pub model: Option<String>,
     pub base: Option<String>,
     pub nvim: Option<bool>,
     pub attach: bool,
@@ -79,6 +81,24 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     let adapter = engine
         .agent_adapter("opencode")
         .context("opencode adapter not enabled")?;
+    let mode = opts
+        .mode
+        .clone()
+        .unwrap_or_else(|| cfg.defaults.mode.clone());
+    let model = opts.model.clone().or_else(|| cfg.defaults.model.clone());
+    // Check the agent and model against what opencode offers in this repo. If discovery
+    // itself fails (opencode slow or missing), go ahead: opencode reports a bad name itself.
+    match adapter.choices(&repo.repo).await {
+        Ok(c) => {
+            c.check_agent(&mode)?;
+            if let Some(m) = &model {
+                c.check_model(m)?;
+            }
+        }
+        Err(e) => log(&format!(
+            "could not list agents/models ({e:#}); not checking"
+        )),
+    }
 
     log(&format!("fetch origin {base}"));
     git::fetch(&repo.repo, "origin", &base).await?;
@@ -100,11 +120,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         old_paths: vec![],
         tmux_session: slug.clone(),
         port: Some(port),
-        mode: Some(
-            opts.mode
-                .clone()
-                .unwrap_or_else(|| cfg.defaults.mode.clone()),
-        ),
+        mode: Some(mode.clone()),
         review_source: None,
         review_id: None,
         head_sha: None,
@@ -113,7 +129,6 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         closed_at: None,
     })?;
 
-    let mode = opts.mode.unwrap_or_else(|| cfg.defaults.mode.clone());
     let full_prompt = format!(
         "{}\n\n{prompt}",
         prompt_header(&slug, &repo.name, &branch, &base)
@@ -121,6 +136,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     let cmd = adapter.launch(&LaunchSpec {
         cwd: path.clone(),
         mode,
+        model,
         prompt: full_prompt,
         port,
         extra_args: cfg.agent_args.clone(),

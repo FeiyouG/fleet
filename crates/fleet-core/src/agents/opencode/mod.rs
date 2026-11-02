@@ -1,11 +1,12 @@
 //! The opencode adapter: procs + sqlite + (optional) HTTP + Plannotator probe -> `AgentRow`.
 
+pub mod choices;
 pub mod db;
 pub mod http;
 pub mod plannotator;
 pub mod state_file;
 
-use super::{AgentAdapter, DiscoverCtx, LaunchSpec, SendTarget};
+use super::{AgentAdapter, Choices, DiscoverCtx, LaunchSpec, SendMsg, SendTarget};
 use crate::model::{Activity, AgentRow};
 use crate::procs::{canon, ProcTable};
 use crate::tmux;
@@ -63,6 +64,7 @@ pub fn row_from_facts(
     state: Option<&state_file::AgentState>,
 ) -> AgentRow {
     let pending = state.map(|s| s.pending()).unwrap_or_default();
+    let control = state.and_then(|s| s.control());
     let activity = if plan.is_some() {
         Activity::WaitPlan
     } else if !pending.is_empty() || live.map(|l| l.pending_permission).unwrap_or(false) {
@@ -89,6 +91,7 @@ pub fn row_from_facts(
         session_id: session.map(|s| s.id.clone()),
         title: session.map(|s| s.title.clone()).filter(|t| !t.is_empty()),
         mode: session.and_then(|s| s.mode.clone()),
+        model: session.and_then(|s| s.model.clone()),
         activity,
         running_tool: session.and_then(|s| s.running_tool.clone()),
         plan_url: plan.map(|p| p.url.clone()),
@@ -106,6 +109,8 @@ pub fn row_from_facts(
                 }
             })
             .collect(),
+        control_url: control.as_ref().map(|c| c.0.clone()),
+        control_token: control.map(|c| c.1),
     }
 }
 
@@ -214,11 +219,19 @@ impl AgentAdapter for OpenCode {
         Ok(rows)
     }
 
-    async fn send(&self, target: &SendTarget, text: &str) -> Result<()> {
+    async fn send(&self, target: &SendTarget, msg: &SendMsg) -> Result<()> {
         match target {
-            SendTarget::Port(p) => http::submit_prompt(*p, text).await,
-            SendTarget::Pane(t) => tmux::send_keys(t, text).await,
+            SendTarget::Control { url, token } => http::control_send(url, token, msg).await,
+            SendTarget::Pane(_) if msg.has_override() => anyhow::bail!(
+                "this agent has no fleet control endpoint, so its agent/model can't be switched: \
+                 run `fleet setup` and restart the agent"
+            ),
+            SendTarget::Pane(t) => tmux::send_keys(t, &msg.text).await,
         }
+    }
+
+    async fn choices(&self, cwd: &Path) -> Result<Choices> {
+        choices::choices(cwd).await
     }
 
     fn launch(&self, spec: &LaunchSpec) -> String {
@@ -229,6 +242,10 @@ impl AgentAdapter for OpenCode {
             "--agent".into(),
             spec.mode.clone(),
         ];
+        if let Some(m) = &spec.model {
+            parts.push("--model".into());
+            parts.push(m.clone());
+        }
         parts.extend(spec.extra_args.iter().cloned());
         parts.push("--prompt".into());
         parts.push(spec.prompt.clone());
@@ -254,6 +271,7 @@ mod tests {
             updated: Utc::now(),
             last_completed: completed,
             running_tool: tool.map(String::from),
+            model: Some("anthropic/claude-opus-5-5".into()),
         }
     }
 
@@ -330,15 +348,21 @@ mod tests {
     #[test]
     fn launch_line_is_shell_safe() {
         let oc = OpenCode::default();
-        let s = oc.launch(&LaunchSpec {
+        let mut spec = LaunchSpec {
             cwd: "/w".into(),
             mode: "plan".into(),
+            model: None,
             prompt: "Fix the \"thing\"\n\nwith newlines".into(),
             port: 4096,
             extra_args: vec![],
-        });
+        };
+        let s = oc.launch(&spec);
         assert!(s.starts_with("opencode --port 4096 --agent plan --prompt "));
         let back = shell_words::split(&s).unwrap();
         assert_eq!(back.last().unwrap(), "Fix the \"thing\"\n\nwith newlines");
+        spec.model = Some("openai/gpt-5.4".into());
+        assert!(oc
+            .launch(&spec)
+            .starts_with("opencode --port 4096 --agent plan --model openai/gpt-5.4 --prompt "));
     }
 }

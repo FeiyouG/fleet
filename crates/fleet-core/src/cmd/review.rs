@@ -2,7 +2,7 @@
 //! Re-review when the task already exists.
 
 use super::{free_port, Progress};
-use crate::agents::{LaunchSpec, SendTarget};
+use crate::agents::{LaunchSpec, SendMsg, SendTarget};
 use crate::config::Project;
 use crate::registry::{Registry, Task};
 use crate::snapshot::Engine;
@@ -108,12 +108,15 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
             &old_sha[..old_sha.len().min(8)],
             &review.head_sha[..review.head_sha.len().min(8)]
         );
-        let target = match task.port {
-            Some(p) if crate::agents::opencode::http::is_opencode(p).await => SendTarget::Port(p),
-            _ => SendTarget::Pane(format!("{}:1.1", task.tmux_session)),
-        };
-        log(&format!("send to {:?}", target));
-        agent.send(&target, &text).await?;
+        let fleet = engine.snapshot(false).await;
+        let target = super::send::find_row(&fleet, &task.slug)
+            .and_then(super::send::send_target)
+            .unwrap_or_else(|| SendTarget::Pane(format!("{}:1.1", task.tmux_session)));
+        log(&match &target {
+            SendTarget::Control { url, .. } => format!("send via {url}"),
+            SendTarget::Pane(p) => format!("send-keys to {p}"),
+        });
+        agent.send(&target, &SendMsg::text(text)).await?;
         if opts.attach {
             tmux::attach(&task.tmux_session).await?;
         }
@@ -168,6 +171,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     let cmd = agent.launch(&LaunchSpec {
         cwd: path.clone(),
         mode: "plan".into(),
+        model: cfg.defaults.model.clone(),
         prompt,
         port,
         extra_args: cfg.agent_args.clone(),

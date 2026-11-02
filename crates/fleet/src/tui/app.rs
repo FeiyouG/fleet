@@ -6,12 +6,14 @@ use super::util;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::{execute, terminal};
-use fleet_core::agents::SendTarget;
+use fleet_core::agents::{Choices, SendMsg, SendTarget};
 use fleet_core::cmd;
 use fleet_core::model::Fleet;
 use fleet_core::{tmux, Config, Engine};
 use futures::StreamExt;
 use ratatui::prelude::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -40,11 +42,15 @@ pub struct App {
     pub quit: bool,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<Msg>,
+    /// Agents/models per directory (project repo or agent cwd), loaded in the background
+    /// when a popup needs them. `Err` = discovery failed (message shown in the popup).
+    pub choices: HashMap<PathBuf, std::result::Result<Choices, String>>,
 }
 
 pub enum Msg {
     Snapshot(Fleet),
     Status(String, bool),
+    Choices(PathBuf, std::result::Result<Choices, String>),
     /// Suspend the TUI, run the closure (blocking, owns the terminal), then resume.
     Suspend(Box<dyn FnOnce() -> Result<()> + Send>),
 }
@@ -98,6 +104,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
         loading: true,
         quit: false,
         tx,
+        choices: HashMap::new(),
     };
 
     let mut term = enter()?;
@@ -120,6 +127,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
                 match msg {
                     Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.fleet = f; app.loading = false; }
                     Some(Msg::Status(s, err)) => app.set_status(s, err),
+                    Some(Msg::Choices(dir, c)) => { app.choices.insert(dir, c); }
                     Some(Msg::Suspend(work)) => {
                         leave(&mut term)?;
                         let r = work();
@@ -167,6 +175,30 @@ fn leave(term: &mut Term) -> Result<()> {
 impl App {
     pub fn set_status(&mut self, s: String, err: bool) {
         self.status_line = Some((s, err));
+    }
+
+    /// Start loading the agents/models offered in `dir` unless already loaded.
+    pub fn want_choices(&mut self, dir: PathBuf) {
+        if self.choices.contains_key(&dir) {
+            return;
+        }
+        let engine = self.engine.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = match engine.agent_adapter("opencode") {
+                Some(a) => a.choices(&dir).await.map_err(|e| format!("{e:#}")),
+                None => Err("opencode adapter not enabled".into()),
+            };
+            let _ = tx.send(Msg::Choices(dir, r));
+        });
+    }
+
+    /// Loaded choices for `dir`: `None` = still loading.
+    pub fn choices_for(
+        &self,
+        dir: &std::path::Path,
+    ) -> Option<&std::result::Result<Choices, String>> {
+        self.choices.get(dir)
     }
 
     pub fn request_refresh(&self) {
@@ -317,10 +349,22 @@ impl App {
             GotoWorktree | ReviewGotoWorktrees => self.goto(Tab::Worktrees),
             GotoReview => self.goto(Tab::Reviews),
             AgentAttach => self.attach_selected().await?,
-            AgentStart => self.popup = Some(Popup::start(&self.cfg)),
+            AgentStart => {
+                let p = Popup::start(&self.cfg);
+                if let Popup::Start(f) = &p {
+                    if let Some(dir) = f.repo_dir(&self.cfg) {
+                        self.want_choices(dir);
+                    }
+                }
+                self.popup = Some(p);
+            }
             AgentSend => {
                 if self.selected_send_target().is_some() {
-                    self.popup = Some(Popup::message(self.selected_name()));
+                    let agent = tabs::selected_agent(self);
+                    if let Some(a) = &agent {
+                        self.want_choices(a.cwd.clone());
+                    }
+                    self.popup = Some(Popup::message(self.selected_name(), agent));
                 } else {
                     self.set_status("no running agent on this row".into(), true);
                 }
@@ -457,6 +501,7 @@ impl App {
                 prompt,
                 repo,
                 mode,
+                model,
             } => {
                 let engine = self.engine.clone();
                 self.spawn("start", async move {
@@ -467,6 +512,7 @@ impl App {
                             prompt,
                             repo,
                             mode,
+                            model,
                             base: None,
                             nvim: None,
                             attach: false,
@@ -480,7 +526,12 @@ impl App {
                     ))
                 });
             }
-            Message { name, text } => {
+            Message {
+                name,
+                text,
+                model,
+                agent,
+            } => {
                 let target = self.selected_send_target();
                 let engine = self.engine.clone();
                 match target {
@@ -488,8 +539,17 @@ impl App {
                         let a = engine
                             .agent_adapter("opencode")
                             .ok_or_else(|| anyhow::anyhow!("no opencode adapter"))?;
-                        a.send(&t, &text).await?;
-                        Ok(format!("sent to {name}"))
+                        let what = [agent.as_deref(), model.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        a.send(&t, &SendMsg { text, model, agent }).await?;
+                        Ok(if what.is_empty() {
+                            format!("sent to {name}")
+                        } else {
+                            format!("sent to {name} ({what})")
+                        })
                     }),
                     None => self.set_status("no running agent".into(), true),
                 }

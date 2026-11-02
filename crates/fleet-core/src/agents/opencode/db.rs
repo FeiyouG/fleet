@@ -2,7 +2,7 @@
 //!
 //! Only three facts per session are needed:
 //! - the session (id, title, directory, mode, last update)
-//! - whether the last assistant message is completed (idle) or not (working)
+//! - whether the last assistant message is completed (idle) or not (working), and its model
 //! - the tool part still `running` on that message, if any (what it is blocked on)
 
 use anyhow::{Context, Result};
@@ -21,6 +21,8 @@ pub struct DbSession {
     /// `true` when the last assistant message has `time.completed`.
     pub last_completed: bool,
     pub running_tool: Option<String>,
+    /// `provider/model` of the session's last message.
+    pub model: Option<String>,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -63,6 +65,7 @@ pub fn recent_sessions(db: &Path, since_secs: i64) -> Result<Vec<DbSession>> {
                     .unwrap_or_else(Utc::now),
                 last_completed: true,
                 running_tool: None,
+                model: None,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -71,14 +74,18 @@ pub fn recent_sessions(db: &Path, since_secs: i64) -> Result<Vec<DbSession>> {
         return Ok(sessions);
     }
 
-    // Last message per session: role + completed?
+    // Last message per session: role + completed? + the model it used (an assistant
+    // message has `providerID`/`modelID`, a user message `model.{providerID,modelID}`).
     let mut last_msg: HashMap<String, (String, bool)> = HashMap::new();
+    let mut models: HashMap<String, String> = HashMap::new();
     {
         let mut st = conn.prepare(
             "with last as (select session_id, max(time_created) t from message \
                            where time_created > ?1 group by session_id) \
              select m.session_id, m.id, json_extract(m.data,'$.role'), \
-                    json_extract(m.data,'$.time.completed') is not null \
+                    json_extract(m.data,'$.time.completed') is not null, \
+                    coalesce(json_extract(m.data,'$.providerID'), json_extract(m.data,'$.model.providerID')), \
+                    coalesce(json_extract(m.data,'$.modelID'), json_extract(m.data,'$.model.modelID')) \
              from message m join last l on l.session_id = m.session_id and m.time_created = l.t",
         )?;
         let rows = st.query_map([cutoff - 7 * 86_400_000], |r| {
@@ -87,15 +94,20 @@ pub fn recent_sessions(db: &Path, since_secs: i64) -> Result<Vec<DbSession>> {
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, bool>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         for row in rows {
-            let (sid, mid, role, completed) = row?;
+            let (sid, mid, role, completed, provider, model) = row?;
             // A pending user message means the agent is about to work: treat as not completed.
             let completed = match role.as_deref() {
                 Some("assistant") => completed,
                 _ => false,
             };
+            if let (Some(p), Some(m)) = (provider, model) {
+                models.insert(sid.clone(), format!("{p}/{m}"));
+            }
             last_msg.insert(sid, (mid, completed));
         }
     }
@@ -124,6 +136,7 @@ pub fn recent_sessions(db: &Path, since_secs: i64) -> Result<Vec<DbSession>> {
             s.last_completed = *completed;
         }
         s.running_tool = running.get(&s.id).cloned();
+        s.model = models.remove(&s.id);
     }
     Ok(sessions)
 }

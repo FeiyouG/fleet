@@ -37,15 +37,33 @@ pub struct AgentState {
     pub sessions: HashMap<String, SessionState>,
     #[serde(default)]
     pub updated_at: i64,
+    /// Plugin v2: control endpoint (`http://127.0.0.1:N`) and its bearer token.
+    #[serde(default)]
+    pub control_url: String,
+    #[serde(default)]
+    pub token: String,
+    /// Plugin v2: the root (non-subagent) session the user last worked in.
+    #[serde(default)]
+    pub current_session: String,
 }
 
 impl AgentState {
     /// The session this process is showing: the one with pending permissions, else the
-    /// busiest, else the first.
+    /// one the plugin reports as current, else the busiest, else the first.
     pub fn primary_session(&self) -> Option<(&String, &SessionState)> {
-        self.sessions
-            .iter()
-            .max_by_key(|(_, s)| (!s.pending.is_empty(), s.status == "busy"))
+        self.sessions.iter().max_by_key(|(id, s)| {
+            (
+                !s.pending.is_empty(),
+                **id == self.current_session,
+                s.status == "busy",
+            )
+        })
+    }
+
+    /// `(url, token)` of the plugin's control endpoint, when it has one.
+    pub fn control(&self) -> Option<(String, String)> {
+        (!self.control_url.is_empty() && !self.token.is_empty())
+            .then(|| (self.control_url.clone(), self.token.clone()))
     }
 
     pub fn pending(&self) -> Vec<&Pending> {
@@ -116,5 +134,23 @@ mod tests {
         assert_eq!(st.primary_session().unwrap().0, "ses_b");
         assert_eq!(st.pending().len(), 1);
         assert_eq!(st.pending()[0].title, "bash: rm -rf dist");
+        assert_eq!(st.control(), None);
+    }
+
+    #[test]
+    fn v2_control_and_current_session() {
+        let st = parse(
+            r#"{"version":2,"pid":42,"server_url":"http://localhost:4096/","control_url":"http://127.0.0.1:52965",
+                "token":"tok","directory":"/w","current_session":"ses_root","sessions":{
+                "ses_root":{"status":"busy","pending":[],"agent":"build"},
+                "ses_child":{"status":"busy","parent":"ses_root","pending":[]}
+            },"updated_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            st.control(),
+            Some(("http://127.0.0.1:52965".into(), "tok".into()))
+        );
+        assert_eq!(st.primary_session().unwrap().0, "ses_root");
     }
 }

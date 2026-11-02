@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct Config {
     pub defaults: Defaults,
-    /// Extra command-line arguments for the agent (e.g. `{"--model", "anthropic/claude-opus-5"}`).
+    /// Extra command-line arguments for the agent. For the model use `defaults.model`.
     pub agent_args: Vec<String>,
     pub projects: Vec<Project>,
     pub agents: AgentsConfig,
@@ -24,6 +24,8 @@ pub struct Config {
 #[serde(default)]
 pub struct Defaults {
     pub mode: String,
+    /// `provider/model` for new agents; `None` = the agent CLI's own default.
+    pub model: Option<String>,
     pub nvim_pane: bool,
     pub notify: bool,
     pub refresh_secs: u64,
@@ -34,6 +36,7 @@ impl Default for Defaults {
     fn default() -> Self {
         Self {
             mode: "plan".into(),
+            model: None,
             nvim_pane: true,
             notify: true,
             refresh_secs: 2,
@@ -225,13 +228,14 @@ local home = os.getenv("HOME")
 
 return {
   defaults = {
-    mode = "plan",          -- opencode agent to start with: plan | build
+    mode = "plan",          -- opencode agent to start with (`fleet agent choices` lists them)
+    -- model = "anthropic/claude-opus-5-5",  -- default model for new agents; unset = opencode's own
     nvim_pane = true,       -- open an nvim pane next to the agent
     notify = true,          -- macOS banner when an agent starts waiting for you
     refresh_secs = 2,
     review_ttl_secs = 60,
   },
-  agent_args = {},          -- extra args for `opencode`, e.g. { "--model", "anthropic/claude-opus-5" }
+  agent_args = {},          -- extra args for `opencode`
 
   -- fleet:projects (fleet project add appends here)
   projects = {
@@ -314,7 +318,7 @@ mod tests {
         let src = r#"
             local home = os.getenv("HOME")
             return {
-              defaults = { mode = "build" },
+              defaults = { mode = "build", model = "openai/gpt-5.4" },
               projects = {
                 { name = "svc", repo = home .. "/x", reviews = "gitlab:a/b" },
                 { name = "cli", repo = "~/y", worktrees = "~/wt", base = "develop" },
@@ -324,6 +328,7 @@ mod tests {
         let mut c = Config::from_lua(src, "test.lua").unwrap();
         c.normalise();
         assert_eq!(c.defaults.mode, "build");
+        assert_eq!(c.defaults.model.as_deref(), Some("openai/gpt-5.4"));
         assert_eq!(c.defaults.refresh_secs, 2);
         assert_eq!(c.projects.len(), 2);
         assert_eq!(c.projects[0].repo, home().join("x"));
