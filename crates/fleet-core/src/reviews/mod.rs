@@ -1,6 +1,7 @@
 //! The reviews collector family. One adapter instance per configured source
-//! (`gitlab:group/project`). GitLab is the only implementation today.
+//! (`gitlab:group/project`, `github:owner/repo`).
 
+pub mod github;
 pub mod gitlab;
 
 use crate::model::ReviewRow;
@@ -31,8 +32,9 @@ pub trait ReviewAdapter: Send + Sync {
 pub fn adapter_for(source: &str) -> Result<Box<dyn ReviewAdapter>> {
     match source.split_once(':') {
         Some(("gitlab", project)) => Ok(Box::new(gitlab::GitLab::new(project))),
+        Some(("github", repo)) => Ok(Box::new(github::GitHub::new(repo))),
         Some((kind, _)) => {
-            bail!("unknown review source kind `{kind}` in `{source}` (known: gitlab)")
+            bail!("unknown review source kind `{kind}` in `{source}` (known: gitlab, github)")
         }
         None => bail!("review source must look like `gitlab:group/project`, got `{source}`"),
     }

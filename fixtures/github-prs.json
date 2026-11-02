@@ -1,0 +1,108 @@
+[
+ {
+  "author": {
+   "login": "FeiyouG"
+  },
+  "baseRefName": "main",
+  "headRefName": "feat/rate-limit-errors",
+  "headRefOid": "391d099e7d0753f5666d96afdcf95ced1781229f",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 27,
+  "reviewDecision": "",
+  "reviews": [
+   {
+    "state": "COMMENTED",
+    "author": {
+     "login": "coderabbitai"
+    }
+   }
+  ],
+  "statusCheckRollup": [
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   },
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   },
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   },
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   }
+  ],
+  "title": "fix(cli): name what was rate limited and how long to wait",
+  "updatedAt": "2026-11-02T09:03:50Z",
+  "url": "https://github.com/monid-ai/cli/pull/27"
+ },
+ {
+  "author": {
+   "login": "FeiyouG"
+  },
+  "baseRefName": "feat/wallet-promo-codes",
+  "headRefName": "feat/skill-wallet-promo-codes",
+  "headRefOid": "e6ef89faff0044be01c276fea6726f4778366af9",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 26,
+  "reviewDecision": "",
+  "reviews": [],
+  "statusCheckRollup": [
+   {
+    "conclusion": "SKIPPED",
+    "status": "COMPLETED",
+    "state": null
+   }
+  ],
+  "title": "docs(skill): monid wallet promo-codes; skill 0.1.9",
+  "updatedAt": "2026-11-02T09:04:49Z",
+  "url": "https://github.com/monid-ai/cli/pull/26"
+ },
+ {
+  "author": {
+   "login": "FeiyouG"
+  },
+  "baseRefName": "main",
+  "headRefName": "fix/cli-run-blocked-run-cap-tofixed-crash",
+  "headRefOid": "44420f5702abf517ee3004cb35adaef3ab464ec7",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "number": 24,
+  "reviewDecision": "",
+  "reviews": [],
+  "statusCheckRollup": [
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   },
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   },
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   },
+   {
+    "conclusion": "SUCCESS",
+    "status": "COMPLETED",
+    "state": null
+   }
+  ],
+  "title": "fix(cli): render run cap control when limitAmount is a bare number",
+  "updatedAt": "2026-11-01T16:12:37Z",
+  "url": "https://github.com/monid-ai/cli/pull/24"
+ }
+]

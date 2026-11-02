@@ -249,11 +249,18 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Agent(a) => agent(a, cfg).await,
-        Cmd::Start(args) => agent(AgentCmd::Start(args), cfg).await,
+        Cmd::Agent(a) => agent(a, cfg, project).await,
+        Cmd::Start(args) => agent(AgentCmd::Start(args), cfg, project).await,
         Cmd::Review(r) => match r {
             ReviewCmd::List { json, source } => {
                 let f = snapshot(&cfg).await;
+                // --project scopes to that project's source; --source overrides.
+                let source = source.or_else(|| {
+                    project
+                        .as_ref()
+                        .and_then(|p| cfg.project(p))
+                        .and_then(|p| p.reviews.clone())
+                });
                 let rows: Vec<_> = f
                     .reviews
                     .iter()
@@ -299,7 +306,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 no_attach,
             } => {
                 let engine = Engine::new(cfg);
-                let repo = repo.or_else(|| cwd_repo(&engine.config));
+                let repo = repo.or(project).or_else(|| cwd_repo(&engine.config));
                 let out = review::start(
                     &engine,
                     review::ReviewOpts {
@@ -331,7 +338,10 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
         },
         Cmd::Worktree(w) => match w {
             WorktreeCmd::List { json } => {
-                let f = snapshot(&cfg).await;
+                let mut f = snapshot(&cfg).await;
+                if let Some(p) = &project {
+                    f.worktrees.retain(|w| w.worktree.repo == *p);
+                }
                 if json {
                     return print_json(&f.worktrees);
                 }
@@ -555,7 +565,7 @@ fn cwd_repo(cfg: &Config) -> Option<String> {
         })
 }
 
-async fn agent(a: AgentCmd, cfg: Config) -> Result<()> {
+async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> {
     match a {
         AgentCmd::Start(args) => {
             let repo = args.repo.clone().or_else(|| cwd_repo(&cfg)).context(
@@ -604,7 +614,10 @@ async fn agent(a: AgentCmd, cfg: Config) -> Result<()> {
             Ok(())
         }
         AgentCmd::List { json } => {
-            let f = snapshot(&cfg).await;
+            let mut f = snapshot(&cfg).await;
+            if let Some(p) = &project {
+                f.overview.retain(|r| r.repo() == Some(p.as_str()));
+            }
             if json {
                 return print_json(&f.overview);
             }
