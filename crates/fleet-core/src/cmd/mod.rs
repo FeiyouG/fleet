@@ -5,6 +5,7 @@ pub mod project;
 pub mod rename;
 pub mod review;
 pub mod send;
+pub mod setup;
 pub mod start;
 
 use anyhow::{Context, Result};

@@ -97,6 +97,9 @@ pub struct AgentRow {
     /// tmux target (`sess:w.p`) of the pane hosting this process, filled by the joiner.
     #[serde(default)]
     pub pane_target: Option<String>,
+    /// Pending permission prompts (titles), from the fleet opencode plugin.
+    #[serde(default)]
+    pub pending: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

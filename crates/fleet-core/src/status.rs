@@ -120,6 +120,7 @@ mod tests {
             port: None,
             last_activity: None,
             pane_target: None,
+            pending: vec![],
         }
     }
     fn review(status: ReviewStatus, ci: Ci) -> ReviewRow {

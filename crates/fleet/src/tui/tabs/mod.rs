@@ -403,6 +403,12 @@ pub fn detail(app: &App, n: &Node) -> Text<'static> {
                     ),
                 ]));
             }
+            for pnd in &agent.pending {
+                lines.push(Line::from(vec![
+                    Span::raw("   permission: "),
+                    Span::styled(pnd.clone(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
             if let Some(t) = &agent.running_tool {
                 if agent.activity == Activity::Working {
                     lines.push(Line::from(Span::styled(
@@ -579,6 +585,11 @@ pub fn detail(app: &App, n: &Node) -> Text<'static> {
 }
 
 fn agent_line(a: &fleet_core::model::AgentRow) -> Line<'static> {
+    let perm = a
+        .pending
+        .first()
+        .map(|p| format!(" · permission: {p}"))
+        .unwrap_or_default();
     Line::from(vec![
         Span::raw("   "),
         Span::styled(
@@ -598,6 +609,7 @@ fn agent_line(a: &fleet_core::model::AgentRow) -> Line<'static> {
             ),
             dim(),
         ),
+        Span::styled(perm, Style::default().fg(Color::Yellow)),
     ])
 }
 

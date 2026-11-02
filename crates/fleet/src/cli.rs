@@ -61,6 +61,17 @@ enum Cmd {
     Project(ProjectCmd),
     /// Print every action and its current key binding
     Keys,
+    /// Install the opencode plugin that reports permission prompts (and print the tmux snippet)
+    Setup {
+        /// Uninstall the plugin
+        #[arg(long)]
+        remove: bool,
+        /// Report plugin / tools / agent-state status without changing anything
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -537,6 +548,60 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Setup {
+            remove,
+            check,
+            json,
+        } => {
+            if remove {
+                let r = cmd::setup::remove()?;
+                println!(
+                    "{}",
+                    if r {
+                        "plugin removed; restart opencode sessions to stop state files"
+                    } else {
+                        "plugin was not installed"
+                    }
+                );
+                return Ok(());
+            }
+            if !check {
+                let p = cmd::setup::install()?;
+                println!("installed {}", p.display());
+                println!(
+                    "restart your opencode sessions to load it (running ones keep the old state)\n"
+                );
+                println!(
+                    "tmux status bar (add to ~/.config/tmux/tmux.conf):\n{}\n",
+                    cmd::setup::TMUX_SNIPPET
+                );
+            }
+            let c = cmd::setup::check(&cfg).await;
+            if json {
+                return print_json(&c);
+            }
+            println!(
+                "plugin: {} ({})",
+                if !c.plugin_installed {
+                    "not installed"
+                } else if c.plugin_up_to_date {
+                    "installed"
+                } else {
+                    "installed, OUTDATED (run fleet setup)"
+                },
+                c.plugin_path
+            );
+            println!("agents: {} running, {} reporting state (restart the other {} for permission prompts)", c.agents_running, c.agents_with_state, c.agents_running.saturating_sub(c.agents_with_state));
+            for t in &c.tools {
+                println!(
+                    "{} {:<9} {}",
+                    if t.ok { "✓" } else { "✗" },
+                    t.name,
+                    t.detail
+                );
+            }
+            Ok(())
+        }
         Cmd::Keys => {
             for (action, key) in tui::keys::Keymap::from_config(&cfg).list() {
                 println!("{action:<22} {key}");

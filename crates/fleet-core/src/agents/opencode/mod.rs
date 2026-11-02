@@ -3,6 +3,7 @@
 pub mod db;
 pub mod http;
 pub mod plannotator;
+pub mod state_file;
 
 use super::{AgentAdapter, DiscoverCtx, LaunchSpec, SendTarget};
 use crate::model::{Activity, AgentRow};
@@ -59,10 +60,12 @@ pub fn row_from_facts(
     plan: Option<&plannotator::Plan>,
     live: Option<&http::Live>,
     port: Option<u16>,
+    state: Option<&state_file::AgentState>,
 ) -> AgentRow {
+    let pending = state.map(|s| s.pending()).unwrap_or_default();
     let activity = if plan.is_some() {
         Activity::WaitPlan
-    } else if live.map(|l| l.pending_permission).unwrap_or(false) {
+    } else if !pending.is_empty() || live.map(|l| l.pending_permission).unwrap_or(false) {
         Activity::WaitPermission
     } else {
         match session {
@@ -93,6 +96,16 @@ pub fn row_from_facts(
         port,
         last_activity: session.map(|s| s.updated),
         pane_target: None,
+        pending: pending
+            .iter()
+            .map(|p| {
+                if p.title.is_empty() {
+                    p.kind.clone()
+                } else {
+                    p.title.clone()
+                }
+            })
+            .collect(),
     }
 }
 
@@ -129,6 +142,9 @@ impl AgentAdapter for OpenCode {
         }
 
         let ports = plannotator::listening_ports(&pids).await;
+        let states = state_file::read_all(procs);
+        let by_id: HashMap<&str, &db::DbSession> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
 
         // Probe every listening port of every opencode process concurrently. A port is
         // either Plannotator (plan waiting), opencode's own API (fleet-started), or neither.
@@ -154,12 +170,23 @@ impl AgentAdapter for OpenCode {
                 .and_then(|p| p.cwd.clone())
                 .map(|c| canon(&c))
                 .unwrap_or_default();
-            let session = pick_session(
-                by_dir.get(&cwd).map(Vec::as_slice).unwrap_or(&[]),
-                ctx.title_hints.get(&pid).map(String::as_str),
-            );
+            // The plugin's state file names the session exactly; otherwise fall back to the
+            // newest session in the directory, disambiguated by the tmux pane title.
+            let state = states.get(&pid);
+            let state_port = state
+                .and_then(|st| st.port())
+                .filter(|p| ports.get(&pid).map(|v| v.contains(p)).unwrap_or(false));
+            let session = state
+                .and_then(|st| st.primary_session())
+                .and_then(|(id, _)| by_id.get(id.as_str()).copied())
+                .or_else(|| {
+                    pick_session(
+                        by_dir.get(&cwd).map(Vec::as_slice).unwrap_or(&[]),
+                        ctx.title_hints.get(&pid).map(String::as_str),
+                    )
+                });
             let mut plan = None;
-            let mut port = known_ports.get(&pid).copied();
+            let mut port = known_ports.get(&pid).copied().or(state_port);
             for (p_pid, p, pl, is_oc) in &probe_results {
                 if *p_pid != pid {
                     continue;
@@ -181,6 +208,7 @@ impl AgentAdapter for OpenCode {
                 plan.as_ref(),
                 live.as_ref(),
                 port,
+                state,
             ));
         }
         Ok(rows)
@@ -235,78 +263,43 @@ mod tests {
             url: "http://127.0.0.1:1".into(),
             title: None,
         };
+        let f = |s: Option<&db::DbSession>,
+                 pl: Option<&plannotator::Plan>,
+                 live: Option<&http::Live>,
+                 st: Option<&state_file::AgentState>| {
+            row_from_facts(1, "/w".into(), s, pl, live, None, st).activity
+        };
         assert_eq!(
-            row_from_facts(
-                1,
-                "/w".into(),
-                Some(&sess(false, Some("bash"))),
-                Some(&plan),
-                None,
-                None
-            )
-            .activity,
+            f(Some(&sess(false, Some("bash"))), Some(&plan), None, None),
             Activity::WaitPlan
         );
         assert_eq!(
-            row_from_facts(
-                1,
-                "/w".into(),
-                Some(&sess(false, Some("question"))),
-                None,
-                None,
-                None
-            )
-            .activity,
+            f(Some(&sess(false, Some("question"))), None, None, None),
             Activity::WaitQuestion
         );
         assert_eq!(
-            row_from_facts(
-                1,
-                "/w".into(),
-                Some(&sess(false, Some("submit_plan"))),
-                None,
-                None,
-                None
-            )
-            .activity,
+            f(Some(&sess(false, Some("submit_plan"))), None, None, None),
             Activity::WaitPlan
         );
         assert_eq!(
-            row_from_facts(
-                1,
-                "/w".into(),
-                Some(&sess(false, Some("bash"))),
-                None,
-                None,
-                None
-            )
-            .activity,
+            f(Some(&sess(false, Some("bash"))), None, None, None),
             Activity::Working
         );
-        assert_eq!(
-            row_from_facts(1, "/w".into(), Some(&sess(true, None)), None, None, None).activity,
-            Activity::Idle
+        assert_eq!(f(Some(&sess(true, None)), None, None, None), Activity::Idle);
+        assert_eq!(f(None, None, None, None), Activity::Idle);
+        // a pending permission in the plugin state file wins over a running bash tool
+        let st = state_file::parse(r#"{"pid":1,"sessions":{"ses_x":{"status":"busy","pending":[{"id":"p","title":"bash: rm -rf dist","type":"bash"}]}}}"#).unwrap();
+        let row = row_from_facts(
+            1,
+            "/w".into(),
+            Some(&sess(false, Some("bash"))),
+            None,
+            None,
+            None,
+            Some(&st),
         );
-        let perm = http::Live {
-            busy: true,
-            pending_permission: true,
-        };
-        assert_eq!(
-            row_from_facts(
-                1,
-                "/w".into(),
-                Some(&sess(false, Some("bash"))),
-                None,
-                Some(&perm),
-                Some(4096)
-            )
-            .activity,
-            Activity::WaitPermission
-        );
-        assert_eq!(
-            row_from_facts(1, "/w".into(), None, None, None, None).activity,
-            Activity::Idle
-        );
+        assert_eq!(row.activity, Activity::WaitPermission);
+        assert_eq!(row.pending, vec!["bash: rm -rf dist".to_string()]);
     }
 
     #[test]
