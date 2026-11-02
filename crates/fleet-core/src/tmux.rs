@@ -1,0 +1,192 @@
+//! tmux: list panes, attach, send keys, create sessions.
+
+use crate::model::PaneRow;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+use tokio::process::Command;
+
+const SEP: &str = "\u{1f}";
+
+pub async fn list_panes() -> Result<Vec<PaneRow>> {
+    let fmt = [
+        "#{pane_pid}",
+        "#{session_name}",
+        "#{window_index}",
+        "#{window_name}",
+        "#{pane_index}",
+        "#{pane_current_path}",
+        "#{pane_current_command}",
+        "#{pane_title}",
+        "#{session_attached}",
+    ]
+    .join(SEP);
+    let out = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", &fmt])
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e).context("running tmux"),
+    };
+    if !out.status.success() {
+        // No server running is not an error: there are simply no panes.
+        return Ok(vec![]);
+    }
+    Ok(parse_panes(&String::from_utf8_lossy(&out.stdout)))
+}
+
+pub fn parse_panes(s: &str) -> Vec<PaneRow> {
+    s.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(SEP).collect();
+            if f.len() < 9 {
+                return None;
+            }
+            Some(PaneRow {
+                pid: f[0].parse().ok()?,
+                session: f[1].to_string(),
+                window: f[2].parse().ok()?,
+                window_name: f[3].to_string(),
+                pane: f[4].parse().ok()?,
+                cwd: PathBuf::from(f[5]),
+                command: f[6].to_string(),
+                title: f[7].to_string(),
+                attached: f[8].parse::<u32>().map(|n| n > 0).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+pub fn inside_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
+async fn run(args: &[&str]) -> Result<String> {
+    let out = Command::new("tmux")
+        .args(args)
+        .output()
+        .await
+        .context("running tmux")?;
+    if !out.status.success() {
+        bail!(
+            "tmux {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub async fn has_session(name: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", &format!("={name}")])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Switch (inside tmux) or attach (outside) to a target like `sess`, `sess:1` or `sess:1.2`.
+/// Outside tmux this execs `tmux attach` in the foreground and returns when it detaches.
+pub async fn attach(target: &str) -> Result<()> {
+    let session = target.split(':').next().unwrap_or(target);
+    if inside_tmux() {
+        run(&["switch-client", "-t", target]).await?;
+        if target.contains(':') {
+            run(&["select-window", "-t", target]).await.ok();
+            if target.contains('.') {
+                run(&["select-pane", "-t", target]).await.ok();
+            }
+        }
+        Ok(())
+    } else {
+        let st = std::process::Command::new("tmux")
+            .args(["attach", "-t", session])
+            .status()
+            .context("tmux attach")?;
+        if !st.success() {
+            bail!("tmux attach -t {session} failed");
+        }
+        Ok(())
+    }
+}
+
+pub async fn new_session(name: &str, cwd: &Path) -> Result<()> {
+    run(&[
+        "new-session",
+        "-d",
+        "-s",
+        name,
+        "-c",
+        &cwd.to_string_lossy(),
+    ])
+    .await
+    .map(|_| ())
+}
+
+pub async fn split_window(target: &str, cwd: &Path, cmd: Option<&str>) -> Result<()> {
+    let cwd = cwd.to_string_lossy().into_owned();
+    let mut args = vec!["split-window", "-h", "-t", target, "-c", &cwd];
+    if let Some(c) = cmd {
+        args.push(c);
+    }
+    run(&args).await.map(|_| ())
+}
+
+pub async fn select_pane(target: &str) -> Result<()> {
+    run(&["select-pane", "-t", target]).await.map(|_| ())
+}
+
+/// Type `text` into a pane and press Enter.
+pub async fn send_keys(target: &str, text: &str) -> Result<()> {
+    run(&["send-keys", "-t", target, "-l", text]).await?;
+    run(&["send-keys", "-t", target, "Enter"]).await.map(|_| ())
+}
+
+pub async fn rename_session(old: &str, new: &str) -> Result<()> {
+    run(&["rename-session", "-t", &format!("={old}"), new])
+        .await
+        .map(|_| ())
+}
+
+pub async fn kill_session(name: &str) -> Result<()> {
+    run(&["kill-session", "-t", &format!("={name}")])
+        .await
+        .map(|_| ())
+}
+
+pub async fn kill_pane(target: &str) -> Result<()> {
+    run(&["kill-pane", "-t", target]).await.map(|_| ())
+}
+
+/// Open a new window in `session` at `cwd` (used for "shell here").
+pub async fn new_window(session: &str, cwd: &Path) -> Result<()> {
+    run(&[
+        "new-window",
+        "-t",
+        &format!("={session}"),
+        "-c",
+        &cwd.to_string_lossy(),
+    ])
+    .await
+    .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_fixture() {
+        let s = include_str!("../../../fixtures/tmux-panes.txt");
+        let panes = parse_panes(s);
+        assert!(panes.len() >= 3, "{}", panes.len());
+        let oc: Vec<_> = panes.iter().filter(|p| p.command == "opencode").collect();
+        assert!(!oc.is_empty());
+        assert_eq!(
+            panes[0].target(),
+            format!("{}:{}.{}", panes[0].session, panes[0].window, panes[0].pane)
+        );
+    }
+}

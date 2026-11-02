@@ -1,0 +1,61 @@
+{
+ "iid": 541,
+ "title": "fix(services): disable caller stop on Exa /agent/runs until cancel billing is fixed",
+ "state": "opened",
+ "draft": false,
+ "source_branch": "fix/exa-agent-no-stop",
+ "target_branch": "main",
+ "sha": "dff8e8cadaeacbc43d08f7406b85bedc3cd1fc2f",
+ "web_url": "https://gitlab.com/monid-ai/monid-services/-/merge_requests/541",
+ "updated_at": "2026-11-02T08:21:04.696Z",
+ "detailed_merge_status": "not_approved",
+ "has_conflicts": false,
+ "blocking_discussions_resolved": true,
+ "user_notes_count": 1,
+ "head_pipeline": {
+  "id": 3016721369,
+  "iid": 11367,
+  "project_id": 80851704,
+  "sha": "dff8e8cadaeacbc43d08f7406b85bedc3cd1fc2f",
+  "ref": "refs/merge-requests/541/head",
+  "status": "running",
+  "source": "merge_request_event",
+  "created_at": "2026-11-02T08:20:29.107Z",
+  "updated_at": "2026-11-02T08:20:29.953Z",
+  "web_url": "https://gitlab.com/monid-ai/monid-services/-/pipelines/3016721369",
+  "before_sha": "dff8e8cadaeacbc43d08f7406b85bedc3cd1fc2f",
+  "tag": false,
+  "yaml_errors": null,
+  "user": {
+   "id": 43731956,
+   "username": "hongtao4",
+   "public_email": null,
+   "name": "Hongtao Yang",
+   "state": "active",
+   "locked": false,
+   "avatar_url": "https://secure.gravatar.com/avatar/0c33cf411b8b578f09c70dc74993abc64a3edad9345aa6076553be0493ea4d51?s=80&d=identicon",
+   "web_url": "https://gitlab.com/hongtao4"
+  },
+  "started_at": "2026-11-02T08:20:29.949Z",
+  "finished_at": null,
+  "committed_at": null,
+  "duration": null,
+  "queued_duration": null,
+  "coverage": null,
+  "detailed_status": {
+   "icon": "status_running",
+   "text": "Running",
+   "label": "running",
+   "group": "running",
+   "tooltip": "running",
+   "has_details": true,
+   "details_path": "/monid-ai/monid-services/-/pipelines/3016721369",
+   "illustration": null,
+   "favicon": "/assets/ci_favicons/favicon_status_running-9c635b2419a8e1ec991c993061b89cc5aefc0743bb238ecd0c381e7741a70e8c.png"
+  },
+  "archived": false
+ },
+ "author": {
+  "username": "hongtao4"
+ }
+}

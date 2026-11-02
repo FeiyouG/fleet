@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/fleet-core", "crates/fleet"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/feiyoug/fleet"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sysinfo = "0.33"
+rand = "0.8"
+dirs = "5"
+shell-words = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,51 @@
+56112221opencode0/Users/feiyouguo/Projects/monid/worktrees/firecrawl-monitorzshmac0
+56676221opencode1/Users/feiyouguo/Projects/monid/worktrees/firecrawl-monitoropencodeOC | Review GitLab MR 482 for monid-services0
+64602231opencode0/Users/feiyouguo/Projects/monid/worktrees/firecrawl-interactzshmac0
+65151231opencode1/Users/feiyouguo/Projects/monid/worktrees/firecrawl-interactopencodeOC | Review of Firecrawl Interact sessions MR0
+12887catalog-v21zsh0/Users/feiyouguo/Projects/monid/worktrees/catalog-v2zshmac0
+26317catalog-v21zsh1/Users/feiyouguo/Projects/monid/worktrees/catalog-v2opencodeOC | Catalog service implementation0
+12907monid-cli-rate-limit1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-cli-rate-limitgitmac0
+19819monid-cli-rate-limit1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-cli-rate-limitopencodeOC | Rate limiting error message update0
+12914monid-cli-topup1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-cli-topupgitmac0
+15426monid-cli-topup1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-cli-topupopencodeOC | Branch changes and completeness review0
+42797monid-create-read-runs-history-api-key-scope1zsh0/Users/feiyouguo/Projects/monid/worktrees/create-read-runs-history-api-scopezshFeiyous-MacBook-Pro.local0
+43556monid-create-read-runs-history-api-key-scope1zsh1/Users/feiyouguo/Projects/monid/worktrees/create-read-runs-history-api-scopeopencodeOC | Split API key run read scope for run …0
+38836monid-inflow-discover-optimization1opencode0/Users/feiyouguo/Projects/monid/worktrees/inflow-discover-optimizationzshFeiyous-MacBook-Pro.local0
+39564monid-inflow-discover-optimization1opencode1/Users/feiyouguo/Projects/monid/worktrees/inflow-discover-optimizationopencodeOC | ODP discovery improvements for Monid0
+12923monid-instacloud-integ1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-instacloud-integzshmac0
+13708monid-instacloud-integ1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-instacloud-integopencodeOC | InstaCloud integration plan0
+63249monid-internal-api-deno-update1opencode0/Users/feiyouguo/Projects/monid/worktrees/internal-api-denonvim/Users/feiyouguo/Projects/monid/worktrees/internal-api-deno/services/analytics/adaptors/clickhouse/migrations/010_workspace_usage.sql0
+63803monid-internal-api-deno-update1opencode1/Users/feiyouguo/Projects/monid/worktrees/internal-api-denoopencodeOC | Reviewing GitLab MR 506 for monid-ser…0
+48099monid-lev81zsh0/Users/feiyouguo/Projects/monid/worktrees/monid-add-lev8-providerzshFeiyous-MacBook-Pro.local0
+48661monid-lev81zsh1/Users/feiyouguo/Projects/monid/worktrees/monid-add-lev8-provideropencodeOC | Review and fix GitLab MR 514 issues0
+12936monid-platform-webhooks-migration1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-platform-webhooks-migrationzshmac0
+10847monid-platform-webhooks-migration1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-platform-webhooks-migrationopencodeOC | Review and fix merge conflicts in branch0
+91398monid-promo-updates1zsh0/Users/feiyouguo/Projects/monid/worktrees/monid-promo-updatezshFeiyous-MacBook-Pro.local0
+11190monid-promo-updates1zsh1/Users/feiyouguo/Projects/monid/worktrees/monid-promo-update/serviceszshFeiyous-MacBook-Pro.local0
+13122monid-promo-updates1zsh2/Users/feiyouguo/Projects/monid/worktrees/monid-promo-update/landingzshFeiyous-MacBook-Pro.local0
+96116monid-promo-updates1zsh3/Users/feiyouguo/Projects/monid/worktrees/monid-promo-updateopencodeOC | Promo endpoint redesign for Miscreape…0
+7255monid-services1zsh0/Users/feiyouguo/Projects/monid/monid-serviceszshmac0
+47284monid-services2opencode0/Users/feiyouguo/Projects/monid/monid-servicesopencodeOC | Compliance Audit Trails for China Hires0
+67772monid-services3opencode0/Users/feiyouguo/Projects/monid/monid-servicesopencodeOC | Review team MR 493 in monid-services0
+20798monid-services4opencode0/Users/feiyouguo/Projects/monid/monid-servicesopencodeOC | Review GitLab MR 536 in monid-services0
+27089monid-services5opencode0/Users/feiyouguo/Projects/monid/monid-servicesopencodeOC | Multi-Agent Orchestration for Local W…0
+74571monid-services5opencode1/Users/feiyouguo/Projects/monid/monid-serviceszshFeiyous-MacBook-Pro.local0
+64072monid-services-admin-users1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-services-admin-users/services/internal-apinvimdiffview:///Users/feiyouguo/Projects/monid/monid-services/.git/worktrees/monid-services-admin-users/23ec8a209bf/services/internal-api/src/users/retry.ts0
+40364monid-services-admin-users1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-services-admin-users/servicesdenoFeiyous-MacBook-Pro.local0
+44370monid-services-admin-users1opencode2/Users/feiyouguo/Projects/monid/worktrees/monid-services-admin-usersopencodeOC | Review branch changes and fix localho…0
+59949monid-sfs-content-type1zsh0/Users/feiyouguo/Projects/monid/worktrees/sfs-content-typezshFeiyous-MacBook-Pro.local0
+61491monid-sfs-content-type1zsh1/Users/feiyouguo/Projects/monid/worktrees/sfs-content-typeopencodeOC | Fix MR 530 review comments0
+77075monid-signup-credit-attribution1nvim0/Users/feiyouguo/Projects/monid/worktrees/monid-signup-credit-codes/landingnvimdiffview:///Users/feiyouguo/Projects/monid/monid-services/.git/worktrees/monid-signup-credit-codes/23ec8a209bf/landing/app/components/landing/cta/LandingCliPill.vue1
+58642monid-signup-credit-attribution1nvim1/Users/feiyouguo/Projects/monid/worktrees/monid-signup-credit-codes/servicesdenoFeiyous-MacBook-Pro.local1
+60858monid-signup-credit-attribution1nvim2/Users/feiyouguo/Projects/monid/worktrees/monid-signup-credit-codes/landingpnpmFeiyous-MacBook-Pro.local1
+77623monid-signup-credit-attribution1nvim3/Users/feiyouguo/Projects/monid/worktrees/monid-signup-credit-codesopencodeOC | Reviewing MR 531 vs design implementa…1
+10233monid-update-run-status-rep1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-update-run-status-repzshFeiyous-MacBook-Pro.local0
+11560monid-update-run-status-rep1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-update-run-status-repopencodeOC | Provider failure reported as COMPLETE…0
+12948monid-update-timeouts1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-update-timeoutszshmac0
+6046monid-update-timeouts1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-update-timeoutsopencodeOC | Review changes and resolve merge conf…0
+12958monid-vercel-integration1zsh0/Users/feiyouguo/Projects/monid/worktrees/monid-vercel-integrationzshmac0
+4828monid-vercel-integration1zsh1/Users/feiyouguo/Projects/monid/worktrees/monid-vercel-integrationopencodeOC | Building Vercel integration0
+12968monid-worldid-cleanup1opencode0/Users/feiyouguo/Projects/monid/worktrees/monid-worldid-cleanupzshmac0
+87960monid-worldid-cleanup1opencode1/Users/feiyouguo/Projects/monid/worktrees/monid-worldid-cleanupopencodeOC | Review GitLab MR 427 merge readiness0
+12977signup-credit-policy1opencode0/Users/feiyouguo/Projects/monid/worktrees/signup-credit-policyzshmac0
+98291signup-credit-policy1opencode1/Users/feiyouguo/Projects/monid/worktrees/signup-credit-policyopencodeOC | MR 477 review and merge check0
