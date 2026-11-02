@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default = "Config::empty")]
 pub struct Config {
     pub defaults: Defaults,
     /// (legacy) extra arguments for opencode; prefer `agents.opencode.args`.
@@ -24,7 +24,8 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Defaults {
-    /// Adapter preselected by `fleet agent start` when `--agent` is omitted.
+    /// Adapter preselected by `fleet agent start` when `--agent` is omitted. REQUIRED in the
+    /// config file (no hidden fallback): `validate` rejects an empty value.
     pub agent: String,
     pub mode: String,
     pub nvim_pane: bool,
@@ -36,7 +37,7 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
-            agent: "opencode".into(),
+            agent: String::new(),
             mode: "plan".into(),
             nvim_pane: true,
             notify: true,
@@ -150,10 +151,29 @@ impl<'de> Deserialize<'de> for AgentsConfig {
     }
 }
 
+impl Config {
+    /// What a file that omits a key gets: nothing. `validate` then insists on `agents` and
+    /// `defaults.agent`, so the file is the whole truth.
+    fn empty() -> Self {
+        Self {
+            defaults: Defaults::default(),
+            agent_args: vec![],
+            projects: vec![],
+            agents: AgentsConfig::default(),
+            keys: BTreeMap::new(),
+        }
+    }
+}
+
+/// The config used when NO file exists yet (so `fleet setup` / `fleet project add` can run):
+/// every builtin agent enabled, opencode preselected. A file that exists must spell both out.
 impl Default for Config {
     fn default() -> Self {
         Self {
-            defaults: Defaults::default(),
+            defaults: Defaults {
+                agent: "opencode".into(),
+                ..Defaults::default()
+            },
             agent_args: vec![],
             projects: vec![],
             agents: AgentsConfig::builtin(),
@@ -272,11 +292,60 @@ impl Config {
             }
             Ok(Some(lua.from_value(value)?))
         };
-        match run() {
-            Ok(Some(cfg)) => Ok(cfg),
+        let cfg = match run() {
+            Ok(Some(cfg)) => cfg,
             Ok(None) => bail!("{chunk_name}: the file must `return {{ ... }}` a config table"),
             Err(e) => bail!("{chunk_name}: {}", lua_error(e)),
+        };
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("{chunk_name}: {e}"))?;
+        Ok(cfg)
+    }
+
+    /// Everything about agents is explicit in the file: which adapters exist (and whether they
+    /// are enabled) and which one `fleet agent start` preselects. Nothing is inherited silently,
+    /// so a config written for one machine reads the same on another.
+    pub fn validate(&self) -> Result<()> {
+        let known = crate::agents::KNOWN;
+        if self.agents.0.is_empty() {
+            bail!(
+                "`agents` is not set. Declare every adapter explicitly, e.g.\n  agents = {{\n    \
+                 opencode = {{ enabled = true }},\n    claude = {{ enabled = true }},\n    \
+                 codex = {{ enabled = false }},\n  }}\n(known adapters: {})",
+                known.join(", ")
+            );
         }
+        if let Some(bad) = self.agents.0.keys().find(|n| !known.contains(&n.as_str())) {
+            bail!(
+                "agents.{bad}: unknown adapter (known: {})",
+                known.join(", ")
+            );
+        }
+        let enabled = self.agents.enabled();
+        if enabled.is_empty() {
+            bail!("every adapter in `agents` is disabled; enable at least one");
+        }
+        if self.defaults.agent.is_empty() {
+            bail!(
+                "defaults.agent is not set. Add e.g. defaults = {{ agent = \"{}\" }} (enabled: {})",
+                enabled[0],
+                enabled.join(", ")
+            );
+        }
+        if !enabled.contains(&self.defaults.agent.as_str()) {
+            bail!(
+                "defaults.agent = \"{}\" is not an enabled adapter (enabled: {})",
+                self.defaults.agent,
+                enabled.join(", ")
+            );
+        }
+        if !["plan", "build"].contains(&self.defaults.mode.as_str()) {
+            bail!(
+                "defaults.mode must be plan or build, got \"{}\"",
+                self.defaults.mode
+            );
+        }
+        Ok(())
     }
 
     fn normalise(&mut self) {
@@ -330,7 +399,8 @@ return {
   -- fleet:projects:end
 
   -- Agents: which coding-agent CLIs fleet discovers and can launch. Independent of projects:
-  -- any enabled agent can run in any project.
+  -- any enabled agent can run in any project. Both this table and defaults.agent are REQUIRED:
+  -- fleet never assumes an adapter you did not write down.
   agents = {
     opencode = { enabled = true, args = {} },          -- args appended to every launch, e.g. { "--model", "anthropic/claude-opus-5" }
     claude   = { enabled = true, args = {} },
@@ -407,7 +477,8 @@ mod tests {
         let src = r#"
             local home = os.getenv("HOME")
             return {
-              defaults = { mode = "build" },
+              defaults = { agent = "opencode", mode = "build" },
+              agents = { opencode = { enabled = true } },
               projects = {
                 { name = "svc", repo = home .. "/x", reviews = "gitlab:a/b" },
                 { name = "cli", repo = "~/y", worktrees = "~/wt", base = "develop" },
@@ -432,13 +503,35 @@ mod tests {
 
     #[test]
     fn agents_table_both_shapes() {
-        let c =
-            Config::from_lua(r#"return { agents = { adapters = { "opencode" } } }"#, "t").unwrap();
+        let c = Config::from_lua(
+            r#"return { defaults = { agent = "opencode" }, agents = { adapters = { "opencode" } } }"#,
+            "t",
+        )
+        .unwrap();
         assert_eq!(c.agents.enabled(), vec!["opencode"]);
-        let c = Config::from_lua(r#"return { agents = { claude = { args = { "--model", "x" } }, codex = { enabled = false } } }"#, "t").unwrap();
+        let c = Config::from_lua(r#"return { defaults = { agent = "claude" }, agents = { claude = { args = { "--model", "x" } }, codex = { enabled = false } } }"#, "t").unwrap();
         assert_eq!(c.agents.enabled(), vec!["claude"]);
         assert_eq!(c.agents.get("claude").args, vec!["--model", "x"]);
+        // No file at all: builtin set, opencode preselected (bootstrap only).
         assert_eq!(Config::default().agents.enabled().len(), 3);
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn agents_must_be_explicit() {
+        let err = |src: &str| Config::from_lua(src, "t").unwrap_err().to_string();
+        assert!(err("return {}").contains("`agents` is not set"));
+        assert!(
+            err(r#"return { agents = { opencode = {} } }"#).contains("defaults.agent is not set")
+        );
+        assert!(
+            err(r#"return { defaults = { agent = "codex" }, agents = { opencode = {} } }"#)
+                .contains("not an enabled adapter")
+        );
+        assert!(err(r#"return { defaults = { agent = "opencode" }, agents = { opencode = {}, aider = {} } }"#)
+            .contains("unknown adapter"));
+        assert!(err(r#"return { defaults = { agent = "opencode" }, agents = { opencode = { enabled = false } } }"#)
+            .contains("enable at least one"));
     }
 
     #[test]
