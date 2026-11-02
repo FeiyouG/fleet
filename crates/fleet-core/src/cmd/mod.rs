@@ -1,5 +1,6 @@
 //! Commands that change the world: start, rename, review, send, gc.
 
+pub mod agent_hook;
 pub mod gc;
 pub mod project;
 pub mod rename;

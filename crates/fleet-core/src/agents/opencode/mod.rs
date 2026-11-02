@@ -3,29 +3,34 @@
 pub mod db;
 pub mod http;
 pub mod plannotator;
-pub mod state_file;
 
-use super::{AgentAdapter, DiscoverCtx, LaunchSpec, SendTarget};
+use super::state_file::{self, AgentState};
+use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec};
+use crate::config::AgentConfig;
 use crate::model::{Activity, AgentRow};
 use crate::procs::{canon, ProcTable};
-use crate::tmux;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct OpenCode {
+    pub cfg: AgentConfig,
     pub db_path: PathBuf,
     /// Sessions older than this are ignored when matching a process to a session.
     pub session_window_secs: i64,
 }
 
-impl Default for OpenCode {
-    fn default() -> Self {
+impl OpenCode {
+    pub fn new(cfg: AgentConfig) -> Self {
         Self {
+            cfg,
             db_path: db::default_db_path(),
             session_window_secs: 14 * 86_400,
         }
+    }
+    fn bin(&self) -> String {
+        self.cfg.bin.clone().unwrap_or_else(|| "opencode".into())
     }
 }
 
@@ -60,7 +65,7 @@ pub fn row_from_facts(
     plan: Option<&plannotator::Plan>,
     live: Option<&http::Live>,
     port: Option<u16>,
-    state: Option<&state_file::AgentState>,
+    state: Option<&AgentState>,
 ) -> AgentRow {
     let pending = state.map(|s| s.pending()).unwrap_or_default();
     let activity = if plan.is_some() {
@@ -72,11 +77,7 @@ pub fn row_from_facts(
             Some(s) if s.running_tool.as_deref() == Some("question") => Activity::WaitQuestion,
             Some(s) if s.running_tool.as_deref() == Some("submit_plan") => Activity::WaitPlan,
             Some(s) if !s.last_completed => Activity::Working,
-            Some(_) => match live {
-                Some(l) if l.busy => Activity::Working,
-                _ => Activity::Idle,
-            },
-            None => match live {
+            _ => match live {
                 Some(l) if l.busy => Activity::Working,
                 _ => Activity::Idle,
             },
@@ -115,12 +116,11 @@ impl AgentAdapter for OpenCode {
         "opencode"
     }
 
-    fn owns_process(&self, name: &str) -> bool {
-        name == "opencode"
+    fn process_names(&self) -> &'static [&'static str] {
+        &["opencode"]
     }
 
     async fn discover(&self, procs: &ProcTable, ctx: &DiscoverCtx) -> Result<Vec<AgentRow>> {
-        let known_ports = &ctx.known_ports;
         let pids: Vec<u32> = procs.named("opencode").iter().map(|p| p.pid).collect();
         if pids.is_empty() {
             return Ok(vec![]);
@@ -140,16 +140,13 @@ impl AgentAdapter for OpenCode {
             let dir = ctx.path_aliases.get(&dir).cloned().unwrap_or(dir);
             by_dir.entry(dir).or_default().push(s);
         }
-
-        let ports = plannotator::listening_ports(&pids).await;
-        let states = state_file::read_all(procs);
         let by_id: HashMap<&str, &db::DbSession> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
 
         // Probe every listening port of every opencode process concurrently. A port is
-        // either Plannotator (plan waiting), opencode's own API (fleet-started), or neither.
+        // either Plannotator (plan waiting), opencode's own API, or neither.
         let probes = pids.iter().flat_map(|&pid| {
-            ports
+            ctx.ports
                 .get(&pid)
                 .map(Vec::as_slice)
                 .unwrap_or(&[])
@@ -170,12 +167,13 @@ impl AgentAdapter for OpenCode {
                 .and_then(|p| p.cwd.clone())
                 .map(|c| canon(&c))
                 .unwrap_or_default();
-            // The plugin's state file names the session exactly; otherwise fall back to the
-            // newest session in the directory, disambiguated by the tmux pane title.
-            let state = states.get(&pid);
+            let state = ctx
+                .states
+                .get(&pid)
+                .filter(|s| s.agent.is_empty() || s.agent == "opencode");
             let state_port = state
                 .and_then(|st| st.port())
-                .filter(|p| ports.get(&pid).map(|v| v.contains(p)).unwrap_or(false));
+                .filter(|p| ctx.ports.get(&pid).map(|v| v.contains(p)).unwrap_or(false));
             let session = state
                 .and_then(|st| st.primary_session())
                 .and_then(|(id, _)| by_id.get(id.as_str()).copied())
@@ -186,7 +184,7 @@ impl AgentAdapter for OpenCode {
                     )
                 });
             let mut plan = None;
-            let mut port = known_ports.get(&pid).copied().or(state_port);
+            let mut port = ctx.known_ports.get(&pid).copied().or(state_port);
             for (p_pid, p, pl, is_oc) in &probe_results {
                 if *p_pid != pid {
                     continue;
@@ -214,35 +212,46 @@ impl AgentAdapter for OpenCode {
         Ok(rows)
     }
 
-    async fn send(&self, target: &SendTarget, text: &str) -> Result<()> {
-        match target {
-            SendTarget::Port(p) => http::submit_prompt(*p, text).await,
-            SendTarget::Pane(t) => tmux::send_keys(t, text).await,
-        }
-    }
-
     fn launch(&self, spec: &LaunchSpec) -> String {
         let mut parts = vec![
-            "opencode".to_string(),
+            self.bin(),
             "--port".into(),
             spec.port.to_string(),
             "--agent".into(),
-            spec.mode.clone(),
+            spec.mode.as_str().into(),
         ];
-        parts.extend(spec.extra_args.iter().cloned());
+        parts.extend(self.cfg.args.iter().cloned());
         parts.push("--prompt".into());
         parts.push(spec.prompt.clone());
-        shell_words::join(parts)
+        shell_line(parts)
     }
 
-    fn uses_dir(&self, _dir: &Path) -> bool {
-        false
+    async fn send(&self, agent: &AgentRow, text: &str) -> Result<()> {
+        match agent.port {
+            Some(p) if http::is_opencode(p).await => http::submit_prompt(p, text).await,
+            _ => super::send_via_tmux(agent, text).await,
+        }
     }
+
+    fn hook_install(&self) -> Option<HookInstall> {
+        Some(HookInstall::File {
+            path: plugin_path(),
+            contents: state_file::PLUGIN_SOURCE,
+        })
+    }
+}
+
+pub fn plugin_path() -> PathBuf {
+    crate::config::xdg_config_home()
+        .join("opencode")
+        .join("plugins")
+        .join("fleet.ts")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::Mode;
     use chrono::Utc;
 
     fn sess(completed: bool, tool: Option<&str>) -> db::DbSession {
@@ -266,7 +275,7 @@ mod tests {
         let f = |s: Option<&db::DbSession>,
                  pl: Option<&plannotator::Plan>,
                  live: Option<&http::Live>,
-                 st: Option<&state_file::AgentState>| {
+                 st: Option<&AgentState>| {
             row_from_facts(1, "/w".into(), s, pl, live, None, st).activity
         };
         assert_eq!(
@@ -287,7 +296,6 @@ mod tests {
         );
         assert_eq!(f(Some(&sess(true, None)), None, None, None), Activity::Idle);
         assert_eq!(f(None, None, None, None), Activity::Idle);
-        // a pending permission in the plugin state file wins over a running bash tool
         let st = state_file::parse(r#"{"pid":1,"sessions":{"ses_x":{"status":"busy","pending":[{"id":"p","title":"bash: rm -rf dist","type":"bash"}]}}}"#).unwrap();
         let row = row_from_facts(
             1,
@@ -329,13 +337,12 @@ mod tests {
 
     #[test]
     fn launch_line_is_shell_safe() {
-        let oc = OpenCode::default();
+        let oc = OpenCode::new(AgentConfig::default());
         let s = oc.launch(&LaunchSpec {
             cwd: "/w".into(),
-            mode: "plan".into(),
+            mode: Mode::Plan,
             prompt: "Fix the \"thing\"\n\nwith newlines".into(),
             port: 4096,
-            extra_args: vec![],
         });
         assert!(s.starts_with("opencode --port 4096 --agent plan --prompt "));
         let back = shell_words::split(&s).unwrap();

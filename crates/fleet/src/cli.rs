@@ -63,9 +63,9 @@ enum Cmd {
     Project(ProjectCmd),
     /// Print every action and its current key binding
     Keys,
-    /// Install the opencode plugin that reports permission prompts (and print the tmux snippet)
+    /// Install each enabled agent's hook/plugin so fleet sees permission prompts (and print the tmux snippet)
     Setup {
-        /// Uninstall the plugin
+        /// Uninstall fleet's hooks/plugins from every agent
         #[arg(long)]
         remove: bool,
         /// Report plugin / tools / agent-state status without changing anything
@@ -74,6 +74,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Hook handler run by Claude Code / Codex (reads the event JSON on stdin). Not for humans.
+    #[command(hide = true, name = "agent-hook")]
+    AgentHook { agent: String },
 }
 
 #[derive(Subcommand)]
@@ -108,7 +111,10 @@ struct StartArgs {
     /// Repo name from config (default: the cwd's repo, else the only repo)
     #[arg(long)]
     repo: Option<String>,
-    /// opencode agent: plan | build
+    /// Which agent to launch: opencode | claude | codex (default: defaults.agent)
+    #[arg(long)]
+    agent: Option<String>,
+    /// plan | build
     #[arg(long)]
     mode: Option<String>,
     /// Base branch (default: repo's `base`, usually main)
@@ -137,6 +143,9 @@ enum ReviewCmd {
         id_or_url: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Which agent to launch (default: defaults.agent)
+        #[arg(long)]
+        agent: Option<String>,
         #[arg(long)]
         no_attach: bool,
     },
@@ -325,6 +334,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             ReviewCmd::Start {
                 id_or_url,
                 repo,
+                agent,
                 no_attach,
             } => {
                 let engine = Engine::new(cfg);
@@ -334,6 +344,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                     review::ReviewOpts {
                         id_or_url,
                         repo,
+                        agent,
                         attach: !no_attach,
                     },
                     &progress(),
@@ -564,45 +575,53 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             check,
             json,
         } => {
+            let engine = Engine::new(cfg.clone());
             if remove {
                 let r = cmd::setup::remove()?;
-                println!(
-                    "{}",
-                    if r {
-                        "plugin removed; restart opencode sessions to stop state files"
-                    } else {
-                        "plugin was not installed"
+                if r.is_empty() {
+                    println!("nothing was installed");
+                } else {
+                    for x in r {
+                        println!("removed {x}");
                     }
-                );
+                    println!("restart running agent sessions to stop their state files");
+                }
                 return Ok(());
             }
             if !check {
-                let p = cmd::setup::install()?;
-                println!("installed {}", p.display());
-                println!(
-                    "restart your opencode sessions to load it (running ones keep the old state)\n"
-                );
+                for h in cmd::setup::install(engine.agent_adapters())? {
+                    println!("installed {:<9} {}", h.agent, h.path);
+                }
+                println!("restart your agent sessions to load the hooks (running ones keep the old state)\n");
                 println!(
                     "tmux status bar (add to ~/.config/tmux/tmux.conf):\n{}\n",
                     cmd::setup::TMUX_SNIPPET
                 );
             }
-            let c = cmd::setup::check(&cfg).await;
+            let c = cmd::setup::check(&cfg, engine.agent_adapters()).await;
             if json {
                 return print_json(&c);
             }
-            println!(
-                "plugin: {} ({})",
-                if !c.plugin_installed {
-                    "not installed"
-                } else if c.plugin_up_to_date {
-                    "installed"
-                } else {
-                    "installed, OUTDATED (run fleet setup)"
-                },
-                c.plugin_path
-            );
-            println!("agents: {} running, {} reporting state (restart the other {} for permission prompts)", c.agents_running, c.agents_with_state, c.agents_running.saturating_sub(c.agents_with_state));
+            for a in &c.agents {
+                let hook = c.hooks.iter().find(|h| h.agent == a.agent);
+                println!(
+                    "{} {:<9} bin {} · {} running, {} reporting state · hooks {}{}",
+                    if a.bin_found { "✓" } else { "✗" },
+                    a.agent,
+                    if a.bin_found { "found" } else { "NOT FOUND" },
+                    a.running,
+                    a.reporting,
+                    match hook {
+                        None => "n/a".to_string(),
+                        Some(h) if !h.installed => "not installed".to_string(),
+                        Some(h) if !h.up_to_date => "OUTDATED (run fleet setup)".to_string(),
+                        Some(_) => "installed".to_string(),
+                    },
+                    hook.and_then(|h| h.note)
+                        .map(|n| format!(" · {n}"))
+                        .unwrap_or_default()
+                );
+            }
             for t in &c.tools {
                 println!(
                     "{} {:<9} {}",
@@ -613,6 +632,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::AgentHook { agent } => cmd::agent_hook::run(&agent),
         Cmd::Keys => {
             for (action, key) in tui::keys::Keymap::from_config(&cfg).list() {
                 println!("{action:<22} {key}");
@@ -671,6 +691,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     name: args.name,
                     prompt,
                     repo,
+                    agent: args.agent,
                     mode: args.mode,
                     base: args.base,
                     nvim: if args.no_nvim { Some(false) } else { None },
@@ -680,8 +701,9 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
             )
             .await?;
             println!(
-                "started {} on {} at {} (tmux {}, port {})",
+                "started {} ({}) on {} at {} (tmux {}, port {})",
                 out.slug,
+                out.agent,
                 out.branch,
                 out.path.display(),
                 out.tmux_session,

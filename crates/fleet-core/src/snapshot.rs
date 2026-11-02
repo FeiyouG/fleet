@@ -35,7 +35,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config) -> Self {
-        let agent_adapters = agents::adapters(&config.agents.adapters);
+        let agent_adapters = agents::adapters(&config.agents, &config.agent_args);
         let mut sources: Vec<String> = config
             .projects
             .iter()
@@ -75,11 +75,32 @@ impl Engine {
             .map(|b| b.as_ref())
     }
 
+    pub fn agent_adapters(&self) -> &[Box<dyn AgentAdapter>] {
+        &self.agent_adapters
+    }
+
+    /// Every pid that belongs to an enabled adapter.
+    fn agent_pids(&self, procs: &ProcTable) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .agent_adapters
+            .iter()
+            .flat_map(|a| {
+                a.process_names()
+                    .iter()
+                    .flat_map(|n| procs.named(n).into_iter().map(|p| p.pid))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// Registry facts: `pid -> port` for fleet-started agents (matched by the port being
     /// alive in that process) and `old path -> current path` for renamed tasks.
-    async fn registry_ctx(
+    fn registry_ctx(
         &self,
-        procs: &ProcTable,
+        ports: &HashMap<u32, Vec<u16>>,
     ) -> (HashMap<u32, u16>, HashMap<PathBuf, PathBuf>) {
         let mut map = HashMap::new();
         let mut aliases = HashMap::new();
@@ -89,19 +110,6 @@ impl Engine {
         let Ok(tasks) = reg.open_tasks() else {
             return (map, aliases);
         };
-        // Map port -> pid via the processes' listening ports.
-        let pids: Vec<u32> = self
-            .agent_adapters
-            .iter()
-            .flat_map(|a| {
-                procs
-                    .named(a.name())
-                    .into_iter()
-                    .map(|p| p.pid)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let ports = agents::opencode::plannotator::listening_ports(&pids).await;
         for t in tasks {
             if let Some(port) = t.port {
                 if let Some((pid, _)) = ports.iter().find(|(_, ps)| ps.contains(&port)) {
@@ -139,12 +147,32 @@ impl Engine {
             let mut all = vec![];
             let mut errs = vec![];
             if let Some(p) = procs.as_ref() {
-                let (known_ports, path_aliases) = self.registry_ctx(p).await;
-                let title_hints = title_hints(p, &panes_for_hints).await;
+                let pids = self.agent_pids(p);
+                // Listening ports of each agent pid and its descendants (Claude/Codex run
+                // Plannotator as a hook child), keyed by the agent pid.
+                let mut fam: Vec<(u32, Vec<u32>)> =
+                    pids.iter().map(|&pid| (pid, p.descendants(pid))).collect();
+                let all_pids: Vec<u32> = fam.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+                let raw = agents::opencode::plannotator::listening_ports(&all_pids).await;
+                let mut ports: HashMap<u32, Vec<u16>> = HashMap::new();
+                for (pid, d) in fam.drain(..) {
+                    let mut v: Vec<u16> = d
+                        .iter()
+                        .flat_map(|x| raw.get(x).cloned().unwrap_or_default())
+                        .collect();
+                    v.sort();
+                    v.dedup();
+                    ports.insert(pid, v);
+                }
+                let (known_ports, path_aliases) = self.registry_ctx(&ports);
+                let title_hints = title_hints(p, &pids, &panes_for_hints);
+                let states = agents::state_file::read_all(p);
                 let ctx = DiscoverCtx {
                     known_ports,
                     title_hints,
                     path_aliases,
+                    states,
+                    ports,
                 };
                 for a in &self.agent_adapters {
                     match a.discover(p, &ctx).await {
@@ -273,12 +301,16 @@ impl Engine {
 }
 
 /// `pid -> pane title` for every agent process whose ancestor is a tmux pane shell.
-async fn title_hints(procs: &ProcTable, panes: &[crate::model::PaneRow]) -> HashMap<u32, String> {
+fn title_hints(
+    procs: &ProcTable,
+    pids: &[u32],
+    panes: &[crate::model::PaneRow],
+) -> HashMap<u32, String> {
     let by_pid: HashMap<u32, usize> = panes.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
     let mut out = HashMap::new();
-    for p in procs.named("opencode") {
-        if let Some(i) = procs.ancestor_in(p.pid, &by_pid) {
-            out.insert(p.pid, panes[i].title.clone());
+    for &pid in pids {
+        if let Some(i) = procs.ancestor_in(pid, &by_pid) {
+            out.insert(pid, panes[i].title.clone());
         }
     }
     out

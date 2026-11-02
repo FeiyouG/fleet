@@ -6,7 +6,6 @@ use super::util;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::{execute, terminal};
-use fleet_core::agents::SendTarget;
 use fleet_core::cmd;
 use fleet_core::model::Fleet;
 use fleet_core::{tmux, Config, Engine};
@@ -456,6 +455,7 @@ impl App {
                 name,
                 prompt,
                 repo,
+                agent,
                 mode,
             } => {
                 let engine = self.engine.clone();
@@ -466,6 +466,7 @@ impl App {
                             name,
                             prompt,
                             repo,
+                            agent,
                             mode,
                             base: None,
                             nvim: None,
@@ -484,11 +485,11 @@ impl App {
                 let target = self.selected_send_target();
                 let engine = self.engine.clone();
                 match target {
-                    Some(t) => self.spawn("send", async move {
-                        let a = engine
-                            .agent_adapter("opencode")
-                            .ok_or_else(|| anyhow::anyhow!("no opencode adapter"))?;
-                        a.send(&t, &text).await?;
+                    Some(row) => self.spawn("send", async move {
+                        let a = engine.agent_adapter(&row.adapter).ok_or_else(|| {
+                            anyhow::anyhow!("agent `{}` is not enabled", row.adapter)
+                        })?;
+                        a.send(&row, &text).await?;
                         Ok(format!("sent to {name}"))
                     }),
                     None => self.set_status("no running agent".into(), true),
@@ -577,6 +578,7 @@ impl App {
                 cmd::review::ReviewOpts {
                     id_or_url: num,
                     repo,
+                    agent: None,
                     attach: false,
                 },
                 &cmd::quiet(),
@@ -720,7 +722,7 @@ impl App {
         tabs::selected_name(self)
     }
 
-    pub fn selected_send_target(&self) -> Option<SendTarget> {
+    pub fn selected_send_target(&self) -> Option<fleet_core::model::AgentRow> {
         tabs::selected_send_target(self)
     }
 }

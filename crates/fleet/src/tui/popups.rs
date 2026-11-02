@@ -19,6 +19,7 @@ pub enum PopupCmd {
         name: Option<String>,
         prompt: String,
         repo: String,
+        agent: Option<String>,
         mode: Option<String>,
     },
     Message {
@@ -79,9 +80,11 @@ pub struct StartForm {
     pub prompt: TextArea<'static>,
     pub repos: Vec<String>,
     pub repo_idx: usize,
+    pub agents: Vec<String>,
+    pub agent_idx: usize,
     pub modes: Vec<String>,
     pub mode_idx: usize,
-    /// 0 name, 1 repo, 2 mode, 3 prompt
+    /// 0 name, 1 repo, 2 agent, 3 mode, 4 prompt
     pub focus: usize,
 }
 
@@ -168,14 +171,21 @@ impl Popup {
             .iter()
             .position(|m| *m == cfg.defaults.mode)
             .unwrap_or(0);
+        let agents: Vec<String> = cfg.agents.enabled().into_iter().map(String::from).collect();
+        let agent_idx = agents
+            .iter()
+            .position(|a| *a == cfg.defaults.agent)
+            .unwrap_or(0);
         Popup::Start(StartForm {
             name,
             prompt,
             repos,
             repo_idx,
+            agents,
+            agent_idx,
             modes,
             mode_idx,
-            focus: 3,
+            focus: 4,
         })
     }
 }
@@ -353,6 +363,7 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                     name: if name.is_empty() { None } else { Some(name) },
                     prompt,
                     repo: form.repos.get(form.repo_idx).cloned().unwrap_or_default(),
+                    agent: form.agents.get(form.agent_idx).cloned(),
                     mode: form.modes.get(form.mode_idx).cloned(),
                 });
             }
@@ -374,9 +385,9 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 let back =
                     ev.code == KeyCode::BackTab || ev.modifiers.contains(KeyModifiers::SHIFT);
                 form.focus = if back {
-                    (form.focus + 3) % 4
+                    (form.focus + 4) % 5
                 } else {
-                    (form.focus + 1) % 4
+                    (form.focus + 1) % 5
                 };
                 return Outcome::Keep(Popup::Start(form));
             }
@@ -385,7 +396,7 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                     if ev.code != KeyCode::Enter {
                         form.name.input(*ev);
                     } else {
-                        form.focus = 3;
+                        form.focus = 4;
                     }
                 }
                 1 => match ev.code {
@@ -403,6 +414,20 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                     _ => {}
                 },
                 2 => match ev.code {
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') => {
+                        form.agent_idx = (form.agent_idx + form.agents.len().max(1) - 1)
+                            % form.agents.len().max(1)
+                    }
+                    KeyCode::Right
+                    | KeyCode::Char('l')
+                    | KeyCode::Char('j')
+                    | KeyCode::Char(' ')
+                    | KeyCode::Enter => {
+                        form.agent_idx = (form.agent_idx + 1) % form.agents.len().max(1)
+                    }
+                    _ => {}
+                },
+                3 => match ev.code {
                     KeyCode::Left
                     | KeyCode::Right
                     | KeyCode::Char('h')
@@ -666,7 +691,15 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             ]);
             f.render_widget(Paragraph::new(repo_line), rows[1]);
             let mode_line = Line::from(vec![
-                Span::styled("mode  ", focus(2)),
+                Span::styled("agent ", focus(2)),
+                Span::raw(
+                    form.agents
+                        .get(form.agent_idx)
+                        .cloned()
+                        .unwrap_or_else(|| "(none enabled)".into()),
+                ),
+                Span::styled("  ← → to change    ", dim()),
+                Span::styled("mode ", focus(3)),
                 Span::raw(form.modes[form.mode_idx].clone()),
                 Span::styled("  ← → to change", dim()),
             ]);
@@ -676,7 +709,7 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 Block::default()
                     .borders(Borders::TOP)
                     .border_style(dim())
-                    .title(Span::styled("prompt", focus(3))),
+                    .title(Span::styled("prompt", focus(4))),
             );
             f.render_widget(&prompt, rows[3]);
             // preview

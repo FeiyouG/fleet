@@ -10,6 +10,7 @@ pub struct Proc {
     pub ppid: Option<u32>,
     pub name: String,
     pub cwd: Option<PathBuf>,
+    pub cmdline: Vec<String>,
 }
 
 pub struct ProcTable {
@@ -22,7 +23,9 @@ impl ProcTable {
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+            ProcessRefreshKind::nothing()
+                .with_cwd(UpdateKind::Always)
+                .with_cmd(UpdateKind::Always),
         );
         let by_pid = sys
             .processes()
@@ -36,6 +39,11 @@ impl ProcTable {
                         ppid: p.parent().map(Pid::as_u32),
                         name: p.name().to_string_lossy().into_owned(),
                         cwd: p.cwd().map(Path::to_path_buf),
+                        cmdline: p
+                            .cmd()
+                            .iter()
+                            .map(|a| a.to_string_lossy().into_owned())
+                            .collect(),
                     },
                 )
             })
@@ -85,6 +93,22 @@ impl ProcTable {
     pub fn is_alive(&self, pid: u32) -> bool {
         self.by_pid.contains_key(&pid)
     }
+
+    /// `pid` plus every process below it in the tree.
+    pub fn descendants(&self, pid: u32) -> Vec<u32> {
+        let mut out = vec![pid];
+        let mut i = 0;
+        while i < out.len() {
+            let cur = out[i];
+            for p in self.by_pid.values() {
+                if p.ppid == Some(cur) && !out.contains(&p.pid) {
+                    out.push(p.pid);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 /// Canonicalise, falling back to the input when the path no longer exists.
@@ -113,24 +137,28 @@ mod tests {
                 ppid: None,
                 name: "launchd".into(),
                 cwd: None,
+                cmdline: vec![],
             },
             Proc {
                 pid: 10,
                 ppid: Some(1),
                 name: "zsh".into(),
                 cwd: None,
+                cmdline: vec![],
             },
             Proc {
                 pid: 20,
                 ppid: Some(10),
                 name: "opencode".into(),
                 cwd: None,
+                cmdline: vec![],
             },
             Proc {
                 pid: 30,
                 ppid: Some(20),
                 name: "bun".into(),
                 cwd: None,
+                cmdline: vec![],
             },
         ]);
         let mut c = HashMap::new();

@@ -302,7 +302,7 @@ impl OverviewRow {
             .and_then(|a| {
                 self.panes
                     .iter()
-                    .find(|p| p.pid == a.pid || p.command == "opencode")
+                    .find(|p| p.pid == a.pid || p.command == a.adapter)
             })
             .or_else(|| self.panes.first())
     }

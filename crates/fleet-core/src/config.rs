@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 pub struct Config {
     pub defaults: Defaults,
-    /// Extra command-line arguments for the agent (e.g. `{"--model", "anthropic/claude-opus-5"}`).
+    /// (legacy) extra arguments for opencode; prefer `agents.opencode.args`.
+    #[serde(deserialize_with = "lua_string_list")]
     pub agent_args: Vec<String>,
     pub projects: Vec<Project>,
     pub agents: AgentsConfig,
@@ -23,6 +24,8 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Defaults {
+    /// Adapter preselected by `fleet agent start` when `--agent` is omitted.
+    pub agent: String,
     pub mode: String,
     pub nvim_pane: bool,
     pub notify: bool,
@@ -33,6 +36,7 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
+            agent: "opencode".into(),
             mode: "plan".into(),
             nvim_pane: true,
             notify: true,
@@ -74,17 +78,75 @@ impl Project {
     }
 }
 
+/// One coding-agent adapter's settings. Independent of projects: any enabled agent can run
+/// in any project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AgentsConfig {
-    pub adapters: Vec<String>,
+pub struct AgentConfig {
+    pub enabled: bool,
+    /// Executable name or path. Defaults to the adapter name.
+    pub bin: Option<String>,
+    /// Extra arguments appended to every launch.
+    #[serde(deserialize_with = "lua_string_list")]
+    pub args: Vec<String>,
+    /// Codex: `--sandbox` value for build mode (`workspace-write` by default).
+    pub sandbox: Option<String>,
 }
 
-impl Default for AgentsConfig {
+impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            adapters: vec!["opencode".into()],
+            enabled: true,
+            bin: None,
+            args: vec![],
+            sandbox: None,
         }
+    }
+}
+
+/// `agents = { opencode = {...}, claude = {...} }`. The v0.2 shape
+/// `agents = { adapters = {"opencode"} }` still parses.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AgentsConfig(pub BTreeMap<String, AgentConfig>);
+
+impl AgentsConfig {
+    pub fn enabled(&self) -> Vec<&str> {
+        self.0
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+    pub fn get(&self, name: &str) -> AgentConfig {
+        self.0.get(name).cloned().unwrap_or_default()
+    }
+    pub fn builtin() -> Self {
+        Self(
+            ["opencode", "claude", "codex"]
+                .iter()
+                .map(|n| (n.to_string(), AgentConfig::default()))
+                .collect(),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentsConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Legacy { adapters: Vec<String> },
+            Map(BTreeMap<String, AgentConfig>),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Legacy { adapters } => AgentsConfig(
+                adapters
+                    .into_iter()
+                    .map(|n| (n, AgentConfig::default()))
+                    .collect(),
+            ),
+            Raw::Map(m) => AgentsConfig(m),
+        })
     }
 }
 
@@ -94,15 +156,37 @@ impl Default for Config {
             defaults: Defaults::default(),
             agent_args: vec![],
             projects: vec![],
-            agents: AgentsConfig::default(),
+            agents: AgentsConfig::builtin(),
             keys: BTreeMap::new(),
         }
     }
 }
 
+/// A Lua `{}` is an empty *table*, which arrives as a map, not a sequence. Accept both.
+fn lua_string_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Seq(Vec<String>),
+        Map(BTreeMap<String, String>),
+    }
+    Ok(match Raw::deserialize(d)? {
+        Raw::Seq(v) => v,
+        Raw::Map(m) => m.into_values().collect(),
+    })
+}
+
 // ───────────────────────── paths ─────────────────────────
 
 /// XDG-style on every platform (macOS included): `$XDG_CONFIG_HOME/fleet` or `~/.config/fleet`.
+/// `$XDG_CONFIG_HOME` or `~/.config`.
+pub fn xdg_config_home() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(".config"))
+}
+
 pub fn config_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("FLEET_CONFIG_DIR") {
         return PathBuf::from(p);
@@ -225,13 +309,14 @@ local home = os.getenv("HOME")
 
 return {
   defaults = {
-    mode = "plan",          -- opencode agent to start with: plan | build
+    agent = "opencode",     -- adapter preselected by `fleet agent start`: opencode | claude | codex
+    mode = "plan",          -- plan (read-only) | build
     nvim_pane = true,       -- open an nvim pane next to the agent
     notify = true,          -- macOS banner when an agent starts waiting for you
     refresh_secs = 2,
     review_ttl_secs = 60,
   },
-  agent_args = {},          -- extra args for `opencode`, e.g. { "--model", "anthropic/claude-opus-5" }
+  agent_args = {},          -- (legacy) extra args for opencode; prefer agents.opencode.args
 
   -- fleet:projects (fleet project add appends here)
   projects = {
@@ -243,6 +328,14 @@ return {
         s.push_str(
             r#"  },
   -- fleet:projects:end
+
+  -- Agents: which coding-agent CLIs fleet discovers and can launch. Independent of projects:
+  -- any enabled agent can run in any project.
+  agents = {
+    opencode = { enabled = true, args = {} },          -- args appended to every launch, e.g. { "--model", "anthropic/claude-opus-5" }
+    claude   = { enabled = true, args = {} },
+    codex    = { enabled = true, args = {}, sandbox = "workspace-write" },
+  },
 
   keys = {
     -- action = "key" or "prefix key"; `fleet keys` lists every action
@@ -335,6 +428,17 @@ mod tests {
             data_dir().join("worktrees").join("svc")
         );
         assert_eq!(c.keys["agent.start"], "C-n");
+    }
+
+    #[test]
+    fn agents_table_both_shapes() {
+        let c =
+            Config::from_lua(r#"return { agents = { adapters = { "opencode" } } }"#, "t").unwrap();
+        assert_eq!(c.agents.enabled(), vec!["opencode"]);
+        let c = Config::from_lua(r#"return { agents = { claude = { args = { "--model", "x" } }, codex = { enabled = false } } }"#, "t").unwrap();
+        assert_eq!(c.agents.enabled(), vec!["claude"]);
+        assert_eq!(c.agents.get("claude").args, vec!["--model", "x"]);
+        assert_eq!(Config::default().agents.enabled().len(), 3);
     }
 
     #[test]

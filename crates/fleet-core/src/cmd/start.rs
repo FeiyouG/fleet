@@ -1,7 +1,7 @@
 //! `fleet agent start`: worktree + branch + tmux + agent.
 
 use super::{free_port, Progress};
-use crate::agents::LaunchSpec;
+use crate::agents::{LaunchSpec, Mode};
 use crate::config::{Config, Project};
 use crate::registry::{Registry, Task};
 use crate::slug;
@@ -17,6 +17,8 @@ pub struct StartOpts {
     pub name: Option<String>,
     pub prompt: String,
     pub repo: String,
+    /// Adapter name; `None` = `defaults.agent`.
+    pub agent: Option<String>,
     pub mode: Option<String>,
     pub base: Option<String>,
     pub nvim: Option<bool>,
@@ -25,6 +27,7 @@ pub struct StartOpts {
 
 #[derive(Debug, Clone)]
 pub struct Started {
+    pub agent: String,
     pub slug: String,
     pub branch: String,
     pub path: PathBuf,
@@ -76,9 +79,27 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     if tmux::has_session(&slug).await {
         bail!("tmux session `{slug}` already exists");
     }
-    let adapter = engine
-        .agent_adapter("opencode")
-        .context("opencode adapter not enabled")?;
+    let agent_name = opts
+        .agent
+        .clone()
+        .unwrap_or_else(|| cfg.defaults.agent.clone());
+    let adapter = engine.agent_adapter(&agent_name).with_context(|| {
+        format!(
+            "agent `{agent_name}` is not enabled (enabled: {})",
+            engine
+                .agent_adapters()
+                .iter()
+                .map(|a| a.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let mode_s = opts
+        .mode
+        .clone()
+        .unwrap_or_else(|| cfg.defaults.mode.clone());
+    let mode = Mode::parse(&mode_s)
+        .with_context(|| format!("mode must be plan or build, got `{mode_s}`"))?;
 
     log(&format!("fetch origin {base}"));
     git::fetch(&repo.repo, "origin", &base).await?;
@@ -100,11 +121,8 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         old_paths: vec![],
         tmux_session: slug.clone(),
         port: Some(port),
-        mode: Some(
-            opts.mode
-                .clone()
-                .unwrap_or_else(|| cfg.defaults.mode.clone()),
-        ),
+        agent: agent_name.clone(),
+        mode: Some(mode_s.clone()),
         review_source: None,
         review_id: None,
         head_sha: None,
@@ -113,7 +131,6 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         closed_at: None,
     })?;
 
-    let mode = opts.mode.unwrap_or_else(|| cfg.defaults.mode.clone());
     let full_prompt = format!(
         "{}\n\n{prompt}",
         prompt_header(&slug, &repo.name, &branch, &base)
@@ -123,7 +140,6 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         mode,
         prompt: full_prompt,
         port,
-        extra_args: cfg.agent_args.clone(),
     });
 
     log(&format!("tmux new-session -s {slug}"));
@@ -142,6 +158,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         tmux::attach(&slug).await?;
     }
     Ok(Started {
+        agent: agent_name,
         tmux_session: slug.clone(),
         slug,
         branch,
