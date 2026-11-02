@@ -247,28 +247,131 @@ pub async fn status_lines(wt: &Path) -> Result<Vec<String>> {
     )
 }
 
-/// Commits reachable from `rev` and from no other ref: no remote branch, no tag, no local
-/// branch other than `own_branch`. These are exactly what deleting `own_branch` would lose.
-/// `--oneline`, newest first, at most `limit`.
+/// Branch tips that exist on the remotes *right now* (`git ls-remote --heads` of every
+/// remote), restricted to commits present locally (others cannot be reachability anchors).
+/// Local remote-tracking refs are not trusted: after a forge deletes a merged branch, a
+/// stale `origin/<branch>` would make its commits look safe until the next `fetch --prune`.
+/// `Err` when a remote cannot be reached.
+pub async fn live_remote_tips(repo: &Path) -> Result<Vec<String>> {
+    let remotes = git(repo, &["remote"]).await?;
+    let mut shas = vec![];
+    for r in remotes.lines().filter(|l| !l.is_empty()) {
+        let fut = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["ls-remote", "--heads", r])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+            .kill_on_drop(true)
+            .output();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .with_context(|| format!("git ls-remote {r}: timed out"))?
+            .context("running git")?;
+        if !out.status.success() {
+            bail!(
+                "git ls-remote {r}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        shas.extend(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().next().map(String::from)),
+        );
+    }
+    shas.sort();
+    shas.dedup();
+    existing_commits(repo, &shas).await
+}
+
+/// The subset of `shas` that are commits in the local object store.
+pub async fn existing_commits(repo: &Path, shas: &[String]) -> Result<Vec<String>> {
+    use tokio::io::AsyncWriteExt;
+    if shas.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("running git cat-file")?;
+    let mut stdin = child.stdin.take().context("git stdin")?;
+    let input = shas.join("\n") + "\n";
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(input.as_bytes()).await;
+    });
+    let out = child.wait_with_output().await?;
+    let _ = writer.await;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_suffix(" commit").map(String::from))
+        .collect())
+}
+
+/// Where a commit may already be kept, for [`commits_only_here`].
+#[derive(Debug, Clone)]
+pub enum RemoteAnchors {
+    /// Tips that exist on the remotes now ([`live_remote_tips`]).
+    Live(Vec<String>),
+    /// Remotes unreachable: fall back to local remote-tracking refs (possibly stale).
+    TrackingRefs,
+}
+
+/// Commits reachable from `rev` and from nothing else that survives a close: no remote
+/// branch (per `anchors`), no tag, no local branch other than `own_branch`, nor any of
+/// `also` (e.g. the head of a merged review). These are exactly what deleting `own_branch`
+/// would lose. `--oneline`, newest first, at most `limit`.
 pub async fn commits_only_here(
     repo: &Path,
     rev: &str,
     own_branch: Option<&str>,
+    anchors: &RemoteAnchors,
+    also: &[String],
     limit: usize,
 ) -> Result<Vec<String>> {
     let n = format!("-n{limit}");
+    // `--exclude` patterns for `--branches` are relative to refs/heads (git-rev-list(1)).
     let excl = own_branch.map(|b| format!("--exclude={b}"));
-    let mut args = vec!["rev-list", "--oneline", &n, rev, "--not"];
+    let mut args: Vec<&str> = vec!["rev-list", "--oneline", &n, rev, "--not"];
     if let Some(e) = &excl {
         args.push(e);
     }
-    args.extend(["--branches", "--remotes", "--tags"]);
+    args.extend(["--branches", "--tags"]);
+    match anchors {
+        RemoteAnchors::Live(shas) => args.extend(shas.iter().map(String::as_str)),
+        RemoteAnchors::TrackingRefs => args.push("--remotes"),
+    }
+    args.extend(also.iter().map(String::as_str));
     Ok(git(repo, &args)
         .await?
         .lines()
         .filter(|l| !l.is_empty())
         .map(String::from)
         .collect())
+}
+
+/// Local branches checked out in no worktree, whose name is `name` or ends in `/name`.
+pub async fn loose_branches_named(repo: &Path, name: &str) -> Result<Vec<String>> {
+    let checked_out: Vec<String> = porcelain(repo)
+        .await?
+        .into_iter()
+        .filter_map(|e| e.branch)
+        .collect();
+    let suffix = format!("/{name}");
+    Ok(git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .await?
+    .lines()
+    .filter(|b| *b == name || b.ends_with(&suffix))
+    .filter(|b| !checked_out.iter().any(|c| c == b))
+    .map(String::from)
+    .collect())
 }
 
 pub async fn rev_parse(repo: &Path, rev: &str) -> Option<String> {

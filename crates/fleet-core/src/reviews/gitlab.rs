@@ -239,6 +239,19 @@ impl ReviewAdapter for GitLab {
         Ok(self.enrich(row).await)
     }
 
+    async fn merged_for_branch(&self, branch: &str) -> Result<Option<ReviewRow>> {
+        let v = self
+            .api(&format!(
+                "projects/{}/merge_requests?state=merged&source_branch={}&order_by=updated_at&per_page=1",
+                self.enc(),
+                urlenc(branch)
+            ))
+            .await?;
+        Ok(v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|m| row_from_mr(&self.source, m)))
+    }
+
     fn fetch_refspec(&self, id: u64) -> String {
         format!("merge-requests/{id}/head")
     }
@@ -322,5 +335,29 @@ mod tests {
             g.parse_id("https://gitlab.com/other/repo/-/merge_requests/514"),
             None
         );
+    }
+}
+
+/// Percent-encode a query value (branch names carry `/`, `#`, `+`, …).
+fn urlenc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod urlenc_tests {
+    #[test]
+    fn encodes_branch_names() {
+        assert_eq!(
+            super::urlenc("refactor/internal-api-deno"),
+            "refactor%2Finternal-api-deno"
+        );
+        assert_eq!(super::urlenc("a+b#c"), "a%2Bb%23c");
     }
 }

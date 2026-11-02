@@ -39,8 +39,9 @@ pub enum Step {
     /// A `fleet agent rename` link at an old path. Undo: re-create it.
     RemoveSymlink { path: PathBuf, target: PathBuf },
     /// Kill an agent (its tmux pane, else SIGTERM) and wait for it to exit. No undo; the
-    /// conversation survives (`opencode -s <session_id>`).
+    /// conversation survives (see [`resume_hint`]).
     StopAgent {
+        adapter: String,
         pid: u32,
         pane: Option<String>,
         session_id: Option<String>,
@@ -132,12 +133,13 @@ impl Step {
                 format!("remove symlink {} → {}", tilde(path), tilde(target))
             }
             Step::StopAgent {
+                adapter,
                 pid,
                 pane,
                 hosts_self,
                 ..
             } => format!(
-                "stop agent pid {pid}{}{}",
+                "stop {adapter} pid {pid}{}{}",
                 pane.as_deref()
                     .map(|p| format!(" (pane {p})"))
                     .unwrap_or_default(),
@@ -199,11 +201,14 @@ impl Step {
         match self {
             Step::CloseTask { .. } => "undo: reopen".into(),
             Step::RemoveSymlink { .. } => "undo: re-create".into(),
-            Step::StopAgent { session_id, .. } => format!(
+            Step::StopAgent {
+                adapter,
+                session_id,
+                ..
+            } => format!(
                 "cannot be undone{}",
-                session_id
-                    .as_deref()
-                    .map(|s| format!(" (resume: opencode -s {s})"))
+                resume_hint(adapter, session_id.as_deref())
+                    .map(|h| format!(" (resume: {h})"))
                     .unwrap_or_default()
             ),
             Step::RemoveWorktree {
@@ -234,6 +239,17 @@ impl Step {
             Step::KillPane { .. } | Step::KillSession { .. } => "cannot be undone".into(),
         }
     }
+}
+
+/// The command that reopens a stopped agent's conversation, per adapter.
+pub fn resume_hint(adapter: &str, session_id: Option<&str>) -> Option<String> {
+    let id = session_id?;
+    Some(match adapter {
+        "opencode" => format!("opencode -s {id}"),
+        "claude" => format!("claude --resume {id}"),
+        "codex" => format!("codex resume {id}"),
+        other => format!("{other} (session {id})"),
+    })
 }
 
 fn short(sha: &str) -> &str {
@@ -602,6 +618,7 @@ mod tests {
                 missing: false,
             },
             Step::StopAgent {
+                adapter: "opencode".into(),
                 pid: 7,
                 pane: None,
                 session_id: None,

@@ -19,6 +19,11 @@ pub trait ReviewAdapter: Send + Sync {
     /// One review by id, any state.
     async fn review(&self, id: u64) -> Result<ReviewRow>;
 
+    /// The most recently merged review whose source branch is `branch`, if any. Not enriched
+    /// (no approvals/threads): callers only need its status, id and head sha. The open-review
+    /// list never contains merged ones, so `close` and gc ask for them per branch.
+    async fn merged_for_branch(&self, branch: &str) -> Result<Option<ReviewRow>>;
+
     /// The refspec that fetches the review's head into `FETCH_HEAD`.
     fn fetch_refspec(&self, id: u64) -> String;
 

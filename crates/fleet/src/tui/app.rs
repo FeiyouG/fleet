@@ -572,26 +572,40 @@ impl App {
                 return;
             }
         }
-        let Some(w) = n.worktree().cloned() else {
-            self.set_status("no worktree on this row: nothing to close".into(), true);
-            return;
+        // A worktree row (or anything on one); else a tmux session/pane whose folder is
+        // gone: close resolves its leftovers (branch, session, registry task) by name.
+        let target = match (n.worktree().cloned(), &n.data) {
+            (Some(w), _) => Ok(w),
+            (None, tabs::NodeData::Session { name, panes, .. })
+                if panes.iter().any(|p| !p.pane.cwd.exists()) =>
+            {
+                Err(name.clone())
+            }
+            (None, tabs::NodeData::Pane(p)) if !p.pane.cwd.exists() => Err(p.pane.session.clone()),
+            _ => {
+                self.set_status("no worktree on this row: nothing to close".into(), true);
+                return;
+            }
+        };
+        let label = match &target {
+            Ok(w) => w.name.clone(),
+            Err(s) => s.clone(),
         };
         let (f, cfg, tx) = (self.fleet.clone(), self.cfg.clone(), self.tx.clone());
-        self.set_status(format!("close {}: planning…", w.name), false);
+        self.set_status(format!("close {label}: planning…"), false);
         tokio::spawn(async move {
             let r = async {
-                let project = cfg
-                    .project(&w.repo)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("project {} not in config", w.repo))?;
-                let facts = cmd::close::gather(
-                    &cmd::close::Resolved {
-                        project,
-                        path: w.path.clone(),
-                    },
-                    &f,
-                )
-                .await?;
+                let resolved = match target {
+                    Ok(w) => {
+                        let project = cfg
+                            .project(&w.repo)
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("project {} not in config", w.repo))?;
+                        cmd::close::Resolved::worktree(project, w.path.clone())
+                    }
+                    Err(session) => cmd::close::resolve(&f, &cfg, &session, None).await?,
+                };
+                let facts = cmd::close::gather(&resolved, &f).await?;
                 cmd::close::plan(&facts, &cmd::close::CloseOpts::default())
             }
             .await;

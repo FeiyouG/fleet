@@ -34,10 +34,7 @@ pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
                 let Some(project) = cfg.project(&w.worktree.repo).cloned() else {
                     continue;
                 };
-                let r = Resolved {
-                    project,
-                    path: w.worktree.path.clone(),
-                };
+                let r = Resolved::worktree(project, w.worktree.path.clone());
                 let planned = match close::gather(&r, fleet).await {
                     Ok(f) => close::plan(&f, &opts),
                     Err(e) => Err(e),

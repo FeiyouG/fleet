@@ -730,11 +730,14 @@ async fn close_cmd(a: CloseArgs, cfg: Config, project: Option<String>) -> Result
         println!("closed {}", plan.target.name);
         for s in &rep.done {
             if let cmd::txn::Step::StopAgent {
-                session_id: Some(id),
+                adapter,
+                session_id,
                 ..
             } = s
             {
-                println!("  resume its conversation later: opencode -s {id}");
+                if let Some(h) = cmd::txn::resume_hint(adapter, session_id.as_deref()) {
+                    println!("  resume its conversation later: {h}");
+                }
             }
         }
     }

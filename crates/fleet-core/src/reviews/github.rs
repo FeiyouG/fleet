@@ -247,6 +247,28 @@ impl ReviewAdapter for GitHub {
         Ok(self.enrich(row).await)
     }
 
+    async fn merged_for_branch(&self, branch: &str) -> Result<Option<ReviewRow>> {
+        let v = self
+            .gh(&[
+                "pr",
+                "list",
+                "-R",
+                &self.repo,
+                "--head",
+                branch,
+                "--state",
+                "merged",
+                "--limit",
+                "1",
+                "--json",
+                "number,title,author,headRefName,baseRefName,headRefOid,url,updatedAt,state",
+            ])
+            .await?;
+        Ok(v.as_array()
+            .and_then(|a| a.first())
+            .and_then(|p| row_from_pr(&self.source, p)))
+    }
+
     fn fetch_refspec(&self, id: u64) -> String {
         format!("pull/{id}/head")
     }
