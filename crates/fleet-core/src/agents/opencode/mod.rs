@@ -118,10 +118,13 @@ impl AgentAdapter for OpenCode {
             .await
             .map_err(|e| anyhow::anyhow!("db task: {e}"))??;
 
-        // Sessions per canonical directory, newest first.
+        // Sessions per canonical directory, newest first. A session started in a path that
+        // was later renamed (`fleet agent rename`) is indexed under the new path too.
         let mut by_dir: HashMap<PathBuf, Vec<&db::DbSession>> = HashMap::new();
         for s in &sessions {
-            by_dir.entry(canon(&s.directory)).or_default().push(s);
+            let dir = canon(&s.directory);
+            let dir = ctx.path_aliases.get(&dir).cloned().unwrap_or(dir);
+            by_dir.entry(dir).or_default().push(s);
         }
 
         let ports = plannotator::listening_ports(&pids).await;

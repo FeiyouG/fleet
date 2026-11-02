@@ -90,11 +90,17 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     if let Some(task) = reg.find_review(&source, id)? {
         // Re-review: same worktree, same session, new prompt.
         let old_sha = task.head_sha.clone().unwrap_or_default();
+        // FETCH_HEAD belongs to the main repo, not the worktree: resolve it to a sha first.
+        let sha = git::git(&repo.path, &["rev-parse", "FETCH_HEAD"])
+            .await?
+            .trim()
+            .to_string();
         log(&format!(
-            "reset --hard FETCH_HEAD in {}",
+            "reset --hard {} in {}",
+            &sha[..sha.len().min(8)],
             task.path.display()
         ));
-        git::reset_hard(&task.path, "FETCH_HEAD").await?;
+        git::reset_hard(&task.path, &sha).await?;
         reg.set_head(&task.slug, &review.head_sha)?;
         let text = format!(
             "Re-review {}: new commits since {} (now at {}). Diff only what changed, verify your own threads, then plan.",

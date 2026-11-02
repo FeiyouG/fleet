@@ -24,6 +24,8 @@ pub struct LaunchSpec {
 pub struct DiscoverCtx {
     pub known_ports: HashMap<u32, u16>,
     pub title_hints: HashMap<u32, String>,
+    /// old canonical path -> current canonical path (from `fleet agent rename`).
+    pub path_aliases: HashMap<std::path::PathBuf, std::path::PathBuf>,
 }
 
 /// Where to deliver a message.

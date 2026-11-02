@@ -73,6 +73,9 @@ impl Default for Config {
 /// This matches opencode, plannotator and tmux on this machine; `~/Library/Application Support`
 /// is deliberately not used.
 pub fn config_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("FLEET_CONFIG_DIR") {
+        return PathBuf::from(p);
+    }
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -86,6 +89,9 @@ pub fn config_path() -> PathBuf {
 
 /// `$XDG_DATA_HOME/fleet` or `~/.local/share/fleet`.
 pub fn data_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("FLEET_DATA_DIR") {
+        return PathBuf::from(p);
+    }
     xdg_data_home().join("fleet")
 }
 

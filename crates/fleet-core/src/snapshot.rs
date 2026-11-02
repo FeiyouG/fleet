@@ -5,7 +5,7 @@ use crate::agents::{self, AgentAdapter, DiscoverCtx};
 use crate::config::Config;
 use crate::join::{self, Inputs};
 use crate::model::{Fleet, ReviewRow, WorktreeRow};
-use crate::procs::ProcTable;
+use crate::procs::{canon, canon_keep_leaf, ProcTable};
 use crate::registry::Registry;
 use crate::reviews::{self, ReviewAdapter};
 use crate::tmux;
@@ -13,6 +13,7 @@ use crate::worktrees::git;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -74,14 +75,19 @@ impl Engine {
             .map(|b| b.as_ref())
     }
 
-    /// Registry-known `pid -> port` for fleet-started agents (matched by port being alive).
-    async fn known_ports(&self, procs: &ProcTable) -> HashMap<u32, u16> {
+    /// Registry facts: `pid -> port` for fleet-started agents (matched by the port being
+    /// alive in that process) and `old path -> current path` for renamed tasks.
+    async fn registry_ctx(
+        &self,
+        procs: &ProcTable,
+    ) -> (HashMap<u32, u16>, HashMap<PathBuf, PathBuf>) {
         let mut map = HashMap::new();
+        let mut aliases = HashMap::new();
         let Ok(reg) = Registry::open() else {
-            return map;
+            return (map, aliases);
         };
         let Ok(tasks) = reg.open_tasks() else {
-            return map;
+            return (map, aliases);
         };
         // Map port -> pid via the processes' listening ports.
         let pids: Vec<u32> = self
@@ -89,11 +95,7 @@ impl Engine {
             .iter()
             .flat_map(|a| {
                 procs
-                    .named(if a.name() == "opencode" {
-                        "opencode"
-                    } else {
-                        a.name()
-                    })
+                    .named(a.name())
                     .into_iter()
                     .map(|p| p.pid)
                     .collect::<Vec<_>>()
@@ -106,8 +108,12 @@ impl Engine {
                     map.insert(*pid, port);
                 }
             }
+            let cur = canon(&t.path);
+            for old in &t.old_paths {
+                aliases.insert(canon_keep_leaf(old), cur.clone());
+            }
         }
-        map
+        (map, aliases)
     }
 
     /// One full snapshot. Never fails on a collector problem: it reports it in `warnings`.
@@ -133,11 +139,12 @@ impl Engine {
             let mut all = vec![];
             let mut errs = vec![];
             if let Some(p) = procs.as_ref() {
-                let known_ports = self.known_ports(p).await;
+                let (known_ports, path_aliases) = self.registry_ctx(p).await;
                 let title_hints = title_hints(p, &panes_for_hints).await;
                 let ctx = DiscoverCtx {
                     known_ports,
                     title_hints,
+                    path_aliases,
                 };
                 for a in &self.agent_adapters {
                     match a.discover(p, &ctx).await {
@@ -166,12 +173,19 @@ impl Engine {
             warnings.push(format!("reviews: {e}"));
         }
 
+        let repo_sources = self
+            .config
+            .repos
+            .iter()
+            .filter_map(|r| r.review_source.clone().map(|s| (r.name.clone(), s)))
+            .collect();
         let mut fleet = join::join(Inputs {
             panes,
             agents,
             worktrees,
             reviews,
             procs: procs.as_ref(),
+            repo_sources,
         });
         fleet.reviews_fetched_at = fetched_at;
         fleet.warnings = warnings;

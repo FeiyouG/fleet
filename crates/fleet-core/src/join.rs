@@ -13,6 +13,8 @@ pub struct Inputs<'a> {
     pub worktrees: Vec<WorktreeRow>,
     pub reviews: Vec<ReviewRow>,
     pub procs: Option<&'a ProcTable>,
+    /// repo name -> review source (`gitlab:group/project`), from config.
+    pub repo_sources: HashMap<String, String>,
 }
 
 /// The worktree whose path is the longest prefix of `p`.
@@ -29,6 +31,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
         worktrees,
         reviews,
         procs,
+        repo_sources,
     } = inp;
 
     // pane shell pid -> pane index
@@ -92,12 +95,29 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
                 p.clone()
             })
             .collect();
-        let rvs: Vec<ReviewRow> = w
-            .branch
-            .as_deref()
-            .and_then(|b| review_by_branch.get(b))
-            .map(|v| v.iter().map(|r| (*r).clone()).collect())
-            .unwrap_or_default();
+        // Reviews on this worktree's branch; for a detached `review-N` checkout, the review
+        // whose head it sits at (or whose id its name carries, once the MR moved on).
+        let rvs: Vec<ReviewRow> = match w.branch.as_deref() {
+            Some(b) => review_by_branch
+                .get(b)
+                .map(|v| v.iter().map(|r| (*r).clone()).collect())
+                .unwrap_or_default(),
+            None => {
+                let by_name = w
+                    .name
+                    .strip_prefix("review-")
+                    .and_then(|n| n.parse::<u64>().ok());
+                reviews
+                    .iter()
+                    .filter(|r| {
+                        (w.head.len() >= 7 && r.head_sha.starts_with(&w.head))
+                            || (by_name == Some(r.id)
+                                && repo_sources.get(&w.repo) == Some(&r.source))
+                    })
+                    .cloned()
+                    .collect()
+            }
+        };
         let primary_review = rvs.iter().find(|r| !r.status.is_done()).or(rvs.first());
         let last_activity = ags.iter().filter_map(|a| a.last_activity).max();
         overview.push(OverviewRow {
@@ -174,8 +194,10 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
             let wts: Vec<WorktreeRow> = worktrees
                 .iter()
                 .filter(|w| {
+                    // Same branch, or a detached checkout of the review head (`review-N`).
+                    // A *branch* that merely shares the commit is not that review's worktree.
                     w.branch.as_deref() == Some(r.source_branch.as_str())
-                        || w.head.len() >= 7 && r.head_sha.starts_with(&w.head)
+                        || (w.detached && w.head.len() >= 7 && r.head_sha.starts_with(&w.head))
                 })
                 .cloned()
                 .collect();
@@ -299,6 +321,7 @@ mod tests {
             worktrees: wts,
             reviews,
             procs: None,
+            repo_sources: HashMap::new(),
         });
 
         assert_eq!(f.overview.len(), 4); // 3 worktrees + 1 outside

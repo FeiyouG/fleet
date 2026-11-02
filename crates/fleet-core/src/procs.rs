@@ -92,6 +92,15 @@ pub fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Canonicalise the parent only, keeping the last component as written. Needed for a path
+/// that is itself a symlink (a renamed worktree's old path): `canon` would follow it.
+pub fn canon_keep_leaf(p: &Path) -> PathBuf {
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(leaf)) => canon(parent).join(leaf),
+        _ => canon(p),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

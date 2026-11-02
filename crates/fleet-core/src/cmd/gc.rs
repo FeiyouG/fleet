@@ -3,6 +3,7 @@
 use super::Progress;
 use crate::config::Config;
 use crate::model::{Fleet, GcVerdict};
+use crate::procs::canon;
 use crate::registry::Registry;
 use crate::tmux;
 use crate::worktrees::git;
@@ -43,11 +44,6 @@ pub struct GcPlan {
 
 pub fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
     let mut p = GcPlan::default();
-    let live_sessions: std::collections::HashSet<&str> = fleet
-        .panes
-        .iter()
-        .map(|v| v.pane.session.as_str())
-        .collect();
 
     for w in &fleet.worktrees {
         match &w.gc {
@@ -93,10 +89,12 @@ pub fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
     if let Ok(reg) = Registry::open() {
         if let Ok(tasks) = reg.open_tasks() {
             for t in tasks {
+                // Registry paths are as written (`/tmp/...`); worktree rows are canonical.
+                let t_path = canon(&t.path);
                 let alive = fleet
                     .worktrees
                     .iter()
-                    .any(|w| w.worktree.path == t.path && !w.agents.is_empty());
+                    .any(|w| canon(&w.worktree.path) == t_path && !w.agents.is_empty());
                 for old in &t.old_paths {
                     if old.is_symlink() && !alive {
                         p.actions.push(GcAction::RemoveSymlink {
@@ -105,21 +103,24 @@ pub fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
                         });
                     }
                 }
+                // A task is closed only when its worktree is gone or being removed now. A
+                // stopped agent or a killed tmux session alone keeps the task open.
                 let wt_exists = fleet
                     .worktrees
                     .iter()
-                    .any(|w| w.worktree.path == t.path && !w.worktree.missing);
-                let removing = p
-                    .actions
-                    .iter()
-                    .any(|a| matches!(a, GcAction::RemoveWorktree { path, .. } if *path == t.path));
+                    .any(|w| canon(&w.worktree.path) == t_path && !w.worktree.missing);
+                let removing = p.actions.iter().any(
+                    |a| matches!(a, GcAction::RemoveWorktree { path, .. } if canon(path) == t_path),
+                );
                 if !wt_exists || removing {
-                    if !live_sessions.contains(t.tmux_session.as_str()) || removing {
-                        p.actions.push(GcAction::CloseTask {
-                            slug: t.slug.clone(),
-                            reason: "worktree gone".into(),
-                        });
-                    }
+                    p.actions.push(GcAction::CloseTask {
+                        slug: t.slug.clone(),
+                        reason: if removing {
+                            "worktree removed".into()
+                        } else {
+                            "worktree gone".into()
+                        },
+                    });
                 }
             }
         }
