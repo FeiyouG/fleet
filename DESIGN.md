@@ -420,3 +420,253 @@ fleet/
 5. **M4 start / rename / review / send** — registry, `--port`, `/tui/submit-prompt`, re-review. Acceptance: one command → attached session, agent renames itself, `WAIT:perm` visible when it asks.
 6. **M5 gc** — dry run + apply. Acceptance: the 4 stale `$TMPDIR` worktrees go, nothing dirty touched.
 7. **Later** — `fleet serve` (axum, same types), GitHub reviews adapter, other agent adapters, Linear, auto-review on READY.
+
+
+---
+
+# fleet v0.2 — real permission state, tree navigation, project scope
+
+**Settled, not repeated:** tabs are **Agents (default) · Tmux · Worktrees · Reviews**; Overview is removed · a **Project** is the unit of configuration and of scope · second project = **monid-cli** (`~/Projects/monid/monid-cli`, remote `github.com:monid-ai/cli`) → a GitHub reviews adapter is in scope · config lives in `~/.config/fleet/` (XDG), format decided in Q3.
+
+## Background (terms used below)
+
+- **Project** — one repo you work in: its main clone, the folder where its worktrees live, its remote / review source, its base branch. `monid-services` (GitLab) and `monid-cli` (GitHub) are the two.
+- **Row / node** — one line in a tab. A **parent** node (project section, worktree, tmux session, review) can **fold** / **unfold** its **children** (worktrees, agents, panes).
+- **Permission prompt** — opencode asking "allow this bash command?". Not in opencode's database; it exists only as an in-process event (`permission.asked` → `permission.replied`).
+- **opencode plugin** — a `.ts` file in `~/.config/opencode/plugins/` that opencode loads into every session at start; it receives every event plus `serverUrl` (that session's HTTP API, even without `--port`).
+- **Embedded interpreter** — a language runtime compiled *into* a program so the program can run scripts without anything installed on the machine (nvim does this with LuaJIT).
+
+---
+
+# SECTION 1 — Answers, clarifications, decisions
+
+## Q1. Tabs and the join
+
+**Decided: Agents · Tmux · Worktrees · Reviews.** Agents is the default and is flat (one row per running agent process). Worktrees is one row per worktree with its agents as children. The old Overview (one row per worktree + OVERALL column) is gone; its OVERALL verdict moves to the Worktrees rows.
+
+How rows join each other (real rows from your machine):
+
+| step | rule | example |
+|---|---|---|
+| process → pane | walk the process tree up to a tmux pane's shell pid | opencode pid 68161 → pane `monid-services:3.0` |
+| process → worktree | longest worktree path that is a prefix of the process cwd | cwd `…/worktrees/monid-cli-topup` → that worktree (of project monid-cli, once configured) |
+| process → session | newest opencode session in that directory; if several, the one whose title matches the pane title (replaced by an exact id in Change 1) | 4 agents in the main clone each get their own session |
+| worktree → review | review whose `source_branch` == the worktree's branch; a detached `review-N` checkout joins review N | `feat/monid-signup-credit-codes` → !534 |
+| review → worktrees/agents | the reverse, 0..n of each | !534 → 1 worktree, 1 agent; !506 → 0 (nobody has it locally) |
+
+**The Reviews tab shows every open MR/PR of the project's source**, not only the ones you have locally (29 today, 8 with a local worktree). A `local` preset (`v f`) is added in Change 3.
+
+## Q2. Where should permission state come from? 🔴
+
+Why it is wrong today: `GET /session/status` (what fleet polls on fleet-started agents) returns only `idle | busy | retry` — verified in the SDK types. A permission prompt leaves the tool part as `running` in the DB, identical to a running `bash`, so fleet shows `WORKING`.
+
+### Options compared
+
+| | A. Subscribe to SSE `/event` of fleet-started agents | B. A 40-line opencode plugin writes a state file per process |
+|---|---|---|
+| What you get | fleet keeps one SSE connection per agent it started; tracks asked → replied in memory | `~/.config/opencode/plugins/fleet.ts` writes `~/.local/share/fleet/agents/<pid>.json` on each relevant event: `{pid, server_url, directory, sessions: {id: {status, pending[]}}}` |
+| Covers | only agents started by `fleet agent start/review` | **every** opencode process started after install (legacy sessions once restarted) |
+| Pros | pure Rust | one source of truth for all agents; exact pid → session (drops the pane-title heuristic); `server_url` for every agent so `send` works over HTTP everywhere; one-shot `fleet status` sees it; survives fleet restarts |
+| Cons | misses prompts asked before fleet connected (no "list pending" endpoint); one-shot CLI blind; legacy agents blind | one TS file installed by `fleet setup`; running agents pick it up only on restart; stale files for dead pids (ignored + deleted) |
+| Effort | ~150 lines Rust | ~40 lines TS + ~80 lines Rust |
+
+**Recommended: B.**
+
+:::question
+Q2 — permission state source
+- [ ] B. opencode plugin writing a state file (Recommended)
+- [ ] A. SSE for fleet-started agents only
+:::
+
+## Q3. Config format — and yes, Lua means a Lua interpreter inside fleet 🟠
+
+**How Lua parsing would work.** There is no way to "parse" Lua without running it: `init.lua` is a program that *returns* a table. So fleet would embed the reference Lua interpreter (the official ~30k-line C implementation, Lua 5.4) through the `mlua` crate with `features = ["lua54", "vendored", "serialize"]`. `vendored` compiles Lua's C source during `cargo build` (needs the C compiler you already have from Xcode CLT) and links it into the `fleet` binary: nothing to install, nothing read from the system, ~+1 MB on disk. At startup: create a `Lua` state with a **restricted standard library** (string/table/math only, plus a hand-exposed `os.getenv`; no `io`, no `os.execute`, no `require` of arbitrary files) → load `init.lua` → run it (~1 ms) → take the returned table → `lua.from_value::<Config>(table)` converts it through serde into the *same* `Config` struct the TOML path uses today, so a wrong key or type is reported by field name. A syntax error prints `init.lua:12: '}' expected`. This is exactly what nvim does (with LuaJIT instead of 5.4).
+
+How the neighbours store config: nvim `~/.config/nvim/init.lua` (Lua), tmux `~/.config/tmux/tmux.conf` (own syntax), opencode `~/.config/opencode/opencode.json` (JSON + `$schema`).
+
+### Options compared
+
+| | A. Lua `~/.config/fleet/init.lua` | B. YAML `~/.config/fleet/config.yaml` | C. keep TOML |
+|---|---|---|---|
+| Needs a runtime? | **yes**, embedded as described above | no (declarative parser) | no |
+| Looks like | `return { projects = { { name = "monid-services", repo = home.."/Projects/monid/monid-services", worktrees = home.."/Projects/monid/worktrees", reviews = "gitlab:monid-ai/monid-services" }, { name = "monid-cli", repo = home.."/Projects/monid/monid-cli", reviews = "github:monid-ai/cli" } } }` | the same tree, indented | today's file |
+| Pros | same language and layout as your nvim config; comments, `os.getenv`, loops ("one project per folder under ~/Projects/monid"), helper locals | human-friendly lists; no code to run | already works; `toml` crate is first-class |
+| Cons | an interpreter inside a status tool; a typo is a runtime error (with file:line); +1 MB; config can do surprising things (mitigated by the sandbox) | the Rust `serde_yaml` crate is **archived** (dtolnay, 2024); successors `serde-saphyr` (saphyr project) and `serde_yml` are young — maintenance risk on the one file fleet cannot start without; indentation mistakes are silent | neither of the two you asked for |
+| Effort | 1 day | 0.5 day | 0 |
+
+**Recommended: A (Lua)** — you already live in that config language, and the sandbox keeps the runtime small and safe. If embedding an interpreter feels wrong for this tool, B is the fallback and I would pick `serde-saphyr`.
+
+:::question
+Q3 — config format
+- [ ] A. Lua `init.lua` (embedded Lua 5.4 via mlua) (Recommended)
+- [ ] B. YAML (serde-saphyr)
+- [ ] C. keep TOML
+:::
+
+## Q4. Navigation model (answers #2–#5 of your list)
+
+Root cause: `expanded` is one boolean per tab (`crates/fleet/src/tui/tabs/mod.rs:48`); child rows are drawn (`overview.rs:185`) but not selectable, so `j/k` skip them and `l` unfolds every parent (`tmux.rs:77`).
+
+Fix: one **tree model shared by Tmux, Worktrees and Reviews** (Agents is flat). `j/k` walk every visible node; `l` unfolds the selected parent (or steps into its first child), `h` folds (or steps to the parent); `Enter` acts on the selected node; the detail panel describes the selected node. Fold state is keyed by row (worktree path / session / review id), so it survives refreshes.
+
+`Enter` per node kind (one rule, shown in the footer):
+
+| node | `Enter` |
+|---|---|
+| project section | unfold / fold |
+| agent | attach to that agent's pane |
+| worktree | attach to its first agent's pane; no agent → open a shell there |
+| tmux session / pane | attach |
+| review | has local children → unfold; none → start a review agent (confirm) |
+
+---
+
+# SECTION 2 — Changes
+
+(Follows: plugin (B), Lua config (A), four tabs.)
+
+## Change 1 🔴 Permission state (and exact session identity) via an opencode plugin
+
+**Problem.** An agent waiting on a permission prompt shows `● WORKING` (`agents/opencode/http.rs:36-44` looks for a `permission` status the API never sends).
+
+**Plugin** `~/.config/opencode/plugins/fleet.ts`, embedded in the binary and installed by `fleet setup` (`--remove` deletes it):
+
+```ts
+import type { Plugin } from "@opencode-ai/plugin"
+export const FleetPlugin: Plugin = async ({ serverUrl, directory }) => {
+  const dir = process.env.FLEET_DATA_DIR ?? `${process.env.XDG_DATA_HOME ?? `${process.env.HOME}/.local/share`}/fleet`
+  const file = `${dir}/agents/${process.pid}.json`
+  const state = { pid: process.pid, server_url: serverUrl.toString(), directory, sessions: {} as Record<string, any>, updated_at: 0 }
+  const write = () => { state.updated_at = Date.now(); Bun.write(file, JSON.stringify(state)) }
+  const s = (id: string) => (state.sessions[id] ??= { status: "idle", pending: [] })
+  write()
+  return {
+    event: async ({ event }) => {
+      const p: any = event.properties
+      switch (event.type) {
+        case "permission.asked":   s(p.sessionID).pending.push({ id: p.id, title: p.title, type: p.type }); break
+        case "permission.replied": s(p.sessionID).pending = s(p.sessionID).pending.filter((x: any) => x.id !== p.permissionID); break
+        case "session.status":     s(p.sessionID).status = p.status.type; break
+        case "session.idle":       s(p.sessionID).status = "idle"; break
+        default: return
+      }
+      write()
+    },
+  }
+}
+```
+
+**Rust** (`agents/opencode/state_file.rs`, new): read `agents/*.json`; delete files whose pid is dead. In `discover`, a pid with a state file gets: exact session id (no title hint), `WAIT:perm` when `pending` is non-empty, `server_url` for `send`/`live()`. Agents without a file keep today's behaviour.
+
+**Activity rule** (first match): Plannotator up → `WAIT:plan` · `pending` non-empty → `WAIT:perm` · running tool `question` → `WAIT:question` · running tool `submit_plan` → `WAIT:plan` · last message not completed → `WORKING` · else `IDLE`.
+
+**Worked example.** Agent in `monid-services-admin-users` runs `bash`, opencode asks to allow it: today `build ● WORKING`; after `build 🔒 WAIT:perm`, detail `permission: bash · "rm -rf dist"`, macOS banner.
+
+```mermaid
+sequenceDiagram
+    participant OC as opencode process
+    participant P as fleet plugin
+    participant F as agents pid json
+    participant Fleet as fleet discover
+    OC->>P: plugin init with serverUrl and directory
+    P->>F: write pid, server_url, directory
+    OC->>P: event permission.asked
+    P->>F: write pending list
+    Fleet->>F: read all files, drop dead pids
+    Fleet->>Fleet: activity WAIT:perm, session id exact
+    OC->>P: event permission.replied
+    P->>F: write pending empty
+```
+
+**Tests.** `state_file::parse` + merge on fixtures; `activity_rules` gains a `pending` case; `fleet setup --check` verified live.
+
+## Change 2 🔴 Four tabs, one tree model
+
+**Code at fault:** `tabs/mod.rs:48` (`expanded: bool`), `app.rs:264-265` (flip the whole tab), `overview.rs:185-199` (children drawn, not selectable), `tmux.rs:77`.
+
+**After:** `tabs/overview.rs` → becomes `tabs/agents.rs` (flat); `tabs/tree.rs` (new):
+
+```rust
+pub enum NodeKind { Project, Worktree, Agent, Session, Pane, Review }
+pub struct Node { pub key: RowKey, pub parent: Option<RowKey>, pub depth: u8, pub kind: NodeKind, pub has_children: bool }
+pub struct TabState { pub selected: usize, pub filter: String, pub unfolded: HashSet<RowKey>, pub preset: usize }
+pub fn flatten(tree: Vec<TreeNode>, unfolded: &HashSet<RowKey>) -> Vec<Node>   // TreeNode = (Node, Vec<TreeNode>)
+```
+
+- Tabs `1 Agents` (default) · `2 Tmux` · `3 Worktrees` · `4 Reviews`; `g a / g t / g w / g v` jump to the same row in another tab.
+- **Agents** (flat): `ACTIVITY · MODE · TITLE · WORKTREE (branch+sync) · TMUX · REVIEW · AGE`, a `PROJECT` column when scope = all; sorted waiting → working → idle, then last activity. `Enter` attaches, `o` opens the plan URL.
+- **Tmux**: session (folded by default; row shows `5 panes · 3 agents · ⏳ WAIT:plan` = most urgent) → panes.
+- **Worktrees**: [project section when scope = all] → worktree (`OVERALL · NAME · BRANCH+SYNC · AGENTS · TMUX · REVIEW`, GC verdict and dirty files in the detail) → agents (children only when 2+ agents; one agent stays inline) → last section `outside projects`.
+- **Reviews**: [project section when scope = all] → review → local worktrees → agents.
+- `j/k/g g/G/C-u/C-d` move over flattened nodes. `l`/`Right`: folded parent → unfold; unfolded → first child. `h`/`Left`: child → parent; unfolded parent → fold. `z o` / `z c` unfold / fold all (which-key menu).
+- Detail panel = the selected node; `Enter` per Q4; `o`/`c` on an agent use that agent's plan URL.
+
+**Worked example (Tmux).** Today `l` unfolds all 24 sessions (≈75 rows). After: `j` to `monid-services`, `l` → its 5 panes appear under it only, `j j Enter` attaches to window 3's opencode pane.
+
+## Change 3 🟠 Reviews: `local` preset, clearer footer
+
+- `PRESETS`: `all → local → mine → others → needs-me → failed` (`local` = ≥1 local worktree).
+- Footer on Reviews: `Enter unfold (local) / start review (none) · l unfold · a a attach agent · v f filter`.
+- `v S` source picker and the `review.source` key are removed (the project is the source).
+
+## Change 4 🟠 Projects + Lua config
+
+**Config** `~/.config/fleet/init.lua` (nvim convention: the file *returns* the table), loaded as described in Q3; TOML support deleted. `fleet config --init` writes your two projects:
+
+```lua
+-- ~/.config/fleet/init.lua
+local home = os.getenv("HOME")
+return {
+  defaults = { mode = "plan", nvim_pane = true, notify = true, refresh_secs = 2, review_ttl_secs = 60 },
+  agent_args = {},                    -- extra args for opencode, e.g. { "--model", "anthropic/claude-opus-5" }
+  projects = {
+    {
+      name = "monid-services",
+      repo = home .. "/Projects/monid/monid-services",
+      worktrees = home .. "/Projects/monid/worktrees",   -- where `fleet agent start` creates worktrees for THIS project
+      reviews = "gitlab:monid-ai/monid-services",
+      base = "main",
+    },
+    {
+      name = "monid-cli",
+      repo = home .. "/Projects/monid/monid-cli",
+      worktrees = home .. "/Projects/monid/worktrees",   -- your existing monid-cli-* worktrees already live here
+      reviews = "github:monid-ai/cli",
+      base = "main",
+    },
+  },
+  keys = {
+    -- ["agent.start"] = "C-n",
+  },
+}
+```
+
+- Discovery lists **all** worktrees git knows for the project repo, wherever they are; `worktrees` only decides where new ones go. The global `worktrees_dir` is gone.
+- `fleet project add <path> [--name N] [--reviews S] [--worktrees DIR] [--base B]` appends a project block (source derived from `git remote get-url origin`: gitlab.com → `gitlab:`, github.com → `github:`) inside a `-- fleet:projects` marked region of `init.lua`; `fleet project list` prints projects with worktree/agent counts.
+- **Scope:** `TabStates.project: Option<String>` (`None` = all). `p` next, `P` previous, cycling `monid-services → monid-cli → all`. Header: `project: monid-cli ▸` / `project: all`. In `all`, Worktrees and Reviews rows sit under per-project sections; Agents gets a PROJECT column; Tmux shows every session. `fleet --project X`, `:project X`.
+- Startup scope: project whose repo contains the cwd, else the first project.
+- `review start ID` without a URL resolves against the scoped project.
+
+**Worked example.** `fleet` from `~/Projects/monid/monid-cli` opens on `project: monid-cli`: its 4 worktrees, the 2 agents that today sit in "outside repos", `github:monid-ai/cli` PRs. `p` → `monid-services`. `p` → `all`: two foldable sections.
+
+## Change 5 🟠 GitHub reviews adapter
+
+`reviews/github.rs` implementing the existing `ReviewAdapter` trait via the already-installed, authenticated `gh`:
+- list: `gh pr list -R o/r --state open --limit 100 --json number,title,author,headRefName,baseRefName,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,url,updatedAt`;
+- threads: one GraphQL query per PR (`reviewThreads(first:100){ nodes { isResolved } }`) → `Threads{total,resolved,unresolved}`; approvals from `reviews` where `state == APPROVED`;
+- status mapping: `isDraft` → draft; `mergeable == CONFLICTING` → conflicts; any `statusCheckRollup` conclusion `FAILURE` → ci failed; `reviewDecision == APPROVED` → approved; else open; CI glyph from the rollup;
+- `fetch_refspec(n)` = `pull/<n>/head`; `display_id` = `#<n>`; `parse_id` accepts `123`, `#123`, and `https://github.com/o/r/pull/123`.
+- `adapter_for("github:o/r")` wired; fixtures captured from one real PR of `monid-ai/cli`.
+
+## Change 6 🟡 `fleet setup`
+
+`fleet setup` installs the plugin and prints the tmux status-bar snippet; `--remove` uninstalls; `--check` reports plugin installed?, agents with/without a state file ("restart these N sessions for permission state"), `glab`/`gh` auth status per configured source.
+
+## Execution steps
+
+1. **Change 4** (config shape underpins the rest): `mlua` config, projects, `fleet project add/list`, scope field, `p`/`P`, `--project`. Verify: `fleet config --init`, both projects present, cycle scope; the two monid-cli agents leave "outside".
+2. **Change 5** — GitHub adapter + fixtures. Verify: `fleet review list` under `project: monid-cli` shows real PRs with threads/approvals.
+3. **Change 2** — `tree.rs`, Agents tab, migrate Tmux/Worktrees/Reviews, sections under `all`, `z` menu, detail-per-node, `Enter` table. Verify in a tmux smoke session.
+4. **Change 1** — plugin embedded, `state_file.rs`, discovery merge, activity rule. Verify live: trigger a permission prompt, see `WAIT:perm`, reply, see it clear.
+5. **Change 3** — `local` preset, footer, remove `v S`.
+6. **Change 6** — `fleet setup`; README + DESIGN updated; one commit per change.
