@@ -1,70 +1,61 @@
-//! `fleet worktree gc`: dry run first, then apply.
+//! `fleet worktree gc`: dry run first, then apply. Each candidate worktree is closed through
+//! the same planner and transaction engine as `fleet worktree close` (non-forced, branch
+//! deleted only if merged); orphans (dead tmux sessions, tasks whose worktree is gone, stale
+//! rename links) get one small transaction each. Transactions are independent: one failing
+//! candidate is rolled back on its own and does not stop the others.
 
+use super::close::{self, CloseOpts, Resolved};
+use super::txn::{self, Step, Txn, TxnReport};
 use super::Progress;
 use crate::config::Config;
 use crate::model::{Fleet, GcVerdict};
 use crate::procs::canon;
 use crate::registry::Registry;
-use crate::tmux;
-use crate::worktrees::git;
-use anyhow::Result;
 use serde::Serialize;
-use std::path::PathBuf;
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum GcAction {
-    RemoveWorktree {
-        repo: String,
-        path: PathBuf,
-        branch: Option<String>,
-        reason: String,
-        missing: bool,
-    },
-    KillTmux {
-        session: String,
-        reason: String,
-    },
-    RemoveSymlink {
-        path: PathBuf,
-        reason: String,
-    },
-    CloseTask {
-        slug: String,
-        reason: String,
-    },
-}
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GcPlan {
-    pub actions: Vec<GcAction>,
-    /// Worktrees that would qualify but are protected (dirty / unpushed / agent alive).
+    pub txns: Vec<Txn>,
+    /// Worktrees that would qualify but are protected (dirty / commits only here / agent alive).
     pub blocked: Vec<(String, String)>,
 }
 
-pub fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
+pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
     let mut p = GcPlan::default();
+    let opts = CloseOpts {
+        force: false,
+        gc: true,
+    };
 
     for w in &fleet.worktrees {
         match &w.gc {
             GcVerdict::Yes(reason) => {
-                p.actions.push(GcAction::RemoveWorktree {
-                    repo: w.worktree.repo.clone(),
+                let Some(project) = cfg.project(&w.worktree.repo).cloned() else {
+                    continue;
+                };
+                let r = Resolved {
+                    project,
                     path: w.worktree.path.clone(),
-                    branch: w.worktree.branch.clone(),
-                    reason: reason.clone(),
-                    missing: w.worktree.missing,
-                });
-                for s in w
-                    .panes
-                    .iter()
-                    .map(|x| x.session.clone())
-                    .collect::<std::collections::BTreeSet<_>>()
-                {
-                    p.actions.push(GcAction::KillTmux {
-                        session: s,
-                        reason: "worktree removed".into(),
-                    });
+                };
+                let planned = match close::gather(&r, fleet).await {
+                    Ok(f) => close::plan(&f, &opts),
+                    Err(e) => Err(e),
+                };
+                match planned {
+                    Err(e) => p.blocked.push((w.worktree.name.clone(), format!("{e:#}"))),
+                    Ok(cp) if cp.blocked() => p.blocked.push((
+                        w.worktree.name.clone(),
+                        cp.blockers
+                            .iter()
+                            .map(|b| b.lines(0)[0].trim_end_matches(':').to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    )),
+                    Ok(mut cp) => {
+                        cp.txn.label = format!("{} ({reason})", cp.txn.label);
+                        p.txns.push(cp.txn);
+                    }
                 }
             }
             GcVerdict::No(reason) if matches!(reason.as_str(), "dirty" | "unpushed") => {
@@ -74,117 +65,99 @@ pub fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
         }
     }
 
+    let covered =
+        |p: &GcPlan, f: &dyn Fn(&Step) -> bool| p.txns.iter().any(|t| t.steps.iter().any(f));
+
     // tmux sessions whose cwd is gone.
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
     for v in &fleet.panes {
-        if !v.pane.cwd.exists() && seen.insert(v.pane.session.clone()) {
-            p.actions.push(GcAction::KillTmux {
-                session: v.pane.session.clone(),
-                reason: "cwd gone".into(),
-            });
+        let s = &v.pane.session;
+        if !v.pane.cwd.exists()
+            && seen.insert(s.clone())
+            && !covered(
+                &p,
+                &|x| matches!(x, Step::KillSession { session, .. } if session == s),
+            )
+        {
+            p.txns.push(Txn::new(
+                format!("kill tmux session {s} (cwd gone)"),
+                vec![Step::KillSession {
+                    session: s.clone(),
+                    hosts_self: false,
+                }],
+            ));
         }
     }
 
-    // Registry: rename symlinks whose target has no agent; tasks whose worktree is gone.
-    if let Ok(reg) = Registry::open() {
-        if let Ok(tasks) = reg.open_tasks() {
-            for t in tasks {
-                // Registry paths are as written (`/tmp/...`); worktree rows are canonical.
-                let t_path = canon(&t.path);
-                let alive = fleet
-                    .worktrees
-                    .iter()
-                    .any(|w| canon(&w.worktree.path) == t_path && !w.agents.is_empty());
-                for old in &t.old_paths {
-                    if old.is_symlink() && !alive {
-                        p.actions.push(GcAction::RemoveSymlink {
-                            path: old.clone(),
-                            reason: "rename link, agent gone".into(),
-                        });
-                    }
-                }
-                // A task is closed only when its worktree is gone or being removed now. A
-                // stopped agent or a killed tmux session alone keeps the task open.
-                let wt_exists = fleet
-                    .worktrees
-                    .iter()
-                    .any(|w| canon(&w.worktree.path) == t_path && !w.worktree.missing);
-                let removing = p.actions.iter().any(
-                    |a| matches!(a, GcAction::RemoveWorktree { path, .. } if canon(path) == t_path),
-                );
-                if !wt_exists || removing {
-                    p.actions.push(GcAction::CloseTask {
-                        slug: t.slug.clone(),
-                        reason: if removing {
-                            "worktree removed".into()
-                        } else {
-                            "worktree gone".into()
-                        },
-                    });
-                }
+    // Registry: tasks whose worktree is gone; rename links whose agent is gone.
+    if let Ok(tasks) = Registry::open().and_then(|r| r.open_tasks()) {
+        for t in tasks {
+            if covered(
+                &p,
+                &|x| matches!(x, Step::CloseTask { slug } if *slug == t.slug),
+            ) {
+                continue;
+            }
+            // Registry paths are as written (`/tmp/...`); worktree rows are canonical.
+            let t_path = canon(&t.path);
+            let wt = fleet
+                .worktrees
+                .iter()
+                .find(|w| canon(&w.worktree.path) == t_path);
+            let alive = wt.map(|w| !w.agents.is_empty()).unwrap_or(false);
+            let links: Vec<Step> = t
+                .old_paths
+                .iter()
+                .filter(|o| o.is_symlink())
+                .filter_map(|o| {
+                    std::fs::read_link(o)
+                        .ok()
+                        .map(|target| Step::RemoveSymlink {
+                            path: o.clone(),
+                            target,
+                        })
+                })
+                .collect();
+            // A task is closed only when its worktree is gone. A stopped agent or a killed
+            // tmux session alone keeps the task open.
+            let wt_gone = wt.map(|w| w.worktree.missing).unwrap_or(true);
+            if wt_gone {
+                let mut steps = vec![Step::CloseTask {
+                    slug: t.slug.clone(),
+                }];
+                steps.extend(links);
+                p.txns.push(Txn::new(
+                    format!("close registry task {} (worktree gone)", t.slug),
+                    steps,
+                ));
+            } else if !alive && !links.is_empty() {
+                p.txns.push(Txn::new(
+                    format!("remove rename links of {} (agent gone)", t.slug),
+                    links,
+                ));
             }
         }
     }
-    let _ = cfg;
     p
 }
 
-pub async fn apply(plan: &GcPlan, cfg: &Config, log: &Progress) -> Vec<(GcAction, Result<()>)> {
+pub async fn apply(plan: &GcPlan, log: &Progress) -> Vec<TxnReport> {
     let mut out = vec![];
-    for a in &plan.actions {
-        let r = match a {
-            GcAction::RemoveWorktree {
-                repo,
-                path,
-                branch,
-                missing,
-                ..
-            } => {
-                let repo_path = cfg.project(repo).map(|r| r.repo.clone());
-                match repo_path {
-                    None => Err(anyhow::anyhow!("repo {repo} not in config")),
-                    Some(rp) => {
-                        let r = if *missing {
-                            git::worktree_prune(&rp).await
-                        } else {
-                            git::worktree_remove(&rp, path, false).await
-                        };
-                        if r.is_ok() {
-                            if let Some(b) = branch {
-                                // Safe delete only; a non-merged branch stays.
-                                let _ = git::branch_delete(&rp, b).await;
-                            }
-                        }
-                        r
-                    }
-                }
-            }
-            GcAction::KillTmux { session, .. } => tmux::kill_session(session).await,
-            GcAction::RemoveSymlink { path, .. } => std::fs::remove_file(path).map_err(Into::into),
-            GcAction::CloseTask { slug, .. } => Registry::open().and_then(|r| r.close(slug)),
-        };
-        log(&format!(
-            "{}: {}",
-            describe(a),
-            match &r {
-                Ok(()) => "ok".into(),
-                Err(e) => format!("FAILED: {e}"),
-            }
-        ));
-        out.push((a.clone(), r));
+    for t in &plan.txns {
+        out.push(txn::apply(t, &txn::Real, log).await);
     }
     out
 }
 
-pub fn describe(a: &GcAction) -> String {
-    match a {
-        GcAction::RemoveWorktree { path, reason, .. } => {
-            format!("remove worktree {} ({reason})", path.display())
-        }
-        GcAction::KillTmux { session, reason } => format!("kill tmux session {session} ({reason})"),
-        GcAction::RemoveSymlink { path, reason } => {
-            format!("remove symlink {} ({reason})", path.display())
-        }
-        GcAction::CloseTask { slug, reason } => format!("close registry task {slug} ({reason})"),
-    }
+/// One line per transaction: its label and its steps.
+pub fn describe(t: &Txn) -> String {
+    format!(
+        "{}: {}",
+        t.label,
+        t.steps
+            .iter()
+            .map(Step::describe)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }

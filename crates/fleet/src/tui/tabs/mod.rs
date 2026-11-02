@@ -785,8 +785,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Tab::Worktrees => &[
                 ("Enter", "attach / shell"),
                 ("l/h", "unfold/fold"),
+                ("w x", "close task"),
                 ("w g", "gc"),
-                ("w c", "columns"),
             ],
             Tab::Reviews => &[
                 ("Enter", "unfold (local) / review (none)"),

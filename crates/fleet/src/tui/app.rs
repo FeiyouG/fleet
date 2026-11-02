@@ -46,6 +46,10 @@ pub enum Msg {
     Status(String, bool),
     /// Suspend the TUI, run the closure (blocking, owns the terminal), then resume.
     Suspend(Box<dyn FnOnce() -> Result<()> + Send>),
+    /// A close plan computed in the background (git reads): open its confirm popup.
+    ClosePlan(Box<cmd::close::ClosePlan>),
+    /// A gc plan computed in the background: open the gc popup.
+    GcPlan(cmd::gc::GcPlan),
 }
 
 pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
@@ -119,6 +123,8 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
                 match msg {
                     Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.fleet = f; app.loading = false; }
                     Some(Msg::Status(s, err)) => app.set_status(s, err),
+                    Some(Msg::ClosePlan(p)) => { app.status_line = None; app.popup = Some(Popup::close(p)); }
+                    Some(Msg::GcPlan(p)) => { app.status_line = None; app.popup = Some(Popup::gc(p)); }
                     Some(Msg::Suspend(work)) => {
                         leave(&mut term)?;
                         let r = work();
@@ -373,21 +379,13 @@ impl App {
                     });
                 }
             }
-            WorktreeRemove => {
-                if let Some(w) = self.selected_worktree() {
-                    let (repo, path) = (w.repo.clone(), w.path.clone());
-                    self.popup = Some(Popup::confirm(
-                        format!(
-                            "Remove worktree {}? (git worktree remove; refuses if dirty)",
-                            path.display()
-                        ),
-                        popups::PopupCmd::RemoveWorktree { repo, path },
-                    ));
-                }
-            }
+            WorktreeClose => self.plan_close(),
             WorktreeGc => {
-                let plan = cmd::gc::plan(&self.fleet, &self.cfg);
-                self.popup = Some(Popup::gc(plan));
+                let (f, cfg, tx) = (self.fleet.clone(), self.cfg.clone(), self.tx.clone());
+                self.set_status("gc: planning…".into(), false);
+                tokio::spawn(async move {
+                    let _ = tx.send(Msg::GcPlan(cmd::gc::plan(&f, &cfg).await));
+                });
             }
             WorktreeColumns => {
                 self.tabs.show_paths = !self.tabs.show_paths;
@@ -517,27 +515,91 @@ impl App {
                 tmux::rename_session(&old, &new).await?;
                 Ok(format!("renamed {old} -> {new}"))
             }),
-            RemoveWorktree { repo, path } => {
-                let rp = self.cfg.project(&repo).map(|r| r.repo.clone());
-                self.spawn("remove", async move {
-                    let rp = rp.ok_or_else(|| anyhow::anyhow!("repo {repo} not in config"))?;
-                    fleet_core::worktrees::git::worktree_remove(&rp, &path, false).await?;
-                    Ok(format!("removed {}", path.display()))
+            Close(plan) => {
+                let engine = self.engine.clone();
+                self.spawn("close", async move {
+                    let fresh = engine.snapshot(false).await;
+                    let opts = cmd::close::CloseOpts {
+                        force: plan.force,
+                        gc: false,
+                    };
+                    let rep = cmd::close::apply_real(&plan, &fresh, &opts, &cmd::quiet()).await?;
+                    if !rep.ok() {
+                        anyhow::bail!("{}", rep.failure_lines().join(" · "));
+                    }
+                    Ok(format!("closed {}", plan.target.name))
                 });
             }
             ApplyGc(plan) => {
-                let cfg = self.cfg.clone();
                 self.spawn("gc", async move {
-                    let res = cmd::gc::apply(&plan, &cfg, &cmd::quiet()).await;
-                    let failed = res.iter().filter(|(_, r)| r.is_err()).count();
-                    if failed > 0 {
-                        anyhow::bail!("{failed} of {} actions failed", res.len());
+                    let res = cmd::gc::apply(&plan, &cmd::quiet()).await;
+                    let failed: Vec<_> = res.iter().filter(|r| !r.ok()).collect();
+                    if !failed.is_empty() {
+                        anyhow::bail!(
+                            "{} of {} failed (each rolled back): {}",
+                            failed.len(),
+                            res.len(),
+                            failed
+                                .iter()
+                                .flat_map(|r| r.failure_lines().into_iter().take(1))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        );
                     }
-                    Ok(format!("gc: {} actions applied", res.len()))
+                    Ok(format!("gc: {} items applied", res.len()))
                 });
             }
         }
         Ok(())
+    }
+
+    /// `w x`: close the task of the selected row (worktree, agent, session or pane). The plan
+    /// needs git reads, so it is built in the background and opens the popup when ready.
+    fn plan_close(&mut self) {
+        let Some(n) = tabs::selected(self) else {
+            return;
+        };
+        if let tabs::NodeData::Review(v) = &n.data {
+            if v.worktrees.len() > 1 {
+                self.set_status(
+                    format!(
+                        "{} has {} local worktrees: unfold it (l) and select one",
+                        v.review.display_id,
+                        v.worktrees.len()
+                    ),
+                    true,
+                );
+                return;
+            }
+        }
+        let Some(w) = n.worktree().cloned() else {
+            self.set_status("no worktree on this row: nothing to close".into(), true);
+            return;
+        };
+        let (f, cfg, tx) = (self.fleet.clone(), self.cfg.clone(), self.tx.clone());
+        self.set_status(format!("close {}: planning…", w.name), false);
+        tokio::spawn(async move {
+            let r = async {
+                let project = cfg
+                    .project(&w.repo)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("project {} not in config", w.repo))?;
+                let facts = cmd::close::gather(
+                    &cmd::close::Resolved {
+                        project,
+                        path: w.path.clone(),
+                    },
+                    &f,
+                )
+                .await?;
+                cmd::close::plan(&facts, &cmd::close::CloseOpts::default())
+            }
+            .await;
+            let _ = tx.send(match r {
+                Ok(p) => Msg::ClosePlan(Box::new(p)),
+                Err(e) => Msg::Status(format!("close: {e:#}"), true),
+            });
+        });
     }
 
     // ───── selection helpers (delegated to the tab modules) ─────

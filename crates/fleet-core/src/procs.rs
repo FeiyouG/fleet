@@ -90,6 +90,24 @@ impl ProcTable {
         None
     }
 
+    /// `pid` and every ancestor of it, nearest first.
+    pub fn ancestors(&self, pid: u32) -> Vec<u32> {
+        let mut v = vec![];
+        let mut cur = Some(pid);
+        while let Some(p) = cur {
+            if v.contains(&p) || v.len() > 64 {
+                break;
+            }
+            v.push(p);
+            cur = self
+                .by_pid
+                .get(&p)
+                .and_then(|x| x.ppid)
+                .filter(|&pp| pp != 0);
+        }
+        v
+    }
+
     pub fn is_alive(&self, pid: u32) -> bool {
         self.by_pid.contains_key(&pid)
     }

@@ -162,6 +162,32 @@ impl Registry {
         Ok(())
     }
 
+    /// Undo of [`close`](Self::close): the task is open again.
+    pub fn reopen(&self, slug: &str) -> Result<()> {
+        self.conn.execute(
+            "update task set closed_at = null where slug = ?1",
+            params![slug],
+        )?;
+        Ok(())
+    }
+
+    /// Open tasks whose current path, or any old (pre-rename) path, is `path`. Paths are
+    /// compared canonicalised (registry rows keep `/tmp/...` as written).
+    pub fn tasks_for_path(&self, path: &Path) -> Result<Vec<Task>> {
+        let want = crate::procs::canon(path);
+        Ok(self
+            .open_tasks()?
+            .into_iter()
+            .filter(|t| {
+                crate::procs::canon(&t.path) == want
+                    || t.path == path
+                    || t.old_paths
+                        .iter()
+                        .any(|o| o == path || crate::procs::canon(o) == want)
+            })
+            .collect())
+    }
+
     pub fn rename(
         &self,
         old: &str,
@@ -230,8 +256,18 @@ mod tests {
         assert_eq!(t.tmux_session, "fix-x");
         assert_eq!(t.old_paths, vec![PathBuf::from("/w/wip-abcd")]);
         assert_eq!(t.port, Some(4096));
+        assert_eq!(
+            r.tasks_for_path(Path::new("/w/wip-abcd")).unwrap()[0].slug,
+            "fix-x"
+        );
+        assert_eq!(r.tasks_for_path(Path::new("/w/fix-x")).unwrap().len(), 1);
+        assert!(r.tasks_for_path(Path::new("/w/other")).unwrap().is_empty());
         r.close("fix-x").unwrap();
         assert!(r.get("fix-x").unwrap().is_none());
+        assert!(r.tasks_for_path(Path::new("/w/fix-x")).unwrap().is_empty());
+        r.reopen("fix-x").unwrap();
+        assert_eq!(r.get("fix-x").unwrap().unwrap().port, Some(4096));
+        r.close("fix-x").unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

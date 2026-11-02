@@ -150,14 +150,34 @@ pub async fn rename_session(old: &str, new: &str) -> Result<()> {
         .map(|_| ())
 }
 
+/// Kill a session. Already gone (or no tmux server at all) counts as success.
 pub async fn kill_session(name: &str) -> Result<()> {
-    run(&["kill-session", "-t", &format!("={name}")])
-        .await
-        .map(|_| ())
+    gone_ok(run(&["kill-session", "-t", &format!("={name}")]).await)
 }
 
+/// Kill a pane. Already gone counts as success.
 pub async fn kill_pane(target: &str) -> Result<()> {
-    run(&["kill-pane", "-t", target]).await.map(|_| ())
+    gone_ok(run(&["kill-pane", "-t", target]).await)
+}
+
+fn gone_ok(r: Result<String>) -> Result<()> {
+    match r {
+        Ok(_) => Ok(()),
+        Err(e) if is_gone(&format!("{e:#}")) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// tmux's wording for "that target does not exist".
+pub fn is_gone(msg: &str) -> bool {
+    [
+        "can't find",
+        "no server running",
+        "error connecting to",
+        "not found",
+    ]
+    .iter()
+    .any(|m| msg.contains(m))
 }
 
 /// Open a new window in `session` at `cwd` (used for "shell here").
@@ -188,5 +208,12 @@ mod tests {
             panes[0].target(),
             format!("{}:{}.{}", panes[0].session, panes[0].window, panes[0].pane)
         );
+    }
+
+    #[test]
+    fn gone_messages() {
+        assert!(is_gone("tmux kill-session -t =x: can't find session: x"));
+        assert!(is_gone("no server running on /tmp/tmux-501/default"));
+        assert!(!is_gone("permission denied"));
     }
 }
