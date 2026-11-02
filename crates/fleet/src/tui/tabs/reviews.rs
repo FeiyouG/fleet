@@ -1,6 +1,6 @@
 //! Reviews tab: [project section] → review → local worktrees → agents.
 
-use super::{agent_cell, pane_cell, render_table, tree_label, Node, NodeData, RowKey, TreeNode};
+use super::{pane_cell, render_table, tree_label, Node, NodeData, RowKey, TreeNode};
 use crate::tui::app::{App, SortMode};
 use crate::tui::util::{self, dim, review_style, trunc};
 use fleet_core::model::{ReviewStatus, ReviewView};
@@ -191,18 +191,35 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
     let rows: Vec<Row> = nodes
         .iter()
         .map(|n| match &n.data {
-            NodeData::Project { name, summary } => Row::new(vec![
-                Cell::from(Line::from(vec![
-                    Span::styled(if n.unfolded { "▾ " } else { "▸ " }, dim()),
-                    Span::styled(
+            NodeData::Project { name, summary } => {
+                // summary is "source · N open · M local"
+                let mut parts = summary.split(" · ");
+                let source = parts.next().unwrap_or("").to_string();
+                let open = parts.next().unwrap_or("").to_string();
+                let local = parts.next().unwrap_or("").to_string();
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        if n.unfolded {
+                            "▾ project"
+                        } else {
+                            "▸ project"
+                        },
+                        dim(),
+                    )),
+                    Cell::from(Span::styled(
                         name.clone(),
                         Style::default()
                             .add_modifier(Modifier::BOLD)
                             .fg(Color::Cyan),
-                    ),
-                ])),
-                Cell::from(Span::styled(summary.clone(), dim())),
-            ]),
+                    )),
+                    Cell::from(""),
+                    Cell::from(Span::styled(open, dim())),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(Span::styled(format!("{local} · {source}"), dim())),
+                ])
+            }
             NodeData::Review(v) => {
                 let r = &v.review;
                 let comments = if r.threads.total == 0 {
@@ -238,15 +255,18 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
                         ),
                     ]),
                 };
-                let author = if is_me(&r.author) {
-                    "me".to_string()
-                } else {
-                    trunc(&r.author, 10)
-                };
+                let author = Span::styled(
+                    trunc(&r.author, 14),
+                    if is_me(&r.author) {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        dim()
+                    },
+                );
                 Row::new(vec![
-                    Cell::from(tree_label(n, &r.display_id)),
+                    Cell::from(tree_label(n, &format!("{:<6}", r.display_id))),
                     Cell::from(trunc(&r.title, 44)),
-                    Cell::from(Span::styled(author, dim())),
+                    Cell::from(author),
                     Cell::from(Span::styled(
                         r.status.label().to_string(),
                         review_style(r.status),
@@ -260,11 +280,16 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
             NodeData::Worktree(v) => {
                 let w = &v.worktree;
                 Row::new(vec![
-                    Cell::from(tree_label(n, &trunc(&w.name, 30))),
+                    Cell::from(tree_label(n, "wt")),
                     Cell::from(Line::from(vec![
-                        Span::raw(w.branch.as_deref().unwrap_or("(detached)").to_string()),
+                        Span::raw(trunc(&w.name, 24)),
                         Span::styled(
-                            format!(" {}{}", w.sync_glyph(), if w.dirty { " *" } else { "" }),
+                            format!(
+                                " · {} {}{}",
+                                w.branch.as_deref().unwrap_or("(detached)"),
+                                w.sync_glyph(),
+                                if w.dirty { " *" } else { "" }
+                            ),
                             dim(),
                         ),
                     ])),
@@ -287,11 +312,19 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
                 ])
             }
             NodeData::Agent { agent, pane, .. } => Row::new(vec![
-                Cell::from(tree_label(
-                    n,
-                    &trunc(agent.title.as_deref().unwrap_or("(no title)"), 30),
-                )),
-                agent_cell(agent),
+                Cell::from(tree_label(n, "agent")),
+                Cell::from(Line::from(vec![
+                    Span::raw(trunc(agent.title.as_deref().unwrap_or("(no title)"), 30)),
+                    Span::styled(
+                        format!(
+                            " · {} {} {}",
+                            agent.mode.as_deref().unwrap_or("?"),
+                            agent.activity.glyph(),
+                            agent.activity.label()
+                        ),
+                        util::activity_style(agent.activity),
+                    ),
+                ])),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -315,9 +348,9 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
             "ID", "TITLE", "AUTHOR", "STATUS", "CI", "👍", "COMMENTS", "LOCAL",
         ],
         vec![
-            Constraint::Length(32),
+            Constraint::Length(14),
             Constraint::Length(44),
-            Constraint::Length(10),
+            Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Length(2),
             Constraint::Length(2),

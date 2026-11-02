@@ -20,6 +20,8 @@ pub struct Cli {
     /// Start scoped to this project (default: the project containing the cwd)
     #[arg(long, global = true)]
     project: Option<String>,
+    #[arg(skip)]
+    all_projects: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -197,6 +199,11 @@ pub fn run() -> Result<()> {
         Some(p) => Config::load_from(p)?,
         None => Config::load()?,
     };
+    let mut cli = cli;
+    if cli.project.as_deref() == Some("all") {
+        cli.project = None;
+        cli.all_projects = true;
+    }
     if let Some(p) = &cli.project {
         if cfg.project(p).is_none() {
             bail!(
@@ -230,7 +237,11 @@ fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
 
 async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
     let cli_config = cli.config.clone();
-    let project = cli.project.clone().or_else(|| cwd_project_strict(&cfg));
+    let project = if cli.all_projects {
+        None
+    } else {
+        cli.project.clone().or_else(|| cwd_project_strict(&cfg))
+    };
     match cli.cmd.unwrap_or(Cmd::Tui) {
         Cmd::Tui => {
             if cfg.projects.is_empty() {

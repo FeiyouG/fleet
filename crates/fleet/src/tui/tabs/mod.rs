@@ -857,7 +857,7 @@ pub fn tree_label(n: &Node, name: &str) -> Line<'static> {
     } else if n.depth > 0 {
         "↳ "
     } else {
-        ""
+        "  " // same width as the fold glyph, so names align across parent and leaf rows
     };
     Line::from(vec![
         Span::styled(format!("{indent}{glyph}"), dim()),
