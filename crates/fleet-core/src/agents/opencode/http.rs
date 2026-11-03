@@ -67,7 +67,8 @@ pub async fn control_send(url: &str, token: &str, msg: &SendMsg) -> Result<()> {
         .json(&serde_json::json!({
             "text": msg.text,
             "model": msg.model,
-            "agent": msg.agent,
+            // fleet's mode = opencode's agent
+            "agent": msg.mode,
         }))
         .send()
         .await

@@ -11,8 +11,9 @@
 //! `debug` is a debugging command whose output may change; when it fails we still list the
 //! agents, dropping opencode's known internal ones by name.
 
-use crate::agents::{AgentChoice, Choices};
+use crate::agents::{AgentChoice, Choices, CHOICES_TTL};
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,32 +24,89 @@ use tokio::process::Command;
 /// opencode's built-in agents that are never offered to users.
 const INTERNAL_AGENTS: &[&str] = &["compaction", "summary", "title"];
 const TIMEOUT: Duration = Duration::from_secs(10);
-const CACHE_TTL: Duration = Duration::from_secs(300);
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, (Instant, Choices)>> {
-    static C: OnceLock<Mutex<HashMap<PathBuf, (Instant, Choices)>>> = OnceLock::new();
+/// Cache key: the binary and the directory (a repo's `opencode.json` changes the answer).
+type Key = (String, PathBuf);
+
+fn cache() -> &'static Mutex<HashMap<Key, (Instant, Choices)>> {
+    static C: OnceLock<Mutex<HashMap<Key, (Instant, Choices)>>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
-pub async fn choices(cwd: &Path) -> Result<Choices> {
-    if let Some((at, c)) = cache().lock().unwrap().get(cwd) {
-        if at.elapsed() < CACHE_TTL {
+/// The on-disk copy, shared by every `fleet` process (each CLI call is a new process, and
+/// a cold discovery takes seconds): `<data>/cache/opencode-choices.json`.
+fn disk_path() -> PathBuf {
+    crate::config::data_dir()
+        .join("cache")
+        .join("opencode-choices.json")
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Disk {
+    /// `"<bin>\0<cwd>"` -> (unix ms when discovered, choices)
+    entries: HashMap<String, (i64, Choices)>,
+}
+
+fn disk_key(k: &Key) -> String {
+    format!("{}\0{}", k.0, k.1.display())
+}
+
+fn read_disk() -> Disk {
+    std::fs::read_to_string(disk_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn from_disk(k: &Key, now_ms: i64) -> Option<Choices> {
+    let (at, c) = read_disk().entries.remove(&disk_key(k))?;
+    (now_ms - at < CHOICES_TTL.as_millis() as i64 && now_ms >= at).then_some(c)
+}
+
+fn to_disk(k: &Key, now_ms: i64, c: &Choices) {
+    let mut d = read_disk();
+    d.entries
+        .retain(|_, (at, _)| now_ms - *at < CHOICES_TTL.as_millis() as i64);
+    d.entries.insert(disk_key(k), (now_ms, c.clone()));
+    let path = disk_path();
+    let tmp = path.with_extension("json.tmp");
+    // best effort: a failed write only costs the next process a fresh discovery
+    let _ = std::fs::create_dir_all(path.parent().unwrap())
+        .and_then(|_| std::fs::write(&tmp, serde_json::to_vec(&d).unwrap_or_default()))
+        .and_then(|_| std::fs::rename(&tmp, &path));
+}
+
+/// What `bin` offers in `cwd`, cached [`CHOICES_TTL`] in memory and on disk. Failures are
+/// not cached: the next call tries again.
+pub async fn choices(bin: &str, cwd: &Path) -> Result<Choices> {
+    let key: Key = (bin.to_string(), cwd.to_path_buf());
+    if let Some((at, c)) = cache().lock().unwrap().get(&key) {
+        if at.elapsed() < CHOICES_TTL {
             return Ok(c.clone());
         }
     }
-    let c = discover(cwd).await?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let c = match from_disk(&key, now_ms) {
+        Some(c) => c,
+        None => {
+            let c = discover(bin, cwd).await?;
+            to_disk(&key, now_ms, &c);
+            c
+        }
+    };
     cache()
         .lock()
         .unwrap()
-        .insert(cwd.to_path_buf(), (Instant::now(), c.clone()));
+        .insert(key, (Instant::now(), c.clone()));
     Ok(c)
 }
 
-async fn discover(cwd: &Path) -> Result<Choices> {
+async fn discover(bin: &str, cwd: &Path) -> Result<Choices> {
+    let run = |args: &'static [&'static str]| run(bin, cwd, args);
     let (models, agents, config) = tokio::join!(
-        run(cwd, &["models"]),
-        run(cwd, &["agent", "list"]),
-        run(cwd, &["debug", "config"]),
+        run(&["models"]),
+        run(&["agent", "list"]),
+        run(&["debug", "config"]),
     );
     let models = parse_models(&models.context("opencode models")?);
     if models.is_empty() {
@@ -58,7 +116,7 @@ async fn discover(cwd: &Path) -> Result<Choices> {
     let details = futures::future::join_all(
         names
             .iter()
-            .map(|n| async move { run(cwd, &["debug", "agent", n]).await.ok() }),
+            .map(|n| async move { self::run(bin, cwd, &["debug", "agent", n]).await.ok() }),
     )
     .await;
     let agents = names
@@ -74,8 +132,8 @@ async fn discover(cwd: &Path) -> Result<Choices> {
     })
 }
 
-async fn run(cwd: &Path, args: &[&str]) -> Result<String> {
-    let fut = Command::new("opencode")
+async fn run(bin: &str, cwd: &Path, args: &[&str]) -> Result<String> {
+    let fut = Command::new(bin)
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -83,11 +141,11 @@ async fn run(cwd: &Path, args: &[&str]) -> Result<String> {
         .output();
     let out = tokio::time::timeout(TIMEOUT, fut)
         .await
-        .with_context(|| format!("`opencode {}` timed out", args.join(" ")))?
-        .with_context(|| format!("running `opencode {}`", args.join(" ")))?;
+        .with_context(|| format!("`{bin} {}` timed out", args.join(" ")))?
+        .with_context(|| format!("running `{bin} {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
-            "`opencode {}` exited with {}: {}",
+            "`{bin} {}` exited with {}: {}",
             args.join(" "),
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()

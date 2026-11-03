@@ -673,18 +673,19 @@ return {
 
 ---
 
-# fleet v0.3 — choose the agent and model, at start and per message
+# fleet v0.3 — choose the mode and model, at start and per message
 
 ## What can be switched, and where the list comes from
 
 - **Models**: `opencode models` (run in the project repo, so the repo's `opencode.json` counts) prints every `provider/model` opencode has credentials for. The list is the same for every opencode agent.
 - **Agents (modes)**: `opencode agent list` header lines `name (primary|all)`; `opencode debug agent NAME` gives `hidden` (internal agents such as `compaction`, `summary`, `title` are dropped) and the agent's own `model`; `opencode debug config` gives the global `model`. "Default" for an agent = its own model, else the global one. If `debug` fails, the three internal names are dropped by name.
-- Discovery lives behind `AgentAdapter::choices(cwd) -> Choices { agents, models, default_model }` (`agents/opencode/choices.rs`), cached 5 minutes per directory. Another agent CLI answers from its own source (Claude Code has no list command; an adapter would return its aliases).
+- Discovery lives behind `AgentAdapter::choices(cwd) -> Choices { agents, models, default_model }`, one per adapter (`agents/opencode/choices.rs` runs the configured `bin`). The default implementation (claude, codex) returns `plan`/`build` and **no** model list, meaning "any name passes through": neither CLI can list its models. opencode's answer is cached 5 minutes per (bin, directory) in memory and in `<data>/cache/opencode-choices.json`, so separate `fleet` processes share it; failures are never cached.
+- **Modes vs adapters.** `agents::Mode` stays fleet's adapter-neutral `Plan | Build` and gains `Custom(String)` for a name only one adapter offers (an opencode agent such as `reviewer`). `--agent` everywhere keeps meaning the adapter (opencode/claude/codex); `--mode` is the mode, both on `start` and on `send`. claude/codex launch anything but `build` read-only, and `choices` rejects other names before that.
 - The model an agent is using now = the model of its session's last message in opencode's DB (assistant `providerID/modelID`, user `model.{providerID,modelID}`), shown in `fleet agent list` and the TUI.
 
 ## Starting with a model
 
-`fleet agent start --model P/M`, config `defaults.model`, and the TUI start popup's `model` row (filterable picker) set `LaunchSpec.model`, which adds `--model P/M` to the `opencode` command line only when set. `--mode`/`--model` are checked against `choices` (unknown model → up to five close matches); if discovery itself fails the start goes ahead unchecked.
+`fleet agent start --model M`, config `agents.<name>.model` (per adapter, in that CLI's naming: opencode `provider/model`, claude `opus`), and the TUI start popup's `model` row (filterable picker; free text for claude/codex) set the model. `LaunchSpec.model` overrides the configured one; each adapter adds `--model M` to its command line only when one is set. `--mode`/`--model` are checked against the adapter's `choices` before any worktree is created (unknown model → up to five close matches); if discovery itself fails the start goes ahead unchecked.
 
 ## Sending with a model / agent: the plugin control endpoint
 
@@ -692,11 +693,15 @@ Finding while planning: three fleet-started agents had no listener on their regi
 
 The plugin (`assets/fleet.ts`, state file `version: 2`) therefore opens its own endpoint: `Bun.serve` on `127.0.0.1:0`, a random bearer token, `control_url` + `token` written to the state file (mode 0600; the token is never serialised into `fleet status --json`). `POST /send {text, model?, agent?}`:
 
-- no override → `client.tui.appendPrompt` + `submitPrompt` (exactly as if typed);
-- override → `client.session.promptAsync` on the plugin's `current_session` (the root session the user last worked in, tracked from `session.created/updated` parent ids and `message.updated`), with `agent` defaulting to the session's last user agent (otherwise opencode would fall back to its default agent), then a TUI toast: the TUI's own selector does not follow an API message, so the next message you type uses the TUI's model again.
+- every message → `client.session.promptAsync` on the plugin's `current_session` (the root session the user last worked in, tracked from `session.created/updated` parent ids, `message.updated` and `session.status`). One target for plain and override messages: earlier, plain text was typed into whatever session the TUI showed while overrides went to `current_session`, so the two could land in different sessions after you opened another session in the TUI.
+- `agent` and `model` default to the session's last **user** message (otherwise opencode would fall back to its default agent/model), so a plain message continues exactly like a typed one. A message fleet itself sent with an override is not recorded as "last" (matched as the first new user message with the agent/model it sent), so the next plain message is back on the session's own model.
+- override → also a TUI toast: the TUI's own selector does not follow an API message, so the next message you type uses the TUI's model again.
+- no session yet (a fresh TUI) → plain text is typed into the TUI (`appendPrompt` + `submitPrompt`); an override is refused (409).
 
-`SendTarget` is `Control { url, token }` (plugin v2) or `Pane` (tmux keys; an override there errors with "run `fleet setup` and restart the agent"). `SendTarget::Port` and `/tui/submit-prompt` over the agent's port are gone: one send path. Re-review (`review start` on an existing review) uses the same target selection.
+The opencode adapter's `send(&AgentRow, &SendMsg)` uses the control endpoint when the row has one (`AgentRow.control_url/control_token`, the token `#[serde(skip)]`), else tmux keys; an override without the endpoint errors with "run `fleet setup` and restart the agent". The agent's `--port` (`/tui/submit-prompt`) is no longer a send path. claude and codex reject an override (`agents::reject_override`) and send as before. `fleet agent send` and the TUI check an override against `choices` first; if discovery fails they warn and send unchecked, like `start`. Re-review sends through the task's own adapter.
 
-Verified [LOCAL] on throwaway agents (temp repo, temp data dir, free models): start with `--model opencode/big-pickle` → reply from Big Pickle; `send --model opencode/glm-5.3-flash-free` → that turn from GLM with agent `build` kept; a following plain `send` → back to Big Pickle; bad token → 401.
+The v2 fields (`control_url`, `token`, `current_session`) live in the agent-neutral `agents/state_file.rs`; `current_session` also wins `primary_session` over a busy subagent.
+
+Verified [LOCAL] on the pre-merge branch, throwaway agents (temp repo, temp data dir, free models): start with `--model opencode/big-pickle` → reply from Big Pickle; `send --model opencode/glm-5.3-flash-free` → that turn from GLM with agent `build` kept; a following plain `send` → back to Big Pickle; bad token → 401.
 
 Deploy order: old plugin + new fleet → no `control_url`, plain messages go by tmux keys, overrides error with the setup hint. New plugin + old fleet → extra state-file fields are ignored; old fleet's port-based send works as before where the port listens.

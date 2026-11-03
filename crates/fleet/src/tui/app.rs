@@ -6,16 +6,17 @@ use super::util;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::{execute, terminal};
-use fleet_core::agents::{Choices, SendMsg, SendTarget};
+use fleet_core::agents::{Choices, SendMsg, CHOICES_TTL};
 use fleet_core::cmd;
 use fleet_core::model::Fleet;
 use fleet_core::{tmux, Config, Engine};
 use futures::StreamExt;
 use ratatui::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,15 +43,21 @@ pub struct App {
     pub quit: bool,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<Msg>,
-    /// Agents/models per directory (project repo or agent cwd), loaded in the background
-    /// when a popup needs them. `Err` = discovery failed (message shown in the popup).
-    pub choices: HashMap<PathBuf, std::result::Result<Choices, String>>,
+    /// Modes/models per (adapter, directory), loaded in the background when a popup needs
+    /// them, with the time they arrived. `Err` = discovery failed (shown in the popup, and
+    /// retried the next time a popup asks).
+    pub choices: HashMap<ChoicesKey, (Instant, std::result::Result<Choices, String>)>,
+    /// Keys being loaded right now (no duplicate discovery while one runs).
+    choices_loading: HashSet<ChoicesKey>,
 }
+
+/// `(adapter name, directory)`: what a mode/model list depends on.
+pub type ChoicesKey = (String, PathBuf);
 
 pub enum Msg {
     Snapshot(Fleet),
     Status(String, bool),
-    Choices(PathBuf, std::result::Result<Choices, String>),
+    Choices(ChoicesKey, std::result::Result<Choices, String>),
     /// Suspend the TUI, run the closure (blocking, owns the terminal), then resume.
     Suspend(Box<dyn FnOnce() -> Result<()> + Send>),
 }
@@ -105,6 +112,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
         quit: false,
         tx,
         choices: HashMap::new(),
+        choices_loading: HashSet::new(),
     };
 
     let mut term = enter()?;
@@ -127,7 +135,10 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
                 match msg {
                     Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.fleet = f; app.loading = false; }
                     Some(Msg::Status(s, err)) => app.set_status(s, err),
-                    Some(Msg::Choices(dir, c)) => { app.choices.insert(dir, c); }
+                    Some(Msg::Choices(key, c)) => {
+                        app.choices_loading.remove(&key);
+                        app.choices.insert(key, (Instant::now(), c));
+                    }
                     Some(Msg::Suspend(work)) => {
                         leave(&mut term)?;
                         let r = work();
@@ -177,28 +188,36 @@ impl App {
         self.status_line = Some((s, err));
     }
 
-    /// Start loading the agents/models offered in `dir` unless already loaded.
-    pub fn want_choices(&mut self, dir: PathBuf) {
-        if self.choices.contains_key(&dir) {
+    /// Load the modes/models `adapter` offers in `dir` unless a fresh answer is already here.
+    /// A failed load, or one older than [`CHOICES_TTL`], is loaded again; the old answer
+    /// stays on screen until the new one arrives.
+    pub fn want_choices(&mut self, adapter: &str, dir: PathBuf) {
+        let key: ChoicesKey = (adapter.to_string(), dir);
+        if !choices_stale(self.choices.get(&key), Instant::now())
+            || !self.choices_loading.insert(key.clone())
+        {
             return;
         }
         let engine = self.engine.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let r = match engine.agent_adapter("opencode") {
-                Some(a) => a.choices(&dir).await.map_err(|e| format!("{e:#}")),
-                None => Err("opencode adapter not enabled".into()),
+            let r = match engine.agent_adapter(&key.0) {
+                Some(a) => a.choices(&key.1).await.map_err(|e| format!("{e:#}")),
+                None => Err(format!("agent `{}` is not enabled", key.0)),
             };
-            let _ = tx.send(Msg::Choices(dir, r));
+            let _ = tx.send(Msg::Choices(key, r));
         });
     }
 
-    /// Loaded choices for `dir`: `None` = still loading.
+    /// Loaded choices for `(adapter, dir)`: `None` = still loading.
     pub fn choices_for(
         &self,
+        adapter: &str,
         dir: &std::path::Path,
     ) -> Option<&std::result::Result<Choices, String>> {
-        self.choices.get(dir)
+        self.choices
+            .get(&(adapter.to_string(), dir.to_path_buf()))
+            .map(|(_, c)| c)
     }
 
     pub fn request_refresh(&self) {
@@ -353,18 +372,16 @@ impl App {
                 let p = Popup::start(&self.cfg);
                 if let Popup::Start(f) = &p {
                     if let Some(dir) = f.repo_dir(&self.cfg) {
-                        self.want_choices(dir);
+                        let agent = f.agent().to_string();
+                        self.want_choices(&agent, dir);
                     }
                 }
                 self.popup = Some(p);
             }
             AgentSend => {
-                if self.selected_send_target().is_some() {
-                    let agent = tabs::selected_agent(self);
-                    if let Some(a) = &agent {
-                        self.want_choices(a.cwd.clone());
-                    }
-                    self.popup = Some(Popup::message(self.selected_name(), agent));
+                if let Some(row) = self.selected_send_target() {
+                    self.want_choices(&row.adapter, row.cwd.clone());
+                    self.popup = Some(Popup::message(self.selected_name(), row));
                 } else {
                     self.set_status("no running agent on this row".into(), true);
                 }
@@ -500,6 +517,7 @@ impl App {
                 name,
                 prompt,
                 repo,
+                agent,
                 mode,
                 model,
             } => {
@@ -511,6 +529,7 @@ impl App {
                             name,
                             prompt,
                             repo,
+                            agent,
                             mode,
                             model,
                             base: None,
@@ -529,22 +548,24 @@ impl App {
             Message {
                 name,
                 text,
+                mode,
                 model,
-                agent,
             } => {
                 let target = self.selected_send_target();
                 let engine = self.engine.clone();
                 match target {
-                    Some(t) => self.spawn("send", async move {
-                        let a = engine
-                            .agent_adapter("opencode")
-                            .ok_or_else(|| anyhow::anyhow!("no opencode adapter"))?;
-                        let what = [agent.as_deref(), model.as_deref()]
+                    Some(row) => self.spawn("send", async move {
+                        let a = engine.agent_adapter(&row.adapter).ok_or_else(|| {
+                            anyhow::anyhow!("agent `{}` is not enabled", row.adapter)
+                        })?;
+                        let what = [mode.as_deref(), model.as_deref()]
                             .into_iter()
                             .flatten()
                             .collect::<Vec<_>>()
                             .join(" · ");
-                        a.send(&t, &SendMsg { text, model, agent }).await?;
+                        let msg = SendMsg { text, model, mode };
+                        cmd::send::check_override(a, &row.cwd, &msg, &cmd::quiet()).await?;
+                        a.send(&row, &msg).await?;
                         Ok(if what.is_empty() {
                             format!("sent to {name}")
                         } else {
@@ -637,6 +658,7 @@ impl App {
                 cmd::review::ReviewOpts {
                     id_or_url: num,
                     repo,
+                    agent: None,
                     attach: false,
                 },
                 &cmd::quiet(),
@@ -780,7 +802,35 @@ impl App {
         tabs::selected_name(self)
     }
 
-    pub fn selected_send_target(&self) -> Option<SendTarget> {
+    pub fn selected_send_target(&self) -> Option<fleet_core::model::AgentRow> {
         tabs::selected_send_target(self)
+    }
+}
+
+/// Does a cached mode/model answer need loading (again)? Missing, failed, or older than
+/// [`CHOICES_TTL`].
+fn choices_stale(
+    entry: Option<&(Instant, std::result::Result<Choices, String>)>,
+    now: Instant,
+) -> bool {
+    match entry {
+        None => true,
+        Some((_, Err(_))) => true,
+        Some((at, Ok(_))) => now.duration_since(*at) >= CHOICES_TTL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choices_reload_on_error_and_after_ttl() {
+        let t0 = Instant::now();
+        assert!(choices_stale(None, t0));
+        assert!(choices_stale(Some(&(t0, Err("timed out".into()))), t0));
+        let ok = (t0, Ok(Choices::default()));
+        assert!(!choices_stale(Some(&ok), t0));
+        assert!(choices_stale(Some(&ok), t0 + CHOICES_TTL));
     }
 }

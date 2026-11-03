@@ -234,7 +234,7 @@ impl Node {
                 .or_else(|| {
                     v.panes
                         .iter()
-                        .find(|p| p.command == "opencode")
+                        .find(|p| fleet_core::agents::KNOWN.contains(&p.command.as_str()))
                         .or(v.panes.first())
                         .map(|p| p.target())
                 }),

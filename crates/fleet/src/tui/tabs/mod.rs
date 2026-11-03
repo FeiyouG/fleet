@@ -8,7 +8,6 @@ use super::app::App;
 use super::keys::Key;
 use super::popups;
 use super::util::{self, dim};
-use fleet_core::agents::SendTarget;
 use fleet_core::model::{Activity, Overall, ReviewRow, WorktreeRow};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -279,15 +278,15 @@ pub fn selected_name(app: &App) -> String {
     selected(app).map(|n| n.name()).unwrap_or_default()
 }
 
-pub fn selected_send_target(app: &App) -> Option<SendTarget> {
+/// The first agent of the selected node, if it can receive a message.
+pub fn selected_send_target(app: &App) -> Option<fleet_core::model::AgentRow> {
     let n = selected(app)?;
-    let a = *n.agents().first()?;
-    fleet_core::cmd::send::agent_target(a)
-}
-
-/// The first agent of the selected row.
-pub fn selected_agent(app: &App) -> Option<fleet_core::model::AgentRow> {
-    selected(app)?.agents().first().map(|a| (*a).clone())
+    let a = (*n.agents().first()?).clone();
+    (a.control_url.is_some()
+        || a.port.is_some()
+        || a.pane_target.is_some()
+        || a.session_id.is_some())
+    .then_some(a)
 }
 
 // ───────────────────────── drawing ─────────────────────────

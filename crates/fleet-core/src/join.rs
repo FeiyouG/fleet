@@ -46,7 +46,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
             .or_else(|| {
                 panes
                     .iter()
-                    .position(|p| p.command == "opencode" && canon(&p.cwd) == a.cwd)
+                    .position(|p| p.command == a.adapter && canon(&p.cwd) == a.cwd)
             });
         if let Some(i) = idx {
             agent_pane.insert(a.pid, i);

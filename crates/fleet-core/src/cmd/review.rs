@@ -2,7 +2,7 @@
 //! Re-review when the task already exists.
 
 use super::{free_port, Progress};
-use crate::agents::{LaunchSpec, SendMsg, SendTarget};
+use crate::agents::{LaunchSpec, Mode, SendMsg};
 use crate::config::Project;
 use crate::registry::{Registry, Task};
 use crate::snapshot::Engine;
@@ -15,6 +15,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct ReviewOpts {
     pub id_or_url: String,
+    /// Adapter name; `None` = `defaults.agent`.
+    pub agent: Option<String>,
     /// Repo name; when `None`, the first repo whose source parses the id/url is used.
     pub repo: Option<String>,
     pub attach: bool,
@@ -80,9 +82,13 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     let adapter = engine.review_adapter(&source).context("review adapter")?;
     let review = adapter.review(id).await?;
     let reg = Registry::open()?;
+    let agent_name = opts
+        .agent
+        .clone()
+        .unwrap_or_else(|| cfg.defaults.agent.clone());
     let agent = engine
-        .agent_adapter("opencode")
-        .context("opencode adapter not enabled")?;
+        .agent_adapter(&agent_name)
+        .with_context(|| format!("agent `{agent_name}` is not enabled"))?;
 
     log(&format!("fetch origin {}", adapter.fetch_refspec(id)));
     git::fetch(&repo.repo, "origin", &adapter.fetch_refspec(id)).await?;
@@ -108,15 +114,46 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
             &old_sha[..old_sha.len().min(8)],
             &review.head_sha[..review.head_sha.len().min(8)]
         );
-        let fleet = engine.snapshot(false).await;
-        let target = super::send::find_row(&fleet, &task.slug)
-            .and_then(super::send::send_target)
-            .unwrap_or_else(|| SendTarget::Pane(format!("{}:1.1", task.tmux_session)));
-        log(&match &target {
-            SendTarget::Control { url, .. } => format!("send via {url}"),
-            SendTarget::Pane(p) => format!("send-keys to {p}"),
-        });
-        agent.send(&target, &SendMsg::text(text)).await?;
+        // Deliver through the task's own adapter: find the live row, else build one from the
+        // registry (port + the agent pane).
+        let task_agent = engine.agent_adapter(&task.agent).with_context(|| {
+            format!(
+                "agent `{}` (which started this review) is not enabled",
+                task.agent
+            )
+        })?;
+        let row = engine
+            .snapshot(false)
+            .await
+            .overview
+            .iter()
+            .flat_map(|r| r.agents.clone())
+            .find(|a| a.cwd == crate::procs::canon(&task.path) && a.adapter == task.agent)
+            .unwrap_or_else(|| crate::model::AgentRow {
+                adapter: task.agent.clone(),
+                pid: 0,
+                cwd: task.path.clone(),
+                session_id: None,
+                title: None,
+                mode: None,
+                model: None,
+                activity: crate::model::Activity::Idle,
+                running_tool: None,
+                plan_url: None,
+                plan_title: None,
+                port: task.port,
+                last_activity: None,
+                pane_target: Some(format!(
+                    "{}:1.{}",
+                    task.tmux_session,
+                    if cfg.defaults.nvim_pane { 1 } else { 0 }
+                )),
+                pending: vec![],
+                control_url: None,
+                control_token: None,
+            });
+        log(&format!("send via {}", task.agent));
+        task_agent.send(&row, &SendMsg::text(text)).await?;
         if opts.attach {
             tmux::attach(&task.tmux_session).await?;
         }
@@ -152,6 +189,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         old_paths: vec![],
         tmux_session: slug.clone(),
         port: Some(port),
+        agent: agent_name.clone(),
         mode: Some("plan".into()),
         review_source: Some(source.clone()),
         review_id: Some(id),
@@ -170,11 +208,10 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     );
     let cmd = agent.launch(&LaunchSpec {
         cwd: path.clone(),
-        mode: "plan".into(),
-        model: cfg.defaults.model.clone(),
+        mode: Mode::Plan,
+        model: None,
         prompt,
         port,
-        extra_args: cfg.agent_args.clone(),
     });
     log(&format!("tmux new-session -s {slug}"));
     tmux::new_session(&slug, &path).await?;

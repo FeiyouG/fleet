@@ -1,7 +1,7 @@
 //! `fleet agent start`: worktree + branch + tmux + agent.
 
 use super::{free_port, Progress};
-use crate::agents::LaunchSpec;
+use crate::agents::{LaunchSpec, Mode};
 use crate::config::{Config, Project};
 use crate::registry::{Registry, Task};
 use crate::slug;
@@ -17,8 +17,11 @@ pub struct StartOpts {
     pub name: Option<String>,
     pub prompt: String,
     pub repo: String,
+    /// Adapter name; `None` = `defaults.agent`.
+    pub agent: Option<String>,
+    /// `plan` | `build` | an adapter-specific mode; `None` = `defaults.mode`.
     pub mode: Option<String>,
-    /// `provider/model`; `None` = `defaults.model`, else the agent CLI's own default.
+    /// Model in the adapter's naming; `None` = `agents.<name>.model`, else the CLI's default.
     pub model: Option<String>,
     pub base: Option<String>,
     pub nvim: Option<bool>,
@@ -27,6 +30,7 @@ pub struct StartOpts {
 
 #[derive(Debug, Clone)]
 pub struct Started {
+    pub agent: String,
     pub slug: String,
     pub branch: String,
     pub path: PathBuf,
@@ -78,25 +82,35 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     if tmux::has_session(&slug).await {
         bail!("tmux session `{slug}` already exists");
     }
-    let adapter = engine
-        .agent_adapter("opencode")
-        .context("opencode adapter not enabled")?;
-    let mode = opts
+    let agent_name = opts
+        .agent
+        .clone()
+        .unwrap_or_else(|| cfg.defaults.agent.clone());
+    let adapter = engine.agent_adapter(&agent_name).with_context(|| {
+        format!(
+            "agent `{agent_name}` is not enabled (enabled: {})",
+            engine
+                .agent_adapters()
+                .iter()
+                .map(|a| a.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let mode_s = opts
         .mode
         .clone()
         .unwrap_or_else(|| cfg.defaults.mode.clone());
-    let model = opts.model.clone().or_else(|| cfg.defaults.model.clone());
-    // Check the agent and model against what opencode offers in this repo. If discovery
-    // itself fails (opencode slow or missing), go ahead: opencode reports a bad name itself.
+    let mode = Mode::parse(&mode_s).context("empty mode")?;
+    // `None` = the adapter's configured model (`agents.<name>.model`), else its CLI's own.
+    let model = opts.model.clone();
+    let effective_model = model.clone().or_else(|| cfg.agents.get(&agent_name).model);
+    // Check mode and model against what the adapter offers in this repo. If discovery
+    // itself fails (CLI slow or missing), go ahead: the CLI reports a bad name itself.
     match adapter.choices(&repo.repo).await {
-        Ok(c) => {
-            c.check_agent(&mode)?;
-            if let Some(m) = &model {
-                c.check_model(m)?;
-            }
-        }
+        Ok(c) => c.check(Some(mode.as_str()), effective_model.as_deref())?,
         Err(e) => log(&format!(
-            "could not list agents/models ({e:#}); not checking"
+            "could not list {agent_name} modes/models ({e:#}); not checking"
         )),
     }
 
@@ -120,7 +134,8 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         old_paths: vec![],
         tmux_session: slug.clone(),
         port: Some(port),
-        mode: Some(mode.clone()),
+        agent: agent_name.clone(),
+        mode: Some(mode_s.clone()),
         review_source: None,
         review_id: None,
         head_sha: None,
@@ -139,7 +154,6 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         model,
         prompt: full_prompt,
         port,
-        extra_args: cfg.agent_args.clone(),
     });
 
     log(&format!("tmux new-session -s {slug}"));
@@ -158,6 +172,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         tmux::attach(&slug).await?;
     }
     Ok(Started {
+        agent: agent_name,
         tmux_session: slug.clone(),
         slug,
         branch,

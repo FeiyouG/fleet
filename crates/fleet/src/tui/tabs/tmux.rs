@@ -119,7 +119,7 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
                 ])
             }
             NodeData::Pane(p) => {
-                let title = if p.pane.command == "opencode" {
+                let title = if p.agent.is_some() {
                     p.agent
                         .as_ref()
                         .and_then(|a| a.title.clone())
