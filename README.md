@@ -92,11 +92,15 @@ fleet setup [--remove|--check] | config [--init] | keys
 while the agent is alive (opencode keeps absolute paths), renames the tmux
 session and updates the registry. With a name, everything is named up front.
 
-### tmux status bar
+### tmux status bar and a key to reach fleet
 
 ```tmux
 set -g status-interval 15
 set -g status-right '#(fleet status --short) | %H:%M'
+
+# prefix f from any session: a dedicated `fleet` session running the TUI (created on first
+# use, kept between visits). Enter on a row switches to that agent's session; prefix f comes back.
+bind-key f if-shell 'tmux has-session -t =fleet' 'switch-client -t fleet' 'new-session -d -s fleet -c ~ fleet \; switch-client -t fleet'
 ```
 
 ## TUI
