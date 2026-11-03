@@ -120,6 +120,7 @@ mod tests {
             session_id: None,
             title: None,
             mode: None,
+            model: None,
             activity: a,
             running_tool: None,
             plan_url: None,
@@ -128,6 +129,8 @@ mod tests {
             last_activity: None,
             pane_target: None,
             pending: vec![],
+            control_url: None,
+            control_token: None,
         }
     }
     fn review(status: ReviewStatus, ci: Ci) -> ReviewRow {

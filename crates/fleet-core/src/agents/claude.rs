@@ -2,7 +2,7 @@
 //! `~/.claude/settings.json`; fallback identity from `~/.claude/projects/<slug>/*.jsonl`.
 
 use super::hooked::{self, Fallback};
-use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode};
+use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg};
 use crate::config::{home, AgentConfig};
 use crate::model::AgentRow;
 use crate::procs::{canon, ProcTable};
@@ -105,8 +105,12 @@ impl AgentAdapter for Claude {
 
     fn launch(&self, spec: &LaunchSpec) -> String {
         let mut parts = vec![self.bin()];
-        if spec.mode == Mode::Plan {
+        // Only `build` may edit; anything else (choices rejects other names) stays read-only.
+        if spec.mode != Mode::Build {
             parts.extend(["--permission-mode".to_string(), "plan".to_string()]);
+        }
+        if let Some(m) = spec.model.as_ref().or(self.cfg.model.as_ref()) {
+            parts.extend(["--model".to_string(), m.clone()]);
         }
         parts.extend(self.cfg.args.iter().cloned());
         parts.push("--".into());
@@ -114,8 +118,9 @@ impl AgentAdapter for Claude {
         shell_line(parts)
     }
 
-    async fn send(&self, agent: &AgentRow, text: &str) -> Result<()> {
-        super::send_via_tmux(agent, text).await
+    async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
+        super::reject_override("claude", msg)?;
+        super::send_via_tmux(agent, &msg.text).await
     }
 
     fn hook_install(&self) -> Option<HookInstall> {
@@ -138,12 +143,13 @@ mod tests {
             "-Users-me-Projects-monid-services"
         );
         let c = Claude::new(AgentConfig {
-            args: vec!["--model".into(), "opus".into()],
+            model: Some("opus".into()),
             ..Default::default()
         });
         let s = c.launch(&LaunchSpec {
             cwd: "/w".into(),
             mode: Mode::Plan,
+            model: None,
             prompt: "do \"it\"".into(),
             port: 0,
         });
@@ -154,9 +160,10 @@ mod tests {
         let s = c.launch(&LaunchSpec {
             cwd: "/w".into(),
             mode: Mode::Build,
+            model: Some("sonnet".into()),
             prompt: "x".into(),
             port: 0,
         });
-        assert_eq!(s, "claude --model opus -- x");
+        assert_eq!(s, "claude --model sonnet -- x");
     }
 }

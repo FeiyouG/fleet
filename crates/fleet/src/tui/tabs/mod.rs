@@ -282,7 +282,11 @@ pub fn selected_name(app: &App) -> String {
 pub fn selected_send_target(app: &App) -> Option<fleet_core::model::AgentRow> {
     let n = selected(app)?;
     let a = (*n.agents().first()?).clone();
-    (a.port.is_some() || a.pane_target.is_some() || a.session_id.is_some()).then_some(a)
+    (a.control_url.is_some()
+        || a.port.is_some()
+        || a.pane_target.is_some()
+        || a.session_id.is_some())
+    .then_some(a)
 }
 
 // ───────────────────────── drawing ─────────────────────────
@@ -365,8 +369,9 @@ pub fn detail(app: &App, n: &Node) -> Text<'static> {
                     util::activity_style(agent.activity),
                 ),
                 Span::raw(format!(
-                    "{} · {}",
+                    "{} · {} · {}",
                     agent.mode.as_deref().unwrap_or("?"),
+                    agent.model.as_deref().unwrap_or("model ?"),
                     agent.title.as_deref().unwrap_or("(no title)")
                 )),
                 Span::styled(
@@ -594,8 +599,11 @@ fn agent_line(a: &fleet_core::model::AgentRow) -> Line<'static> {
             util::activity_style(a.activity),
         ),
         Span::raw(format!(
-            " {} · {}",
+            " {}{} · {}",
             a.mode.as_deref().unwrap_or("?"),
+            a.model_short()
+                .map(|m| format!(" · {m}"))
+                .unwrap_or_default(),
             util::trunc(a.title.as_deref().unwrap_or("(no title)"), 70)
         )),
         Span::styled(

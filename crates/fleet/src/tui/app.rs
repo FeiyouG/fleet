@@ -6,13 +6,17 @@ use super::util;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use crossterm::{execute, terminal};
+use fleet_core::agents::{Choices, SendMsg, CHOICES_TTL};
 use fleet_core::cmd;
 use fleet_core::model::Fleet;
 use fleet_core::{tmux, Config, Engine};
 use futures::StreamExt;
 use ratatui::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +43,21 @@ pub struct App {
     pub quit: bool,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<Msg>,
+    /// Modes/models per (adapter, directory), loaded in the background when a popup needs
+    /// them, with the time they arrived. `Err` = discovery failed (shown in the popup, and
+    /// retried the next time a popup asks).
+    pub choices: HashMap<ChoicesKey, (Instant, std::result::Result<Choices, String>)>,
+    /// Keys being loaded right now (no duplicate discovery while one runs).
+    choices_loading: HashSet<ChoicesKey>,
 }
+
+/// `(adapter name, directory)`: what a mode/model list depends on.
+pub type ChoicesKey = (String, PathBuf);
 
 pub enum Msg {
     Snapshot(Fleet),
     Status(String, bool),
+    Choices(ChoicesKey, std::result::Result<Choices, String>),
     /// Suspend the TUI, run the closure (blocking, owns the terminal), then resume.
     Suspend(Box<dyn FnOnce() -> Result<()> + Send>),
     /// A close plan computed in the background (git reads): open its confirm popup.
@@ -101,6 +115,8 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
         loading: true,
         quit: false,
         tx,
+        choices: HashMap::new(),
+        choices_loading: HashSet::new(),
     };
 
     let mut term = enter()?;
@@ -125,6 +141,10 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
                     Some(Msg::Status(s, err)) => app.set_status(s, err),
                     Some(Msg::ClosePlan(p)) => { app.status_line = None; app.popup = Some(Popup::close(p)); }
                     Some(Msg::GcPlan(p)) => { app.status_line = None; app.popup = Some(Popup::gc(p)); }
+                    Some(Msg::Choices(key, c)) => {
+                        app.choices_loading.remove(&key);
+                        app.choices.insert(key, (Instant::now(), c));
+                    }
                     Some(Msg::Suspend(work)) => {
                         leave(&mut term)?;
                         let r = work();
@@ -172,6 +192,38 @@ fn leave(term: &mut Term) -> Result<()> {
 impl App {
     pub fn set_status(&mut self, s: String, err: bool) {
         self.status_line = Some((s, err));
+    }
+
+    /// Load the modes/models `adapter` offers in `dir` unless a fresh answer is already here.
+    /// A failed load, or one older than [`CHOICES_TTL`], is loaded again; the old answer
+    /// stays on screen until the new one arrives.
+    pub fn want_choices(&mut self, adapter: &str, dir: PathBuf) {
+        let key: ChoicesKey = (adapter.to_string(), dir);
+        if !choices_stale(self.choices.get(&key), Instant::now())
+            || !self.choices_loading.insert(key.clone())
+        {
+            return;
+        }
+        let engine = self.engine.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = match engine.agent_adapter(&key.0) {
+                Some(a) => a.choices(&key.1).await.map_err(|e| format!("{e:#}")),
+                None => Err(format!("agent `{}` is not enabled", key.0)),
+            };
+            let _ = tx.send(Msg::Choices(key, r));
+        });
+    }
+
+    /// Loaded choices for `(adapter, dir)`: `None` = still loading.
+    pub fn choices_for(
+        &self,
+        adapter: &str,
+        dir: &std::path::Path,
+    ) -> Option<&std::result::Result<Choices, String>> {
+        self.choices
+            .get(&(adapter.to_string(), dir.to_path_buf()))
+            .map(|(_, c)| c)
     }
 
     pub fn request_refresh(&self) {
@@ -322,10 +374,20 @@ impl App {
             GotoWorktree | ReviewGotoWorktrees => self.goto(Tab::Worktrees),
             GotoReview => self.goto(Tab::Reviews),
             AgentAttach => self.attach_selected().await?,
-            AgentStart => self.popup = Some(Popup::start(&self.cfg)),
+            AgentStart => {
+                let p = Popup::start(&self.cfg);
+                if let Popup::Start(f) = &p {
+                    if let Some(dir) = f.repo_dir(&self.cfg) {
+                        let agent = f.agent().to_string();
+                        self.want_choices(&agent, dir);
+                    }
+                }
+                self.popup = Some(p);
+            }
             AgentSend => {
-                if self.selected_send_target().is_some() {
-                    self.popup = Some(Popup::message(self.selected_name()));
+                if let Some(row) = self.selected_send_target() {
+                    self.want_choices(&row.adapter, row.cwd.clone());
+                    self.popup = Some(Popup::message(self.selected_name(), row));
                 } else {
                     self.set_status("no running agent on this row".into(), true);
                 }
@@ -455,6 +517,7 @@ impl App {
                 repo,
                 agent,
                 mode,
+                model,
             } => {
                 let engine = self.engine.clone();
                 self.spawn("start", async move {
@@ -466,6 +529,7 @@ impl App {
                             repo,
                             agent,
                             mode,
+                            model,
                             base: None,
                             nvim: None,
                             attach: false,
@@ -479,7 +543,12 @@ impl App {
                     ))
                 });
             }
-            Message { name, text } => {
+            Message {
+                name,
+                text,
+                mode,
+                model,
+            } => {
                 let target = self.selected_send_target();
                 let engine = self.engine.clone();
                 match target {
@@ -487,8 +556,19 @@ impl App {
                         let a = engine.agent_adapter(&row.adapter).ok_or_else(|| {
                             anyhow::anyhow!("agent `{}` is not enabled", row.adapter)
                         })?;
-                        a.send(&row, &text).await?;
-                        Ok(format!("sent to {name}"))
+                        let what = [mode.as_deref(), model.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        let msg = SendMsg { text, model, mode };
+                        cmd::send::check_override(a, &row.cwd, &msg, &cmd::quiet()).await?;
+                        a.send(&row, &msg).await?;
+                        Ok(if what.is_empty() {
+                            format!("sent to {name}")
+                        } else {
+                            format!("sent to {name} ({what})")
+                        })
                     }),
                     None => self.set_status("no running agent".into(), true),
                 }
@@ -799,5 +879,33 @@ impl App {
 
     pub fn selected_send_target(&self) -> Option<fleet_core::model::AgentRow> {
         tabs::selected_send_target(self)
+    }
+}
+
+/// Does a cached mode/model answer need loading (again)? Missing, failed, or older than
+/// [`CHOICES_TTL`].
+fn choices_stale(
+    entry: Option<&(Instant, std::result::Result<Choices, String>)>,
+    now: Instant,
+) -> bool {
+    match entry {
+        None => true,
+        Some((_, Err(_))) => true,
+        Some((at, Ok(_))) => now.duration_since(*at) >= CHOICES_TTL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choices_reload_on_error_and_after_ttl() {
+        let t0 = Instant::now();
+        assert!(choices_stale(None, t0));
+        assert!(choices_stale(Some(&(t0, Err("timed out".into()))), t0));
+        let ok = (t0, Ok(Choices::default()));
+        assert!(!choices_stale(Some(&ok), t0));
+        assert!(choices_stale(Some(&ok), t0 + CHOICES_TTL));
     }
 }

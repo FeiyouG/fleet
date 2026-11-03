@@ -19,7 +19,10 @@ pub struct StartOpts {
     pub repo: String,
     /// Adapter name; `None` = `defaults.agent`.
     pub agent: Option<String>,
+    /// `plan` | `build` | an adapter-specific mode; `None` = `defaults.mode`.
     pub mode: Option<String>,
+    /// Model in the adapter's naming; `None` = `agents.<name>.model`, else the CLI's default.
+    pub model: Option<String>,
     pub base: Option<String>,
     pub nvim: Option<bool>,
     pub attach: bool,
@@ -98,8 +101,18 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         .mode
         .clone()
         .unwrap_or_else(|| cfg.defaults.mode.clone());
-    let mode = Mode::parse(&mode_s)
-        .with_context(|| format!("mode must be plan or build, got `{mode_s}`"))?;
+    let mode = Mode::parse(&mode_s).context("empty mode")?;
+    // `None` = the adapter's configured model (`agents.<name>.model`), else its CLI's own.
+    let model = opts.model.clone();
+    let effective_model = model.clone().or_else(|| cfg.agents.get(&agent_name).model);
+    // Check mode and model against what the adapter offers in this repo. If discovery
+    // itself fails (CLI slow or missing), go ahead: the CLI reports a bad name itself.
+    match adapter.choices(&repo.repo).await {
+        Ok(c) => c.check(Some(mode.as_str()), effective_model.as_deref())?,
+        Err(e) => log(&format!(
+            "could not list {agent_name} modes/models ({e:#}); not checking"
+        )),
+    }
 
     log(&format!("fetch origin {base}"));
     git::fetch(&repo.repo, "origin", &base).await?;
@@ -138,6 +151,7 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     let cmd = adapter.launch(&LaunchSpec {
         cwd: path.clone(),
         mode,
+        model,
         prompt: full_prompt,
         port,
     });

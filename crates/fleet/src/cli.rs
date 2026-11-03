@@ -92,8 +92,28 @@ enum AgentCmd {
     },
     /// Switch/attach tmux to the agent's session
     Attach { name: String },
-    /// Send a message to a running agent
-    Send { name: String, text: Vec<String> },
+    /// Send a message to a running agent (optionally with another mode and/or model)
+    Send {
+        name: String,
+        text: Vec<String>,
+        /// Use this mode for the message: plan | build | an opencode agent
+        #[arg(long)]
+        mode: Option<String>,
+        /// Use this model for the message (opencode: provider/model; `fleet agent choices`)
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// List the modes and models an agent can use in a repo
+    Choices {
+        /// Repo name from config (default: the cwd's repo, else the only repo)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Which agent: opencode | claude | codex (default: defaults.agent)
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Rename a fleet-started task: branch, folder (+symlink), tmux session, registry
     Rename { old: String, new: String },
     /// Kill the agent pane (keeps the worktree)
@@ -116,9 +136,12 @@ struct StartArgs {
     /// Which agent to launch: opencode | claude | codex (default: defaults.agent)
     #[arg(long)]
     agent: Option<String>,
-    /// plan | build
+    /// plan | build, or an opencode agent (`fleet agent choices` lists them)
     #[arg(long)]
     mode: Option<String>,
+    /// Model in the agent's naming, e.g. opencode provider/model (default: agents.<name>.model)
+    #[arg(long)]
+    model: Option<String>,
     /// Base branch (default: repo's `base`, usually main)
     #[arg(long)]
     base: Option<String>,
@@ -811,6 +834,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     repo,
                     agent: args.agent,
                     mode: args.mode,
+                    model: args.model,
                     base: args.base,
                     nvim: if args.no_nvim { Some(false) } else { None },
                     attach: !args.no_attach,
@@ -838,8 +862,8 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                 return print_json(&f.overview);
             }
             println!(
-                "{:<10} {:<26} {:<14} {:<26} {:<18} {:<26} {}",
-                "OVERALL", "NAME", "REPO", "BRANCH", "AGENT", "TMUX", "REVIEW"
+                "{:<10} {:<26} {:<14} {:<26} {:<18} {:<20} {:<26} {}",
+                "OVERALL", "NAME", "REPO", "BRANCH", "AGENT", "MODEL", "TMUX", "REVIEW"
             );
             for r in &f.overview {
                 let w = r.worktree.as_ref();
@@ -869,25 +893,31 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     .first()
                     .map(|x| format!("{} {}", x.display_id, x.status.label()))
                     .unwrap_or("—".into());
+                let model = first.and_then(|a| a.model_short()).unwrap_or("—");
                 println!(
-                    "{:<10} {:<26} {:<14} {:<26} {:<18} {:<26} {}",
+                    "{:<10} {:<26} {:<14} {:<26} {:<18} {:<20} {:<26} {}",
                     r.overall.label(),
                     trunc(&r.name(), 26),
                     trunc(r.repo().unwrap_or("—"), 14),
                     trunc(&branch, 26),
                     trunc(&agent, 18),
+                    trunc(model, 20),
                     trunc(&pane, 26),
                     review
                 );
                 for a in r.agents.iter().skip(1) {
                     println!(
-                        "{:<10}   ↳ {:<22} {:<14} {:<26} {} {}",
+                        "{:<10}   ↳ {:<22} {:<14} {:<26} {:<18} {}",
                         "",
                         "",
                         "",
                         "",
-                        a.mode.as_deref().unwrap_or("?"),
-                        a.activity.label()
+                        format!(
+                            "{} {}",
+                            a.mode.as_deref().unwrap_or("?"),
+                            a.activity.label()
+                        ),
+                        a.model_short().unwrap_or("—")
                     );
                 }
             }
@@ -897,10 +927,60 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
             Ok(())
         }
         AgentCmd::Attach { name } => send::attach(&snapshot(&cfg).await, &name).await,
-        AgentCmd::Send { name, text } => {
+        AgentCmd::Send {
+            name,
+            text,
+            mode,
+            model,
+        } => {
             let engine = Engine::new(cfg).merged_lookups(false);
             let f = engine.snapshot(false).await;
-            send::send(&engine, &f, &name, &text.join(" ")).await
+            let msg = fleet_core::agents::SendMsg {
+                text: text.join(" "),
+                model,
+                mode,
+            };
+            send::send(&engine, &f, &name, &msg, &progress()).await
+        }
+        AgentCmd::Choices { repo, agent, json } => {
+            let repo = repo
+                .or(project)
+                .or_else(|| cwd_repo(&cfg))
+                .context("pass --repo <name>")?;
+            let dir = cfg
+                .project(&repo)
+                .with_context(|| format!("repo `{repo}` is not in config"))?
+                .repo
+                .clone();
+            let agent = agent.unwrap_or_else(|| cfg.defaults.agent.clone());
+            let configured = cfg.agents.get(&agent).model;
+            let engine = Engine::new(cfg);
+            let adapter = engine
+                .agent_adapter(&agent)
+                .with_context(|| format!("agent `{agent}` is not enabled"))?;
+            let c = adapter.choices(&dir).await?;
+            if json {
+                return print_json(&c);
+            }
+            for (i, a) in c.agents.iter().enumerate() {
+                println!(
+                    "{:<8} {:<12} default model: {}",
+                    if i == 0 { "modes" } else { "" },
+                    a.name,
+                    configured
+                        .as_deref()
+                        .map(|m| format!("{m} (agents.{agent}.model)"))
+                        .or_else(|| c.default_for(&a.name).map(String::from))
+                        .unwrap_or_else(|| format!("({agent} decides)"))
+                );
+            }
+            if c.models.is_empty() {
+                println!("models   ({agent} can't list them; any name is passed through)");
+            }
+            for (i, m) in c.models.iter().enumerate() {
+                println!("{:<8} {m}", if i == 0 { "models" } else { "" });
+            }
+            Ok(())
         }
         AgentCmd::Rename { old, new } => {
             let r = rename::rename(&cfg, &old, &new, &progress()).await?;

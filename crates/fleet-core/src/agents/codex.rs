@@ -3,7 +3,7 @@
 //! and `~/.codex/session_index.jsonl` (thread names). Messages via `codex queue`.
 
 use super::hooked::{self, Fallback};
-use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode};
+use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg};
 use crate::config::{home, AgentConfig};
 use crate::model::AgentRow;
 use crate::procs::{canon, ProcTable};
@@ -142,8 +142,9 @@ impl AgentAdapter for Codex {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> String {
+        // Only `build` may write; anything else (choices rejects other names) is read-only.
         let sandbox = match spec.mode {
-            Mode::Plan => "read-only".to_string(),
+            Mode::Plan | Mode::Custom(_) => "read-only".to_string(),
             Mode::Build => self
                 .cfg
                 .sandbox
@@ -159,12 +160,17 @@ impl AgentAdapter for Codex {
             "--sandbox".into(),
             sandbox,
         ];
+        if let Some(m) = spec.model.as_ref().or(self.cfg.model.as_ref()) {
+            parts.extend(["--model".to_string(), m.clone()]);
+        }
         parts.extend(self.cfg.args.iter().cloned());
         parts.push(spec.prompt.clone());
         shell_line(parts)
     }
 
-    async fn send(&self, agent: &AgentRow, text: &str) -> Result<()> {
+    async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
+        super::reject_override("codex", msg)?;
+        let text = msg.text.as_str();
         if let Some(id) = &agent.session_id {
             let out = Command::new(self.bin())
                 .args(["queue", "--thread", id, "--message", text])
@@ -201,6 +207,7 @@ mod tests {
         let s = c.launch(&LaunchSpec {
             cwd: "/w t".into(),
             mode: Mode::Plan,
+            model: None,
             prompt: "hi".into(),
             port: 0,
         });
@@ -208,6 +215,14 @@ mod tests {
             s,
             "codex --cd '/w t' --ask-for-approval on-request --sandbox read-only hi"
         );
+        let s = c.launch(&LaunchSpec {
+            cwd: "/w".into(),
+            mode: Mode::Custom("reviewer".into()),
+            model: Some("gpt-5.4".into()),
+            prompt: "hi".into(),
+            port: 0,
+        });
+        assert!(s.contains("--sandbox read-only --model gpt-5.4 hi"), "{s}");
         let c = Codex::new(AgentConfig {
             sandbox: Some("danger-full-access".into()),
             ..Default::default()
@@ -216,6 +231,7 @@ mod tests {
             .launch(&LaunchSpec {
                 cwd: "/w".into(),
                 mode: Mode::Build,
+                model: None,
                 prompt: "x".into(),
                 port: 0
             })

@@ -1268,6 +1268,7 @@ mod tests {
             session_id: Some("ses_1".into()),
             title: None,
             mode: None,
+            model: None,
             activity: Activity::Working,
             running_tool: None,
             plan_url: None,
@@ -1276,6 +1277,8 @@ mod tests {
             last_activity: None,
             pane_target: pane.map(String::from),
             pending: vec![],
+            control_url: None,
+            control_token: None,
         }
     }
 

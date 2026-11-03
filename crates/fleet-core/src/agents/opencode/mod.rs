@@ -1,18 +1,19 @@
 //! The opencode adapter: procs + sqlite + (optional) HTTP + Plannotator probe -> `AgentRow`.
 
+pub mod choices;
 pub mod db;
 pub mod http;
 pub mod plannotator;
 
 use super::state_file::{self, AgentState};
-use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec};
+use super::{shell_line, AgentAdapter, Choices, DiscoverCtx, HookInstall, LaunchSpec, SendMsg};
 use crate::config::AgentConfig;
 use crate::model::{Activity, AgentRow};
 use crate::procs::{canon, ProcTable};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct OpenCode {
     pub cfg: AgentConfig,
@@ -68,6 +69,7 @@ pub fn row_from_facts(
     state: Option<&AgentState>,
 ) -> AgentRow {
     let pending = state.map(|s| s.pending()).unwrap_or_default();
+    let control = state.and_then(|s| s.control());
     let activity = if plan.is_some() {
         Activity::WaitPlan
     } else if !pending.is_empty() || live.map(|l| l.pending_permission).unwrap_or(false) {
@@ -90,6 +92,7 @@ pub fn row_from_facts(
         session_id: session.map(|s| s.id.clone()),
         title: session.map(|s| s.title.clone()).filter(|t| !t.is_empty()),
         mode: session.and_then(|s| s.mode.clone()),
+        model: session.and_then(|s| s.model.clone()),
         activity,
         running_tool: session.and_then(|s| s.running_tool.clone()),
         plan_url: plan.map(|p| p.url.clone()),
@@ -107,6 +110,8 @@ pub fn row_from_facts(
                 }
             })
             .collect(),
+        control_url: control.as_ref().map(|c| c.0.clone()),
+        control_token: control.map(|c| c.1),
     }
 }
 
@@ -220,17 +225,34 @@ impl AgentAdapter for OpenCode {
             "--agent".into(),
             spec.mode.as_str().into(),
         ];
+        if let Some(m) = spec.model.as_ref().or(self.cfg.model.as_ref()) {
+            parts.push("--model".into());
+            parts.push(m.clone());
+        }
         parts.extend(self.cfg.args.iter().cloned());
         parts.push("--prompt".into());
         parts.push(spec.prompt.clone());
         shell_line(parts)
     }
 
-    async fn send(&self, agent: &AgentRow, text: &str) -> Result<()> {
-        match agent.port {
-            Some(p) if http::is_opencode(p).await => http::submit_prompt(p, text).await,
-            _ => super::send_via_tmux(agent, text).await,
+    /// Through the fleet plugin's control endpoint when the process has one (plain and
+    /// override messages alike land in its current session); else tmux keystrokes, which
+    /// can't switch mode or model.
+    async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
+        if let (Some(url), Some(token)) = (&agent.control_url, &agent.control_token) {
+            return http::control_send(url, token, msg).await;
         }
+        if msg.has_override() {
+            anyhow::bail!(
+                "this agent has no fleet control endpoint, so its mode/model can't be switched: \
+                 run `fleet setup` and restart the agent"
+            );
+        }
+        super::send_via_tmux(agent, &msg.text).await
+    }
+
+    async fn choices(&self, cwd: &Path) -> Result<Choices> {
+        choices::choices(&self.bin(), cwd).await
     }
 
     fn hook_install(&self) -> Option<HookInstall> {
@@ -263,6 +285,7 @@ mod tests {
             updated: Utc::now(),
             last_completed: completed,
             running_tool: tool.map(String::from),
+            model: Some("anthropic/claude-opus-5-5".into()),
         }
     }
 
@@ -338,14 +361,46 @@ mod tests {
     #[test]
     fn launch_line_is_shell_safe() {
         let oc = OpenCode::new(AgentConfig::default());
-        let s = oc.launch(&LaunchSpec {
+        let mut spec = LaunchSpec {
             cwd: "/w".into(),
             mode: Mode::Plan,
+            model: None,
             prompt: "Fix the \"thing\"\n\nwith newlines".into(),
             port: 4096,
-        });
+        };
+        let s = oc.launch(&spec);
         assert!(s.starts_with("opencode --port 4096 --agent plan --prompt "));
         let back = shell_words::split(&s).unwrap();
         assert_eq!(back.last().unwrap(), "Fix the \"thing\"\n\nwith newlines");
+        // configured model, overridden per launch; custom agents pass through
+        let oc = OpenCode::new(AgentConfig {
+            model: Some("anthropic/claude-opus-5-5".into()),
+            ..Default::default()
+        });
+        spec.mode = Mode::Custom("reviewer".into());
+        assert!(oc.launch(&spec).starts_with(
+            "opencode --port 4096 --agent reviewer --model anthropic/claude-opus-5-5 --prompt "
+        ));
+        spec.model = Some("openai/gpt-5.4".into());
+        assert!(oc
+            .launch(&spec)
+            .starts_with("opencode --port 4096 --agent reviewer --model openai/gpt-5.4 --prompt "));
+    }
+
+    #[test]
+    fn control_endpoint_from_state_file() {
+        let st = state_file::parse(r#"{"pid":1,"agent":"opencode","control_url":"http://127.0.0.1:9","token":"t","current_session":"ses_x","sessions":{"ses_x":{"status":"idle"}}}"#).unwrap();
+        let row = row_from_facts(
+            1,
+            "/w".into(),
+            Some(&sess(true, None)),
+            None,
+            None,
+            None,
+            Some(&st),
+        );
+        assert_eq!(row.control_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert_eq!(row.control_token.as_deref(), Some("t"));
+        assert_eq!(row.model.as_deref(), Some("anthropic/claude-opus-5-5"));
     }
 }

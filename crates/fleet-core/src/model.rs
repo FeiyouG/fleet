@@ -91,6 +91,9 @@ pub struct AgentRow {
     pub title: Option<String>,
     /// `plan` / `build` for opencode.
     pub mode: Option<String>,
+    /// `provider/model` the session last used.
+    #[serde(default)]
+    pub model: Option<String>,
     pub activity: Activity,
     /// The tool currently running, when `activity == Working`.
     pub running_tool: Option<String>,
@@ -105,6 +108,12 @@ pub struct AgentRow {
     /// Pending permission prompts (titles), from the fleet opencode plugin.
     #[serde(default)]
     pub pending: Vec<String>,
+    /// The fleet plugin's control endpoint in this process (messages, model switches).
+    #[serde(default)]
+    pub control_url: Option<String>,
+    /// Bearer token for `control_url`. Never serialised (`fleet status --json` is public).
+    #[serde(skip)]
+    pub control_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -399,4 +408,14 @@ pub struct Counts {
     pub needs_you: usize,
     pub failed: usize,
     pub ready: usize,
+}
+
+impl AgentRow {
+    /// The model without its provider (`anthropic/claude-opus-5-5` -> `claude-opus-5-5`),
+    /// for narrow columns.
+    pub fn model_short(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(|m| m.split_once('/').map(|(_, n)| n).unwrap_or(m))
+    }
 }

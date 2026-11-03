@@ -44,8 +44,18 @@ Lua 5.4 is embedded (sandboxed: `string`, `table`, `math`, `os.getenv`); the fil
 ```lua
 local home = os.getenv("HOME")
 return {
-  defaults = { mode = "plan", nvim_pane = true, notify = true, refresh_secs = 2, review_ttl_secs = 60 },
-  agent_args = {},                     -- extra args for opencode, e.g. { "--model", "anthropic/claude-opus-5" }
+  defaults = {
+    agent = "opencode",                -- required: adapter preselected by `fleet agent start`
+    mode = "plan",                     -- plan | build (every adapter), or an opencode agent (`fleet agent choices`)
+    nvim_pane = true, notify = true, refresh_secs = 2, review_ttl_secs = 60,
+  },
+  -- required: every adapter, explicitly. model = the model for new agents in that CLI's own
+  -- naming (unset = the CLI's default); args are appended to every launch.
+  agents = {
+    opencode = { enabled = true },     -- e.g. model = "anthropic/claude-opus-5-5"
+    claude   = { enabled = true },     -- e.g. model = "opus"
+    codex    = { enabled = false, sandbox = "workspace-write" },
+  },
   -- fleet:projects (fleet project add appends here)
   projects = {
     {
@@ -67,13 +77,25 @@ Discovery lists every worktree git knows for a project's repo wherever it lives;
 
 opencode's database never records a pending permission prompt ("allow this bash command?"), so without help such an agent looks like `WORKING`. `fleet setup` installs a ~60-line plugin into `~/.config/opencode/plugins/fleet.ts` that writes `~/.local/share/fleet/agents/<pid>.json` on permission/session events. With it, fleet shows `🔒 WAIT:perm` plus the prompt text, and knows each process's exact session. Sessions started before the install keep the old behaviour until restarted (`fleet setup --check` counts them). `fleet setup --remove` uninstalls.
 
+The plugin also opens a small control endpoint on `127.0.0.1` (random port, random bearer token, both in the state file, mode 0600). `fleet agent send` uses it: every message goes through opencode's session API into the session you last worked in, so a plain message and one with `--mode`/`--model` always land in the same session. A plain message keeps the session's agent and model; an override applies to that one turn (the TUI's own selector is unchanged; a toast says so). This works for any opencode process with the plugin, including ones you started by hand. opencode agents without it get tmux keystrokes and can't switch mode or model.
+
+### Modes and models
+
+Every adapter knows `plan` and `build`. `fleet agent choices [--repo P] [--agent A] [--json]` lists what you can pick in a project:
+
+- **opencode**: its primary agents (hidden internal ones dropped) as modes, each with its default model, and every model opencode has credentials for (`opencode models`, run in the repo so its `opencode.json` counts). `--mode` and `--model` are checked against this list.
+- **claude / codex**: `plan` and `build`; their CLIs can't list models, so any `--model` name is passed through (`--model` on their command line). They can't switch mode or model for a single message.
+
+The list is cached for 5 minutes (in memory and in `~/.local/share/fleet/cache/`, so separate `fleet` calls share it); a failed lookup is not cached. If the lookup itself fails, `start` and `send` warn and go ahead unchecked.
+
 ## Commands
 
 ```
 fleet [--project NAME]                 the TUI (default scope: the project containing the cwd, else all)
 fleet status [--short|--json]          one-shot snapshot (tmux status bar / scripts)
-fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--mode plan|build] [--no-nvim]
-fleet agent list | attach NAME | send NAME TEXT | rename OLD NEW | stop NAME
+fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--agent opencode|claude|codex] [--mode MODE] [--model MODEL] [--no-nvim]
+fleet agent send NAME TEXT [--mode MODE] [--model MODEL]
+fleet agent list | choices [--repo P] [--agent A] | attach NAME | rename OLD NEW | stop NAME
 fleet review list [--source S] | review start ID|URL        (re-review when it already exists)
 fleet worktree list | worktree gc [--yes]                   (dry run first)
 fleet worktree close TARGET [--force] [--yes] [--json]      (alias: fleet close; TARGET = task, folder, branch, session or path)
@@ -184,6 +206,8 @@ foldable section per project plus "outside projects". `:project [name|all]` and 
 
 `?` shows the full map after your `[keys]` overrides; prefix keys open a which-key menu.
 
+**Start popup** (`a s`): name, repo, agent (opencode/claude/codex), mode (`←`/`→` through that agent's modes), model (`Enter` opens a filterable picker: type `opus` or `gpt 5.4`; for claude/codex type the name; `Backspace` = default), prompt. **Message popup** (`a m`): `Tab` cycles the mode (`unchanged` → each mode), `C-o` picks a model; both default to unchanged, so a plain `Enter` sends as before.
+
 ## How it works
 
 `fleet-core` (no terminal code) runs three collector families concurrently and
@@ -191,7 +215,7 @@ joins them local-first:
 
 | family | adapter | reads |
 |---|---|---|
-| agents | opencode | process table, `~/.local/share/opencode/opencode.db` (read-only), the plugin's state files (`agents/<pid>.json`), the HTTP API of fleet-started agents, a `GET /api/plan` probe on each listening port (Plannotator) |
+| agents | opencode | process table, `~/.local/share/opencode/opencode.db` (read-only; session, activity, model of the last message), the plugin's state files (`agents/<pid>.json`, incl. its control endpoint), the HTTP API of fleet-started agents, a `GET /api/plan` probe on each listening port (Plannotator) |
 | reviews | gitlab, github | `glab api` / `gh pr list` + GraphQL threads: open MRs/PRs, approvals, resolved/unresolved threads (cached 60 s, refreshed in the background) |
 | worktrees | git | `git worktree list --porcelain`, status, ahead/behind |
 

@@ -87,9 +87,12 @@ pub struct AgentConfig {
     pub enabled: bool,
     /// Executable name or path. Defaults to the adapter name.
     pub bin: Option<String>,
-    /// Extra arguments appended to every launch.
+    /// Extra arguments appended to every launch. For the model use `model`.
     #[serde(deserialize_with = "lua_string_list")]
     pub args: Vec<String>,
+    /// Model for new agents, in this CLI's own naming (opencode `provider/model`, claude
+    /// `opus`, codex `gpt-5.4`). `None` = the CLI's own default.
+    pub model: Option<String>,
     /// Codex: `--sandbox` value for build mode (`workspace-write` by default).
     pub sandbox: Option<String>,
 }
@@ -100,6 +103,7 @@ impl Default for AgentConfig {
             enabled: true,
             bin: None,
             args: vec![],
+            model: None,
             sandbox: None,
         }
     }
@@ -339,11 +343,10 @@ impl Config {
                 enabled.join(", ")
             );
         }
-        if !["plan", "build"].contains(&self.defaults.mode.as_str()) {
-            bail!(
-                "defaults.mode must be plan or build, got \"{}\"",
-                self.defaults.mode
-            );
+        // plan | build work for every adapter; other names (an opencode agent) are checked
+        // against the adapter's own list when an agent starts.
+        if crate::agents::Mode::parse(&self.defaults.mode).is_none() {
+            bail!("defaults.mode is empty; use plan, build, or an opencode agent name");
         }
         Ok(())
     }
@@ -379,7 +382,7 @@ local home = os.getenv("HOME")
 return {
   defaults = {
     agent = "opencode",     -- adapter preselected by `fleet agent start`: opencode | claude | codex
-    mode = "plan",          -- plan (read-only) | build
+    mode = "plan",          -- plan (read-only) | build, or an opencode agent (`fleet agent choices`)
     nvim_pane = true,       -- open an nvim pane next to the agent
     notify = true,          -- macOS banner when an agent starts waiting for you
     refresh_secs = 2,
@@ -402,8 +405,10 @@ return {
   -- any enabled agent can run in any project. Both this table and defaults.agent are REQUIRED:
   -- fleet never assumes an adapter you did not write down.
   agents = {
-    opencode = { enabled = true, args = {} },          -- args appended to every launch, e.g. { "--model", "anthropic/claude-opus-5" }
-    claude   = { enabled = true, args = {} },
+    -- args are appended to every launch; model = the model for new agents in that CLI's naming
+    -- (unset = the CLI's own default; `fleet agent choices --agent NAME` lists what it offers)
+    opencode = { enabled = true, args = {} },          -- e.g. model = "anthropic/claude-opus-5-5"
+    claude   = { enabled = true, args = {} },          -- e.g. model = "opus"
     codex    = { enabled = true, args = {}, sandbox = "workspace-write" },
   },
 
@@ -509,9 +514,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.agents.enabled(), vec!["opencode"]);
-        let c = Config::from_lua(r#"return { defaults = { agent = "claude" }, agents = { claude = { args = { "--model", "x" } }, codex = { enabled = false } } }"#, "t").unwrap();
+        let c = Config::from_lua(r#"return { defaults = { agent = "claude", mode = "reviewer" }, agents = { claude = { args = { "--verbose" }, model = "opus" }, codex = { enabled = false } } }"#, "t").unwrap();
         assert_eq!(c.agents.enabled(), vec!["claude"]);
-        assert_eq!(c.agents.get("claude").args, vec!["--model", "x"]);
+        assert_eq!(c.agents.get("claude").args, vec!["--verbose"]);
+        assert_eq!(c.agents.get("claude").model.as_deref(), Some("opus"));
+        assert_eq!(c.agents.get("opencode").model, None);
+        assert_eq!(c.defaults.mode, "reviewer");
         // No file at all: builtin set, opencode preselected (bootstrap only).
         assert_eq!(Config::default().agents.enabled().len(), 3);
         assert!(Config::default().validate().is_ok());

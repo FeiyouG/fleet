@@ -2,7 +2,7 @@
 //! Re-review when the task already exists.
 
 use super::{free_port, Progress};
-use crate::agents::{LaunchSpec, Mode};
+use crate::agents::{LaunchSpec, Mode, SendMsg};
 use crate::config::Project;
 use crate::registry::{Registry, Task};
 use crate::snapshot::Engine;
@@ -136,6 +136,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
                 session_id: None,
                 title: None,
                 mode: None,
+                model: None,
                 activity: crate::model::Activity::Idle,
                 running_tool: None,
                 plan_url: None,
@@ -148,9 +149,11 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
                     if cfg.defaults.nvim_pane { 1 } else { 0 }
                 )),
                 pending: vec![],
+                control_url: None,
+                control_token: None,
             });
         log(&format!("send via {}", task.agent));
-        task_agent.send(&row, &text).await?;
+        task_agent.send(&row, &SendMsg::text(text)).await?;
         if opts.attach {
             tmux::attach(&task.tmux_session).await?;
         }
@@ -206,6 +209,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     let cmd = agent.launch(&LaunchSpec {
         cwd: path.clone(),
         mode: Mode::Plan,
+        model: None,
         prompt,
         port,
     });
