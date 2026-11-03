@@ -141,11 +141,15 @@ Before applying, gc plans again and skips an item that changed since the dry run
 started there meanwhile). Only `worktree list` and `worktree gc` ask the forge about merged
 MRs/PRs per branch; `fleet status` (status bar) makes one call per project.
 
-### tmux status bar
+### tmux status bar and a key to reach fleet
 
 ```tmux
 set -g status-interval 15
 set -g status-right '#(fleet status --short) | %H:%M'
+
+# prefix f from any session: a dedicated `fleet` session running the TUI (created on first
+# use, kept between visits). Enter on a row switches to that agent's session; prefix f comes back.
+bind-key f if-shell 'tmux has-session -t =fleet' 'switch-client -t fleet' 'new-session -d -s fleet -c ~ fleet \; switch-client -t fleet'
 ```
 
 ## TUI
