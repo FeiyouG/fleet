@@ -212,20 +212,27 @@ impl ReviewAdapter for GitLab {
     }
 
     async fn open_reviews(&self) -> Result<Vec<ReviewRow>> {
-        let v = self
-            .api(&format!(
-                "projects/{}/merge_requests?state=opened&per_page=100&order_by=updated_at",
-                self.enc()
-            ))
-            .await?;
-        let base: Vec<ReviewRow> = v
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| row_from_mr(&self.source, m))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Offset pages of 100 until a short page: a project with more than 100 open MRs must
+        // not silently show the newest 100 only.
+        let mut base: Vec<ReviewRow> = vec![];
+        for page in 1.. {
+            let v = self
+                .api(&format!(
+                    "projects/{}/merge_requests?state=opened&per_page=100&page={page}&order_by=updated_at",
+                    self.enc()
+                ))
+                .await?;
+            let got = v.as_array().map(Vec::len).unwrap_or(0);
+            base.extend(
+                v.as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| row_from_mr(&self.source, m)),
+            );
+            if got < 100 {
+                break;
+            }
+        }
         // Enrich concurrently (one /approvals + one /discussions per MR).
         let futs: Vec<_> = base.into_iter().map(|r| self.enrich(r)).collect();
         Ok(futures_join_all(futs).await)

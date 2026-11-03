@@ -8,7 +8,21 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::process::Command;
 
-const FIELDS: &str = "number,title,author,headRefName,baseRefName,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefOid,url,updatedAt,reviews";
+/// PRs per GraphQL page. Measured on monid-ai/monid (134 open PRs, CodeRabbit on every one):
+/// 30 answers in ~2.5 s every time, 50 hits GitHub's gateway timeout (HTTP 502) about half the
+/// time, 100 always. `gh pr list --limit 100` (the previous path) therefore returned nothing.
+const PAGE: u32 = 30;
+
+/// Everything a `ReviewRow` needs, in one node, with nothing heavy: no review bodies
+/// (`reviews`, which drags every CodeRabbit comment along), no `reviewDecision` (3 s per page by
+/// itself; `latestReviews` carries the same approvals), no per-check contexts (only the
+/// rollup state). Thread counts ride along, so the list needs no per-PR follow-up call.
+const PR_FIELDS: &str =
+    "number title url updatedAt state isDraft mergeable headRefName baseRefName headRefOid \
+author{login} \
+latestReviews(first:20){nodes{state author{login}}} \
+reviewThreads(first:100){totalCount nodes{isResolved}} \
+commits(last:1){nodes{commit{statusCheckRollup{state}}}}";
 
 pub struct GitHub {
     /// `owner/repo`
@@ -45,28 +59,80 @@ impl GitHub {
             .with_context(|| format!("parsing gh {}", args.join(" ")))
     }
 
-    async fn threads(&self, number: u64) -> Threads {
+    /// `gh api graphql` with `$owner`/`$name` bound to this repo plus `extra` variables.
+    async fn graphql(&self, query: &str, extra: &[(&str, &str)]) -> Result<Value> {
         let (owner, name) = self.owner_name();
-        let q = format!(
-            "query {{ repository(owner:\"{owner}\", name:\"{name}\") {{ pullRequest(number:{number}) {{ reviewThreads(first:100) {{ totalCount nodes {{ isResolved }} }} }} }} }}"
-        );
-        self.gh(&["api", "graphql", "-f", &format!("query={q}")])
-            .await
-            .map(|v| threads_from(&v))
-            .unwrap_or_default()
+        let mut args: Vec<String> = vec![
+            "api".into(),
+            "graphql".into(),
+            "-F".into(),
+            format!("owner={owner}"),
+            "-F".into(),
+            format!("name={name}"),
+        ];
+        for (k, v) in extra {
+            args.push("-F".into());
+            args.push(format!("{k}={v}"));
+        }
+        args.push("-f".into());
+        args.push(format!("query={query}"));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let v = self.gh(&refs).await?;
+        if let Some(errs) = v.get("errors").and_then(Value::as_array) {
+            if let Some(m) = errs
+                .first()
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+            {
+                bail!("gh api graphql: {m}");
+            }
+        }
+        Ok(v)
     }
 
-    async fn enrich(&self, mut row: ReviewRow) -> ReviewRow {
-        if !row.status.is_done() {
-            row.threads = self.threads(row.id).await;
+    /// One page of open PRs, newest activity first. `after` is the previous page's cursor.
+    async fn page(&self, after: Option<&str>) -> Result<(Vec<ReviewRow>, Option<String>)> {
+        let q = format!(
+            "query($owner:String!,$name:String!,$n:Int!,$after:String){{repository(owner:$owner,name:$name){{\
+             pullRequests(states:OPEN,first:$n,after:$after,orderBy:{{field:UPDATED_AT,direction:DESC}}){{\
+             pageInfo{{hasNextPage endCursor}} nodes{{{PR_FIELDS}}}}}}}}}"
+        );
+        let n = PAGE.to_string();
+        let mut vars = vec![("n", n.as_str())];
+        if let Some(c) = after {
+            vars.push(("after", c));
         }
-        row
+        let v = self.graphql(&q, &vars).await?;
+        let prs = v
+            .pointer("/data/repository/pullRequests")
+            .context("unexpected graphql shape")?;
+        let rows = prs
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| row_from_node(&self.source, p))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let next = prs
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then(|| {
+                prs.pointer("/pageInfo/endCursor")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .flatten();
+        Ok((rows, next))
     }
 }
 
-/// `reviewThreads` GraphQL payload -> counts. GitHub threads are always resolvable.
-pub fn threads_from(v: &Value) -> Threads {
-    let Some(rt) = v.pointer("/data/repository/pullRequest/reviewThreads") else {
+/// `reviewThreads{totalCount nodes{isResolved}}` on a PR node -> counts. GitHub threads are
+/// always resolvable.
+pub fn threads_of(pr: &Value) -> Threads {
+    let Some(rt) = pr.get("reviewThreads") else {
         return Threads::default();
     };
     let nodes = rt
@@ -93,42 +159,26 @@ pub fn threads_from(v: &Value) -> Threads {
     }
 }
 
-/// Pure: one `gh pr list --json` object -> `ReviewRow` (threads filled later).
-pub fn row_from_pr(source: &str, pr: &Value) -> Option<ReviewRow> {
+/// Pure: one GraphQL `PullRequest` node (see `PR_FIELDS`) -> `ReviewRow`.
+pub fn row_from_node(source: &str, pr: &Value) -> Option<ReviewRow> {
     let number = pr.get("number")?.as_u64()?;
     let draft = pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false);
     let state = pr.get("state").and_then(Value::as_str).unwrap_or("OPEN");
-    let checks = pr
-        .get("statusCheckRollup")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let ci = if checks.is_empty() {
-        Ci::None
-    } else if checks.iter().any(|c| {
-        matches!(
-            c.get("conclusion").and_then(Value::as_str),
-            Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
-        ) || c.get("state").and_then(Value::as_str) == Some("FAILURE")
-    }) {
-        Ci::Failed
-    } else if checks.iter().any(|c| {
-        matches!(
-            c.get("status").and_then(Value::as_str),
-            Some("IN_PROGRESS") | Some("QUEUED") | Some("PENDING")
-        ) || c.get("state").and_then(Value::as_str) == Some("PENDING")
-    }) {
-        Ci::Running
-    } else {
-        Ci::Passed
+    // Combined state of the head commit's checks + statuses; null when there are none.
+    let ci = match pr
+        .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+        .and_then(Value::as_str)
+    {
+        None => Ci::None,
+        Some("SUCCESS") => Ci::Passed,
+        Some("FAILURE") | Some("ERROR") => Ci::Failed,
+        Some("PENDING") | Some("EXPECTED") => Ci::Running,
+        Some(_) => Ci::None,
     };
     let mergeable = pr.get("mergeable").and_then(Value::as_str).unwrap_or("");
-    let decision = pr
-        .get("reviewDecision")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    // Latest review per reviewer; an APPROVED one is a standing approval.
     let approvals: Vec<String> = pr
-        .get("reviews")
+        .pointer("/latestReviews/nodes")
         .and_then(Value::as_array)
         .map(|rs| {
             let mut v: Vec<String> = rs
@@ -151,7 +201,7 @@ pub fn row_from_pr(source: &str, pr: &Value) -> Option<ReviewRow> {
         _ if draft => ReviewStatus::Draft,
         _ if mergeable == "CONFLICTING" => ReviewStatus::Conflicts,
         _ if ci == Ci::Failed => ReviewStatus::CiFailed,
-        _ if decision == "APPROVED" || !approvals.is_empty() => ReviewStatus::Approved,
+        _ if !approvals.is_empty() => ReviewStatus::Approved,
         _ => ReviewStatus::Open,
     };
     Some(ReviewRow {
@@ -181,7 +231,7 @@ pub fn row_from_pr(source: &str, pr: &Value) -> Option<ReviewRow> {
         draft,
         ci,
         approvals,
-        threads: Threads::default(),
+        threads: threads_of(pr),
         status,
         head_sha: pr
             .get("headRefOid")
@@ -207,66 +257,47 @@ impl ReviewAdapter for GitHub {
         &self.source
     }
 
+    /// Every open PR, walking GraphQL pages of `PAGE` until exhausted (sequential: a page's
+    /// cursor comes from the previous one). A failing page fails the whole fetch, so the
+    /// caller shows the error instead of a silently short list.
     async fn open_reviews(&self) -> Result<Vec<ReviewRow>> {
-        let v = self
-            .gh(&[
-                "pr", "list", "-R", &self.repo, "--state", "open", "--limit", "100", "--json",
-                FIELDS,
-            ])
-            .await?;
-        let base: Vec<ReviewRow> = v
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| row_from_pr(&self.source, p))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut out = Vec::with_capacity(base.len());
-        let mut it = base.into_iter().peekable();
-        while it.peek().is_some() {
-            let chunk: Vec<_> = it.by_ref().take(8).map(|r| self.enrich(r)).collect();
-            out.extend(futures::future::join_all(chunk).await);
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let (rows, next) = self.page(after.as_deref()).await?;
+            out.extend(rows);
+            match next {
+                Some(c) => after = Some(c),
+                None => return Ok(out),
+            }
         }
-        Ok(out)
     }
 
     async fn review(&self, id: u64) -> Result<ReviewRow> {
-        let v = self
-            .gh(&[
-                "pr",
-                "view",
-                &id.to_string(),
-                "-R",
-                &self.repo,
-                "--json",
-                &format!("{FIELDS},state"),
-            ])
-            .await?;
-        let row = row_from_pr(&self.source, &v).context("unexpected PR json")?;
-        Ok(self.enrich(row).await)
+        let q = format!(
+            "query($owner:String!,$name:String!,$id:Int!){{repository(owner:$owner,name:$name){{\
+             pullRequest(number:$id){{{PR_FIELDS}}}}}}}"
+        );
+        let id_s = id.to_string();
+        let v = self.graphql(&q, &[("id", id_s.as_str())]).await?;
+        let node = v
+            .pointer("/data/repository/pullRequest")
+            .filter(|n| !n.is_null())
+            .with_context(|| format!("PR #{id} not found in {}", self.repo))?;
+        row_from_node(&self.source, node).context("unexpected PR json")
     }
 
     async fn merged_for_branch(&self, branch: &str) -> Result<Option<ReviewRow>> {
-        let v = self
-            .gh(&[
-                "pr",
-                "list",
-                "-R",
-                &self.repo,
-                "--head",
-                branch,
-                "--state",
-                "merged",
-                "--limit",
-                "1",
-                "--json",
-                "number,title,author,headRefName,baseRefName,headRefOid,url,updatedAt,state",
-            ])
-            .await?;
-        Ok(v.as_array()
+        let q = format!(
+            "query($owner:String!,$name:String!,$branch:String!){{repository(owner:$owner,name:$name){{\
+             pullRequests(states:MERGED,headRefName:$branch,first:1,orderBy:{{field:UPDATED_AT,direction:DESC}}){{\
+             nodes{{{PR_FIELDS}}}}}}}}}"
+        );
+        let v = self.graphql(&q, &[("branch", branch)]).await?;
+        Ok(v.pointer("/data/repository/pullRequests/nodes")
+            .and_then(Value::as_array)
             .and_then(|a| a.first())
-            .and_then(|p| row_from_pr(&self.source, p)))
+            .and_then(|p| row_from_node(&self.source, p)))
     }
 
     fn fetch_refspec(&self, id: u64) -> String {
@@ -301,32 +332,51 @@ impl ReviewAdapter for GitHub {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_prs() {
+    fn page_nodes() -> Vec<Value> {
         let v: Value =
-            serde_json::from_str(include_str!("../../../../fixtures/github-prs.json")).unwrap();
-        let rows: Vec<ReviewRow> = v
-            .as_array()
+            serde_json::from_str(include_str!("../../../../fixtures/github-pr-page.json")).unwrap();
+        v.pointer("/data/repository/pullRequests/nodes")
+            .and_then(Value::as_array)
+            .cloned()
             .unwrap()
-            .iter()
-            .filter_map(|p| row_from_pr("github:monid-ai/cli", p))
-            .collect();
-        assert_eq!(rows.len(), 3);
-        let r = rows.iter().find(|r| r.id == 27).unwrap();
-        assert_eq!(r.display_id, "#27");
-        assert_eq!(r.author, "FeiyouG");
-        assert_eq!(r.source_branch, "feat/rate-limit-errors");
-        assert_eq!(r.ci, Ci::Passed);
-        assert_eq!(r.status, ReviewStatus::Open);
-        assert!(r.approvals.is_empty()); // coderabbit only COMMENTED
     }
 
     #[test]
-    fn parses_threads() {
+    fn parses_page_nodes() {
+        let rows: Vec<ReviewRow> = page_nodes()
+            .iter()
+            .filter_map(|p| row_from_node("github:monid-ai/monid", p))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        // approved by a human (coderabbit only COMMENTED), CI green, 1 of 2 threads open
+        let r = &rows[0];
+        assert_eq!(r.display_id, "#225");
+        assert_eq!(r.approvals, vec!["FeiyouG"]);
+        assert_eq!(r.ci, Ci::Passed);
+        assert_eq!(r.status, ReviewStatus::Approved);
+        assert_eq!(
+            (r.threads.total, r.threads.resolved, r.threads.unresolved),
+            (2, 1, 1)
+        );
+        // CI failed beats approval-less open
+        let r = &rows[1];
+        assert_eq!(r.ci, Ci::Failed);
+        assert_eq!(r.status, ReviewStatus::CiFailed);
+        assert!(r.approvals.is_empty());
+        // draft, no checks at all
+        let r = &rows[2];
+        assert_eq!(r.ci, Ci::None);
+        assert_eq!(r.status, ReviewStatus::Draft);
+        assert_eq!(r.threads.total, 0);
+    }
+
+    #[test]
+    fn page_cursor() {
         let v: Value =
-            serde_json::from_str(include_str!("../../../../fixtures/github-threads.json")).unwrap();
-        let t = threads_from(&v);
-        assert_eq!((t.total, t.resolved, t.unresolved), (2, 0, 2));
+            serde_json::from_str(include_str!("../../../../fixtures/github-pr-page.json")).unwrap();
+        let info = v.pointer("/data/repository/pullRequests/pageInfo").unwrap();
+        assert_eq!(info["hasNextPage"], Value::Bool(true));
+        assert!(info["endCursor"].as_str().unwrap().starts_with("Y3Vyc29y"));
     }
 
     #[test]

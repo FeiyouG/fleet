@@ -743,11 +743,16 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         None => " · reviews loading…".to_string(),
     };
     spans.push(Span::styled(reviews_age, dim()));
-    if !app.fleet.warnings.is_empty() {
-        spans.push(Span::styled(
-            format!(" · ⚠ {}", app.fleet.warnings.len()),
-            Style::default().fg(Color::Red),
-        ));
+    if let Some(w) = app.fleet.warnings.first() {
+        // Show the first warning's text, not just a count: a failed reviews fetch would
+        // otherwise look like a project with no open reviews.
+        let more = app.fleet.warnings.len() - 1;
+        let text = if more > 0 {
+            format!(" · ⚠ {w} (+{more})")
+        } else {
+            format!(" · ⚠ {w}")
+        };
+        spans.push(Span::styled(text, Style::default().fg(Color::Red)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

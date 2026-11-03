@@ -162,28 +162,43 @@ pub fn build(app: &App) -> Vec<TreeNode> {
     let rows = scoped(app);
     match &app.tabs.project {
         Some(_) => rows.iter().map(|v| review_node(app, v)).collect(),
-        None => app
-            .cfg
-            .projects
-            .iter()
-            .filter_map(|p| {
-                let src = p.reviews.as_deref()?;
-                let mine: Vec<&ReviewView> = rows
-                    .iter()
-                    .copied()
-                    .filter(|r| r.review.source == src)
-                    .collect();
-                let local = mine.iter().filter(|r| !r.worktrees.is_empty()).count();
-                Some(TreeNode::new(
-                    RowKey::Project(p.name.clone()),
-                    NodeData::Project {
-                        name: p.name.clone(),
-                        summary: format!("{src} · {} open · {local} local", mine.len()),
-                    },
-                    mine.iter().map(|v| review_node(app, v)).collect(),
-                ))
-            })
-            .collect(),
+        None => {
+            app.cfg
+                .projects
+                .iter()
+                .filter_map(|p| {
+                    let src = p.reviews.as_deref()?;
+                    let mine: Vec<&ReviewView> = rows
+                        .iter()
+                        .copied()
+                        .filter(|r| r.review.source == src)
+                        .collect();
+                    let local = mine.iter().filter(|r| !r.worktrees.is_empty()).count();
+                    // A source whose fetch failed must not read as "0 open".
+                    let failed =
+                        app.fleet.warnings.iter().find_map(|w| {
+                            w.strip_prefix("reviews: ").filter(|w| w.starts_with(src))
+                        });
+                    let summary = match failed {
+                        Some(e) if mine.is_empty() => {
+                            format!(
+                                "{src} · ⚠ {} · {local} local",
+                                e.trim_start_matches(src).trim_start_matches(": ")
+                            )
+                        }
+                        _ => format!("{src} · {} open · {local} local", mine.len()),
+                    };
+                    Some(TreeNode::new(
+                        RowKey::Project(p.name.clone()),
+                        NodeData::Project {
+                            name: p.name.clone(),
+                            summary,
+                        },
+                        mine.iter().map(|v| review_node(app, v)).collect(),
+                    ))
+                })
+                .collect()
+        }
     }
 }
 
@@ -193,10 +208,16 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
         .map(|n| match &n.data {
             NodeData::Project { name, summary } => {
                 // summary is "source · N open · M local"
-                let mut parts = summary.split(" · ");
+                let mut parts = summary.splitn(3, " · ");
                 let source = parts.next().unwrap_or("").to_string();
                 let open = parts.next().unwrap_or("").to_string();
                 let local = parts.next().unwrap_or("").to_string();
+                // the middle part is either "N open" or "⚠ <error>"
+                let (open_text, open_style) = if open.starts_with('⚠') {
+                    (open.clone(), Style::default().fg(Color::Red))
+                } else {
+                    (open.clone(), dim())
+                };
                 Row::new(vec![
                     Cell::from(Span::styled(
                         if n.unfolded {
@@ -213,7 +234,7 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
                             .fg(Color::Cyan),
                     )),
                     Cell::from(""),
-                    Cell::from(Span::styled(open, dim())),
+                    Cell::from(Span::styled(open_text, open_style)),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
