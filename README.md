@@ -95,21 +95,29 @@ session and updates the registry. With a name, everything is named up front.
 
 ### Close a task
 
-`fleet close feat-x` (or `w x` on any row of that task in the TUI) finishes a task and removes
+`fleet worktree close feat-x` (alias `fleet close feat-x`; `w x` on any row of that task in the
+TUI) finishes a task and removes
 everything that belonged to it, in this order: close the registry task, remove rename symlinks,
 stop its agents, `git worktree remove`, delete the **local** branch, kill its tmux panes/sessions
 (a session that also has panes elsewhere loses only the task's panes). Remote branches are not
 touched. It works on any worktree, fleet-started or not; the target is a task name, folder name,
 branch, tmux session or path.
 
-It **refuses** (exit 1, nothing changed) and lists exactly what would be lost when the worktree
-has uncommitted or untracked files, commits that deleting the branch would lose, a running agent,
-or a `git worktree lock`. "Would lose" means reachable from no branch that exists on the remote
-*now* (`git ls-remote`, so a stale `origin/<branch>` left after the forge deleted a merged branch
-does not count), no tag and no other local branch. Commits inside a **merged** MR/PR of the branch
-(looked up on the forge with `glab`/`gh`; squash merges leave them behind) are a note, not a
-blocker; a commit added after the merge still blocks. `--force` closes anyway. The main clone is
-never closed. Without `--yes` it asks; without a terminal it is a dry run.
+It **refuses** (exit 1, nothing changed) and lists exactly what would be lost when:
+- the worktree has uncommitted or untracked files;
+- the branch is **not merged**: it has commits that are neither in the base branch (`main`:
+  local, `origin/main`, or the live remote tip) nor in a merged MR/PR of this branch. Squash
+  merges are recognised by asking the forge (`glab`/`gh`), and only when the PR's head commit
+  is really on this branch, so an old merged PR of a reused branch name does not count. A
+  commit added after the merge still blocks. Pushed is not enough;
+- an agent in it is **busy** (working, or waiting on a plan, question or permission). An
+  **idle** agent is just stopped, and fleet prints the command that resumes its conversation;
+- it is locked (`git worktree lock`).
+
+A detached checkout (`fleet review start` makes `review-N` that way) has no branch: it only
+blocks for commits that exist on no remote branch, tag or other local branch. `--force`
+closes anyway (TUI: `F` shows in red what will be lost, a second `F` closes; `Enter` does not).
+The main clone is never closed. Without `--yes` it asks; without a terminal it is a dry run.
 
 Leftovers close too: when the worktree folder is already gone (deleted by hand, or a close
 interrupted half-way), `fleet close <folder name | branch | tmux session>` finds the branch
@@ -121,10 +129,17 @@ symlink re-created, worktree re-added from its branch, branch re-created at its 
 fleet says what it could not restore: a stopped agent (its conversation resumes with
 `opencode -s` / `claude --resume` / `codex resume <session>`), killed tmux panes, and with
 `--force` the uncommitted files. Ignored files (build output) go with the folder. Run inside the
-task's own tmux session, fleet kills that session last.
+task's own tmux session (or by the task's own agent), fleet kills that session last and the
+agent running it after that.
 
-gc uses the same planner and the same merged-review lookup, so `fleet worktree list` shows
-`yes: merged` for a worktree whose MR/PR was merged even though the forge only lists open ones.
+`fleet worktree gc` (TUI `w g`) lists everything that can be cleaned and cleans it in one go
+(`--yes`, or `Enter` in the popup): finished worktrees (`merged` MR/PR, `in base` with no
+agent, folder missing, stale detached `$TMPDIR` checkout, review gone), each closed exactly
+like `fleet worktree close` without `--force` (a blocked one is listed as blocked, with the
+reason), plus tmux sessions in deleted folders and registry rows / rename links left behind.
+Before applying, gc plans again and skips an item that changed since the dry run (an agent
+started there meanwhile). Only `worktree list` and `worktree gc` ask the forge about merged
+MRs/PRs per branch; `fleet status` (status bar) makes one call per project.
 
 ### tmux status bar
 
@@ -159,7 +174,7 @@ foldable section per project plus "outside projects". `:project [name|all]` and 
 | `:` | run any `fleet …` subcommand, or `:project X` |
 | `g a/t/w/v` | this row in Agents / Tmux / Worktrees / Reviews |
 | `a a/s/m/n/x/o/c` | agent: attach, start, message, rename, stop, open plan, copy plan |
-| `w s/p/P/x/g/c/o` | worktree: shell, push -u, pull --ff-only, close task (popup lists every step and blocker; `F` forces), gc, columns, open review |
+| `w s/p/P/x/g/c/o` | worktree: shell, push -u, pull --ff-only, close task (popup lists every step and blocker; `F` twice forces), gc, columns, open review |
 | `v o/c/r/w/a/f` | review: open, copy, review/re-review, worktrees, agents, filter preset (all/local/mine/others/needs-me/failed) |
 | `K`, `n` (Tmux) | kill / rename session |
 

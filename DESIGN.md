@@ -777,3 +777,57 @@ on disk is treated as a name, not a path.
 Also: blockers and resume hints name the agent's adapter (`claude --resume`, `codex resume`), and
 the e2e script drives tmux only through an explicit socket (see `AGENTS.md`): run from inside your
 own tmux, a bare `tmux kill-server` ignores `TMUX_TMPDIR` and kills your server.
+
+## Revision after review (v0.3.2): close only what is merged
+
+Review of PR #2 found three bugs (reproduced with the e2e setup) and the owner restated the rule
+for close. Decisions:
+
+**Rule.** `fleet worktree close` removes the worktree, its tmux session(s), its local branch, the
+registry row and rename links. It refuses (exit 1, nothing changed; `--force` overrides) when:
+uncommitted/untracked files · the branch is **not merged** · an agent is **busy** · the worktree
+is locked. v0.3 Q3 ("commits on no remote branch, tag or other branch") is replaced for
+branches: *pushed is not merged*.
+
+**"Merged"** (`git::base_anchors` + `commits_not_in`): every commit of the branch is in the base
+branch (`refs/heads/<base>`, every `refs/remotes/*/<base>`, and the `git ls-remote` tip of each
+remote when present locally), or in the head of a merged MR/PR of this branch. Blocker
+`Unmerged { base, commits, more }`; the `landed` note for squash merges stays. A **detached**
+checkout (`review-N`, made detached on purpose by `fleet review start`: the author's branch is
+usually checked out elsewhere, fork PRs have no branch in `origin`, and a review must not commit
+to the author's branch) keeps v0.3's rule (`Unpushed`): only commits that exist nowhere else
+block. A kept branch (base, or checked out elsewhere) loses nothing.
+
+**A merged review counts only when its head is on the branch** (`git merge-base --is-ancestor
+<pr head> <branch tip>`), in `close::gather` and in `Engine::related_merged` (the snapshot).
+Bug: matching by name alone attached an old merged PR of a reused branch name (`fix/typo`, a
+reused slug, a fork PR with the same head name) to a new branch; `worktree list` said `merged`
+and gc planned to kill the live task's tmux session (e2e 9d).
+
+**Agents.** `Activity::is_busy` = working or waiting on a plan/question/permission: blocks. Idle
+= stopped by a normal step (resume command printed). The agent that runs this `fleet` is never a
+blocker (it is busy only because of us).
+
+**Order fix.** The hosting `StopAgent` now ranks 8, after the hosting tmux kill (7). Bug: both
+ranked 7 and `StopAgent` came first, so an agent closing its own task killed its pane, and with
+it its child `fleet`, before the session kill ran; the session survived (e2e 11).
+
+**Merged lookups only where used.** `Engine::merged_lookups(bool)`: on for the TUI (background,
+cached) and for `worktree list` / `worktree gc`; off for the rest of the CLI (`close` asks for
+its one branch live). Bug: the cache is per process, so every one-shot command made 1 + N forge
+calls; `fleet status --short` in a 15 s status bar with 20 worktrees is ~5,000 `gh` calls/hour
+(e2e 9e).
+
+**gc = "list what is finished, clean it in one go".** `gc_verdict`: busy agent → no; folder
+missing → yes; dirty → no; merged/closed review → yes (an idle agent is stopped); any agent → no
+("agent alive"); `in base` (new `WorktreeRow::in_base`: tip in the base branch) → yes; stale tmp,
+review gone → yes. The `ahead > 0` rule is gone: the planner decides. Every candidate goes through
+`close::plan` unforced; blocked ones are listed with `Blocker::summary`. The branch is deleted
+with `-D` like close (the planner proved it merged); `DeleteBranch.best_effort` and
+`CloseOpts.gc` are removed: `-d` refused every squash-merged branch, so gc left it behind.
+**Apply re-plans** from a fresh snapshot and runs an item only if its transaction is unchanged;
+otherwise `TxnReport.skipped` ("changed since the dry run"; e2e 9f drives a real `[y/N]` gc).
+
+**TUI force needs `F` twice.** Blocked popup: `F` arms force and shows "LOST when you press F
+again"; `Enter`/`y` then only explain; a second `F` closes.
+
