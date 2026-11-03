@@ -171,7 +171,8 @@ set -g status-right '#(fleet status --short) | %H:%M'
 
 # prefix f from any session: a dedicated `fleet` session running the TUI (created on first
 # use, kept between visits). Enter on a row switches to that agent's session; prefix f comes back.
-bind-key f if-shell 'tmux has-session -t =fleet' 'switch-client -t fleet' 'new-session -d -s fleet -c ~ fleet \; switch-client -t fleet'
+# `fleet:` is the session-only target form: a bare name can match a pane that runs fleet instead.
+bind-key f run-shell 'tmux has-session -t fleet: 2>/dev/null || tmux new-session -d -s fleet -c ~ fleet; tmux switch-client -t fleet:'
 ```
 
 ## TUI

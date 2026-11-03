@@ -87,12 +87,20 @@ pub async fn has_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The unambiguous form of a session name for `-t`: `=name:`. `=` disables prefix matching and
+/// the trailing `:` stops tmux at the session step. A bare name falls through to windows and
+/// then to panes, where it matches the *command running in the pane*, so a session called
+/// `fleet` (or `nvim`, `opencode`) would resolve to some unrelated pane running that program.
+pub fn session_target(name: &str) -> String {
+    format!("={name}:")
+}
+
 /// Switch (inside tmux) or attach (outside) to a target like `sess`, `sess:1` or `sess:1.2`.
 /// Outside tmux this execs `tmux attach` in the foreground and returns when it detaches.
 pub async fn attach(target: &str) -> Result<()> {
     let session = target.split(':').next().unwrap_or(target);
     if inside_tmux() {
-        run(&["switch-client", "-t", target]).await?;
+        run(&["switch-client", "-t", &session_target(session)]).await?;
         if target.contains(':') {
             run(&["select-window", "-t", target]).await.ok();
             if target.contains('.') {
@@ -102,7 +110,7 @@ pub async fn attach(target: &str) -> Result<()> {
         Ok(())
     } else {
         let st = std::process::Command::new("tmux")
-            .args(["attach", "-t", session])
+            .args(["attach", "-t", &session_target(session)])
             .status()
             .context("tmux attach")?;
         if !st.success() {
@@ -145,14 +153,14 @@ pub async fn send_keys(target: &str, text: &str) -> Result<()> {
 }
 
 pub async fn rename_session(old: &str, new: &str) -> Result<()> {
-    run(&["rename-session", "-t", &format!("={old}"), new])
+    run(&["rename-session", "-t", &session_target(old), new])
         .await
         .map(|_| ())
 }
 
 /// Kill a session. Already gone (or no tmux server at all) counts as success.
 pub async fn kill_session(name: &str) -> Result<()> {
-    gone_ok(run(&["kill-session", "-t", &format!("={name}")]).await)
+    gone_ok(run(&["kill-session", "-t", &session_target(name)]).await)
 }
 
 /// Kill a pane. Already gone counts as success.
@@ -185,7 +193,7 @@ pub async fn new_window(session: &str, cwd: &Path) -> Result<()> {
     run(&[
         "new-window",
         "-t",
-        &format!("={session}"),
+        &session_target(session),
         "-c",
         &cwd.to_string_lossy(),
     ])
@@ -208,6 +216,12 @@ mod tests {
             panes[0].target(),
             format!("{}:{}.{}", panes[0].session, panes[0].window, panes[0].pane)
         );
+    }
+
+    #[test]
+    fn session_target_is_exact_and_session_only() {
+        assert_eq!(session_target("fleet"), "=fleet:");
+        assert_eq!(session_target("wip-x"), "=wip-x:");
     }
 
     #[test]
