@@ -276,6 +276,7 @@ mod tests {
             session_id: Some(format!("ses_{pid}")),
             title: Some("t".into()),
             mode: Some("plan".into()),
+            model: None,
             activity: act,
             running_tool: None,
             plan_url: None,
@@ -284,6 +285,8 @@ mod tests {
             last_activity: None,
             pane_target: None,
             pending: vec![],
+            control_url: None,
+            control_token: None,
         }
     }
 

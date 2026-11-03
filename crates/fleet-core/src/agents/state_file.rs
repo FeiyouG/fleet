@@ -59,19 +59,36 @@ pub struct AgentState {
     pub sessions: HashMap<String, SessionState>,
     #[serde(default)]
     pub updated_at: i64,
+    /// opencode plugin v2: its control endpoint (`http://127.0.0.1:N`, `POST /send`).
+    #[serde(default)]
+    pub control_url: String,
+    /// Bearer token for `control_url`. The file is mode 0600.
+    #[serde(default)]
+    pub token: String,
+    /// opencode plugin v2: the root (non-subagent) session the user last worked in; where
+    /// `fleet agent send` delivers.
+    #[serde(default)]
+    pub current_session: String,
 }
 
 impl AgentState {
-    /// The session this process is showing: the one with something pending, else the
-    /// busiest, else the most recently titled, else any.
+    /// The session this process is showing: the one with something pending, else the one
+    /// the plugin reports as current, else the busiest, else the most recently titled.
     pub fn primary_session(&self) -> Option<(&String, &SessionState)> {
-        self.sessions.iter().max_by_key(|(_, s)| {
+        self.sessions.iter().max_by_key(|(id, s)| {
             (
                 !s.pending.is_empty() || s.question || s.plan,
+                **id == self.current_session,
                 s.status == "busy",
                 s.title.is_some(),
             )
         })
+    }
+
+    /// `(url, token)` of the plugin's control endpoint, when it has one.
+    pub fn control(&self) -> Option<(String, String)> {
+        (!self.control_url.is_empty() && !self.token.is_empty())
+            .then(|| (self.control_url.clone(), self.token.clone()))
     }
 
     pub fn pending(&self) -> Vec<&Pending> {
@@ -212,6 +229,25 @@ mod tests {
         assert_eq!(st.pending().len(), 1);
         assert_eq!(st.pending()[0].title, "bash: rm -rf dist");
         assert_eq!(st.agent, "");
+        assert_eq!(st.control(), None);
+    }
+
+    #[test]
+    fn v2_control_and_current_session() {
+        let st = parse(
+            r#"{"version":2,"pid":42,"agent":"opencode","server_url":"http://localhost:4096/","control_url":"http://127.0.0.1:52965",
+                "token":"tok","directory":"/w","current_session":"ses_root","sessions":{
+                "ses_root":{"status":"idle","pending":[],"mode":"build"},
+                "ses_child":{"status":"busy","parent":"ses_root","pending":[]}
+            },"updated_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            st.control(),
+            Some(("http://127.0.0.1:52965".into(), "tok".into()))
+        );
+        // current beats busy: a running subagent does not steal the row
+        assert_eq!(st.primary_session().unwrap().0, "ses_root");
     }
 
     #[test]

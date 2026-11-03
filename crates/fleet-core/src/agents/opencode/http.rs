@@ -1,6 +1,8 @@
-//! The opencode HTTP API, available only on agents started with `--port`.
+//! The opencode HTTP API (when its port actually listens; opencode 1.18 TUIs may not), and
+//! the fleet plugin's control endpoint.
 
-use anyhow::{Context, Result};
+use crate::agents::SendMsg;
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -54,22 +56,31 @@ pub async fn is_opencode(port: u16) -> bool {
         .is_some()
 }
 
-/// `POST /tui/submit-prompt` with text: types the prompt into the TUI and submits it.
-pub async fn submit_prompt(port: u16, text: &str) -> Result<()> {
-    let c = client();
-    c.post(format!("http://127.0.0.1:{port}/tui/append-prompt"))
-        .json(&serde_json::json!({ "text": text }))
+/// `POST <control_url>/send` on the fleet plugin's endpoint (`assets/fleet.ts`). A plain
+/// message is typed into the TUI; one with a model/agent goes through the session API.
+pub async fn control_send(url: &str, token: &str, msg: &SendMsg) -> Result<()> {
+    let r = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .post(format!("{}/send", url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "text": msg.text,
+            "model": msg.model,
+            // fleet's mode = opencode's agent
+            "agent": msg.mode,
+        }))
         .send()
         .await
-        .context("append-prompt")?
-        .error_for_status()
-        .context("append-prompt status")?;
-    c.post(format!("http://127.0.0.1:{port}/tui/submit-prompt"))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .context("submit-prompt")?
-        .error_for_status()
-        .context("submit-prompt status")?;
+        .context("fleet plugin control endpoint")?;
+    let status = r.status();
+    let body: Value = r.json().await.unwrap_or(Value::Null);
+    if !status.is_success() || body.get("ok").and_then(Value::as_bool) != Some(true) {
+        let err = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("no details");
+        bail!("agent rejected the message ({status}): {err}");
+    }
     Ok(())
 }

@@ -67,6 +67,7 @@ pub fn row(
         session_id: sess.map(|(id, _)| id.clone()).or(fb.session_id),
         title: sess.and_then(|(_, s)| s.title.clone()).or(fb.title),
         mode,
+        model: None,
         activity,
         running_tool: None,
         plan_url: plan.map(|p| p.url.clone()),
@@ -78,6 +79,8 @@ pub fn row(
             .or(fb.last_activity),
         pane_target: None,
         pending,
+        control_url: None,
+        control_token: None,
     }
 }
 
