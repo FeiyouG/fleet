@@ -167,7 +167,8 @@ enum WorktreeCmd {
         json: bool,
     },
     /// Finish a task: stop its agents, kill its tmux, remove the worktree and its local
-    /// branch, close the registry task. All-or-nothing; refuses if anything would be lost.
+    /// branch, close the registry task. All-or-nothing; refuses when files are uncommitted,
+    /// the branch is not merged, an agent is busy, or the worktree is locked.
     Close(CloseArgs),
 }
 
@@ -175,7 +176,7 @@ enum WorktreeCmd {
 struct CloseArgs {
     /// Task name, worktree folder name, branch, tmux session, or a path
     target: String,
-    /// Close even with uncommitted files, commits only on this branch, or a running agent
+    /// Close even with uncommitted files, an unmerged branch, a busy agent or a lock
     #[arg(long)]
     force: bool,
     /// Do not ask (without it, a non-interactive run is a dry run)
@@ -255,8 +256,19 @@ fn cli_config_path(explicit: &Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(fleet_core::config::config_path)
 }
 
+/// A one-shot snapshot without per-branch merged-review lookups: one forge call per project,
+/// not one per worktree (`fleet status` may run every few seconds from a status bar).
 async fn snapshot(cfg: &Config) -> Fleet {
-    Engine::new(cfg.clone()).snapshot(true).await
+    Engine::new(cfg.clone())
+        .merged_lookups(false)
+        .snapshot(true)
+        .await
+}
+
+/// A snapshot with merged reviews looked up per worktree branch, for the commands that show
+/// or act on gc verdicts (`worktree list`, `worktree gc`).
+async fn snapshot_gc(engine: &Engine) -> Fleet {
+    engine.snapshot(true).await
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -357,7 +369,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 agent,
                 no_attach,
             } => {
-                let engine = Engine::new(cfg);
+                let engine = Engine::new(cfg).merged_lookups(false);
                 let repo = repo.or(project).or_else(|| cwd_repo(&engine.config));
                 let out = review::start(
                     &engine,
@@ -391,7 +403,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
         },
         Cmd::Worktree(w) => match w {
             WorktreeCmd::List { json } => {
-                let mut f = snapshot(&cfg).await;
+                let mut f = snapshot_gc(&Engine::new(cfg.clone())).await;
                 if let Some(p) = &project {
                     f.worktrees.retain(|w| w.worktree.repo == *p);
                 }
@@ -422,7 +434,8 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 Ok(())
             }
             WorktreeCmd::Gc { yes, json } => {
-                let f = snapshot(&cfg).await;
+                let engine = Engine::new(cfg.clone());
+                let f = snapshot_gc(&engine).await;
                 let plan = gc::plan(&f, &cfg).await;
                 if json {
                     print_json(&plan)?;
@@ -446,7 +459,8 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 if !yes && !confirm(&format!("apply {} items?", plan.txns.len()))? {
                     return Ok(());
                 }
-                let reports = gc::apply(&plan, &progress()).await;
+                let fresh = snapshot_gc(&engine).await;
+                let reports = gc::apply(&plan, &fresh, &cfg, &progress()).await;
                 let failed: Vec<_> = reports.iter().filter(|r| !r.ok()).collect();
                 for r in &failed {
                     eprintln!("{}:", r.label);
@@ -455,7 +469,11 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                     }
                 }
                 if !failed.is_empty() {
-                    bail!("{} of {} item(s) failed", failed.len(), reports.len());
+                    bail!(
+                        "{} of {} item(s) not done (failed and rolled back, or skipped)",
+                        failed.len(),
+                        reports.len()
+                    );
                 }
                 Ok(())
             }
@@ -678,13 +696,11 @@ fn confirm(q: &str) -> Result<bool> {
 }
 
 async fn close_cmd(a: CloseArgs, cfg: Config, project: Option<String>) -> Result<()> {
-    let engine = Engine::new(cfg.clone());
+    // close asks the forge about its one branch itself; no per-worktree lookups needed.
+    let engine = Engine::new(cfg.clone()).merged_lookups(false);
     let f = engine.snapshot(true).await;
     let r = close::resolve(&f, &cfg, &a.target, project.as_deref()).await?;
-    let opts = close::CloseOpts {
-        force: a.force,
-        gc: false,
-    };
+    let opts = close::CloseOpts { force: a.force };
     let plan = close::plan(&close::gather(&r, &f).await?, &opts)?;
     if a.json {
         print_json(&plan)?;
@@ -786,7 +802,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     &repo,
                 )?,
             };
-            let engine = Engine::new(cfg);
+            let engine = Engine::new(cfg).merged_lookups(false);
             let out = start::start(
                 &engine,
                 start::StartOpts {
@@ -882,7 +898,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
         }
         AgentCmd::Attach { name } => send::attach(&snapshot(&cfg).await, &name).await,
         AgentCmd::Send { name, text } => {
-            let engine = Engine::new(cfg);
+            let engine = Engine::new(cfg).merged_lookups(false);
             let f = engine.snapshot(false).await;
             send::send(&engine, &f, &name, &text.join(" ")).await
         }

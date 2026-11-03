@@ -3,8 +3,9 @@
 #
 # Isolated from your setup: its own repo + bare origin under /tmp, its own fleet config and
 # registry (FLEET_CONFIG_DIR / FLEET_DATA_DIR), an empty agent data dir (XDG_DATA_HOME), a stub
-# `opencode` (sleeps; no model is called) and a stub `gh` (answers "which PR of this branch was
-# merged" from files the script writes).
+# `opencode` (sleeps; no model is called; when "armed" for its folder it runs one command the
+# way an agent's bash tool does) and a stub `gh` (answers "which PR of this branch was merged"
+# from files the script writes, and logs every call).
 #
 # tmux SAFETY: this script is usually run from inside your own tmux, where $TMUX points at
 # your server and tmux ignores TMUX_TMPDIR. So the script never calls bare `tmux`: every call
@@ -45,12 +46,38 @@ check() { local what=$1; shift; if "$@"; then ok "$what"; else die "$what"; fi; 
 nocheck() { local what=$1; shift; if "$@"; then die "$what"; else ok "$what"; fi; }
 
 # ── stubs ──
-printf 'fn main(){loop{std::thread::sleep(std::time::Duration::from_secs(60));}}' >"$T/stub.rs"
+cat >"$T/stub.rs" <<'RS'
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+// Sleeps forever. When $E2E_ARM/arm-<cwd folder name> exists it first runs $E2E_CMD like an
+// agent's bash tool: own process group, output piped back to the agent.
+fn main() {
+    let cwd = std::env::current_dir().unwrap();
+    let leaf = cwd.file_name().unwrap().to_string_lossy().to_string();
+    let arm = std::env::var("E2E_ARM").unwrap_or_default();
+    let mut _child = None;
+    if !arm.is_empty() && std::path::Path::new(&format!("{arm}/arm-{leaf}")).exists() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        _child = Command::new("sh")
+            .arg("-c")
+            .arg(std::env::var("E2E_CMD").unwrap_or_default())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .ok();
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+RS
 rustc -O -o "$T/bin/opencode" "$T/stub.rs" 2>/dev/null
 cat >"$T/bin/gh" <<EOF
 #!/bin/sh
 # Stub gh: only \`pr list\` is answered. A merged PR of branch B exists when $T/merged/<B with / as %>
 # holds "<number> <head sha>".
+echo "\$*" >>"$T/gh.log"
 head=""; state="open"
 while [ \$# -gt 0 ]; do
   case "\$1" in --head) head=\$2; shift ;; --state) state=\$2; shift ;; esac; shift
@@ -83,6 +110,9 @@ return {
 }
 EOF
 printf 'set -g base-index 1\nset -g pane-base-index 0\nset -g default-shell /bin/sh\nset -g default-command /bin/sh\n' >"$T/tmux.conf"
+# Inherited by every pane of the scratch server, so the armed stub agent can run fleet.
+export E2E_ARM=$T E2E_FLEET=$FLEET
+export E2E_CMD='exec "$E2E_FLEET" close --yes "$(basename "$PWD")" >"$E2E_ARM/self-close.log" 2>&1'
 t -f "$T/tmux.conf" new-session -d -s keep -c "$T"
 [ "$(t display -p '#{socket_path}')" = "$SOCK" ] || die "scratch tmux socket mismatch"
 
@@ -104,42 +134,55 @@ start() {
   [ "$exe" = "$T/bin/opencode" ] || die "agent of $1 runs $exe, not the stub"
 }
 gone_all() { ! has_wt "$1" && ! has_branch "$2" && ! has_session "$1" && ! task_open "$1"; }
+# A pending permission prompt in the agent's state file: activity WAIT:perm (busy).
+busy() { mkdir -p "$FLEET_DATA_DIR/agents"; printf '{"pid":%s,"agent":"opencode","sessions":{"s":{"pending":[{"id":"p","title":"bash","type":"bash"}]}}}' "$1" >"$FLEET_DATA_DIR/agents/$1.json"; }
 
-echo "1. a running agent blocks close; nothing changes"
+echo "1. a busy agent blocks close; nothing changes; once idle, close stops it"
 start t1
+pid=$(agent_pid t1)
+busy "$pid"
 nocheck "close t1 refused" f close t1 --yes
-check "names the agent" out_has "agent running: opencode"
+check "names the busy agent" out_has "agent busy: opencode"
 intact() { has_wt t1 && has_branch feat/t1 && has_session t1 && task_open t1 && [ -n "$(agent_pid t1)" ]; }
 check "worktree, branch, session, task, agent intact" intact
+rm "$FLEET_DATA_DIR/agents/$pid.json"
+check "idle agent: close t1" f close t1 --yes
+check "  all gone" gone_all t1 feat/t1
+nocheck "  agent process gone" kill -0 "$pid" 2>/dev/null
 
 echo "2. stop + rename (symlink), then close removes everything"
-f agent stop t1 || die "stop"
-f agent rename t1 t2 || die "rename"
-check "rename left a symlink" test -L "$WT/t1"
+start r1
+f agent stop r1 || die "stop"
+f agent rename r1 t2 || die "rename"
+check "rename left a symlink" test -L "$WT/r1"
 check "close t2" f close t2 --yes
 check "worktree, branch, session, task gone" gone_all t2 feat/t2
-nocheck "symlink gone" test -L "$WT/t1"
+nocheck "symlink gone" test -L "$WT/r1"
 
-echo "3. dirty + agent: refused listing them; --force closes"
+echo "3. dirty: refused listing the file (an idle agent is not a blocker); --force closes"
 start t3
 pid=$(agent_pid t3)
 echo hi >"$WT/t3/scratch.txt"
 nocheck "close t3 refused" f close t3 --yes
 check "lists the file" out_has "scratch.txt"
-check "lists the agent" out_has "agent running"
+nocheck "does not list the idle agent" out_has "agent busy"
 check "still there" has_wt t3
 check "close --force" f close t3 --force --yes
 check "all gone" gone_all t3 feat/t3
 nocheck "agent process gone" kill -0 "$pid" 2>/dev/null
 
-echo "4. a commit only on this branch blocks; after push it closes (remote kept)"
+echo "4. a commit not merged into main blocks, pushed or not; merged into main it closes"
 start t4
 f agent stop t4 || die "stop t4"
 git -C "$WT/t4" commit -q --allow-empty -m "only-here-t4"
 nocheck "close t4 refused" f close t4 --yes
 check "lists the commit" out_has "only-here-t4"
 git -C "$WT/t4" push -q -u origin feat/t4
-check "close after push" f close t4 --yes
+nocheck "pushed but not merged: still refused" f close t4 --yes
+check "  says not merged" out_has "not merged"
+git -C "$REPO" merge -q --no-ff -m "merge t4" feat/t4
+git -C "$REPO" push -q origin main
+check "merged into main: closes" f close t4 --yes
 check "all gone" gone_all t4 feat/t4
 remote_kept() { git -C "$ORIGIN" rev-parse -q --verify refs/heads/feat/t4 >/dev/null; }
 check "remote branch untouched" remote_kept
@@ -248,7 +291,53 @@ f worktree list || die "list"
 check "worktree list says gc yes: merged" out_has "yes: merged"
 f worktree gc --yes || die "gc gcm"
 check "gc removed it" bash -c "! test -d '$WT/gcm'"
-# gc deletes branches with `git branch -d` only (best effort): an unmerged local branch stays.
+nocheck "  and deleted the squash-merged branch" has_branch feat/gcm
+
+echo "9d. an old merged PR of a reused branch name does not count"
+git -C "$REPO" worktree add -q -b feat/reuse "$WT/reuse" main
+git -C "$WT/reuse" commit -q --allow-empty -m "new-work-reuse"
+git -C "$WT/reuse" push -q -u origin feat/reuse
+t new-session -d -s reuse-nvim -c "$WT/reuse"
+merged_pr feat/reuse 3 0123456789abcdef0123456789abcdef01234567
+f worktree list || die "list"
+nocheck "worktree list does not call it merged" grep -q "^reuse .*merged" "$T/out"
+f worktree gc || die "gc dry run"
+nocheck "gc does not offer it" out_has "close reuse"
+nocheck "close refuses it (not merged)" f close reuse --yes
+check "  lists its commit" out_has "new-work-reuse"
+check "  session untouched" has_session reuse-nvim
+f close reuse --force --yes || die "force reuse"
+
+echo "9e. a one-shot snapshot does not ask the forge once per worktree"
+for i in 1 2 3; do git -C "$REPO" worktree add -q -b feat/idle$i "$WT/idle$i" main; done
+: >"$T/gh.log"
+"$FLEET" status --short >/dev/null 2>&1
+check "fleet status: one gh call" test "$(wc -l <"$T/gh.log" | tr -d ' ')" -le 1
+for i in 1 2 3; do f close "idle$i" --yes || die "close idle$i"; done
+
+echo "9f. gc applies only what is still true: an agent started after the dry run is not hit"
+git -C "$REPO" worktree add -q -b feat/late "$WT/late" main
+# An interactive gc in a scratch pane (a terminal, so it asks [y/N]); the agent starts while
+# the dry run is on screen, then the answer is yes.
+t new-session -d -s gcrun -c "$T"
+t send-keys -t "gcrun:1" "'$FLEET' worktree gc >'$T/gc.log' 2>&1" Enter
+for _ in $(seq 1 80); do grep -q "apply" "$T/gc.log" 2>/dev/null && break; sleep 0.25; done
+cp "$T/gc.log" "$T/out"
+check "dry run offers the merged-into-main worktree" out_has "close late (in base)"
+t new-session -d -s late -c "$WT/late"
+t send-keys -t "late:1" "opencode --port 4999 late" Enter
+sleep 1
+t send-keys -t "gcrun:1" "y" Enter
+for _ in $(seq 1 80); do grep -q "skipped\|ok$" "$T/gc.log" 2>/dev/null && break; sleep 0.25; done
+sleep 0.5
+cp "$T/gc.log" "$T/out"
+check "  the item is skipped" out_has "close late (in base): skipped"
+check "  worktree kept" has_wt late
+check "  agent alive" test -n "$(agent_pid late)"
+t kill-session -t "=gcrun"
+t kill-session -t "=late"
+sleep 0.5
+f close late --yes || die "close late"
 
 echo "10. leftovers: worktree deleted by hand, branch + tmux session remain (no registry row)"
 git -C "$REPO" worktree add -q -b refactor/leftover "$WT/leftover" main
@@ -272,6 +361,15 @@ nocheck "  session gone" has_session demo-left2-update
 git -C "$REPO" branch -q refactor/bare main
 check "close a bare leftover branch by name" f close refactor/bare --yes
 nocheck "  branch gone" has_branch refactor/bare
+
+echo "11. an agent closes its own task (fleet runs as the agent's child, output piped to it)"
+touch "$T/arm-t11"
+start t11
+t new-window -t "=t11" -c "$WT/t11"     # a shell window in the task's session
+for _ in $(seq 1 60); do has_session t11 || break; sleep 0.25; done
+cp "$T/self-close.log" "$T/out" 2>/dev/null || true
+nocheck "session gone (agent stopped last)" has_session t11
+check "  worktree, branch, task gone" gone_all t11 feat/t11
 
 check "the scratch tmux server is the only one touched (keep session alive)" has_session keep
 echo "all $PASS checks passed"

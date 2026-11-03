@@ -519,10 +519,7 @@ impl App {
                 let engine = self.engine.clone();
                 self.spawn("close", async move {
                     let fresh = engine.snapshot(false).await;
-                    let opts = cmd::close::CloseOpts {
-                        force: plan.force,
-                        gc: false,
-                    };
+                    let opts = cmd::close::CloseOpts { force: plan.force };
                     let rep = cmd::close::apply_real(&plan, &fresh, &opts, &cmd::quiet()).await?;
                     if !rep.ok() {
                         anyhow::bail!("{}", rep.failure_lines().join(" · "));
@@ -531,12 +528,14 @@ impl App {
                 });
             }
             ApplyGc(plan) => {
+                let (engine, cfg) = (self.engine.clone(), self.cfg.clone());
                 self.spawn("gc", async move {
-                    let res = cmd::gc::apply(&plan, &cmd::quiet()).await;
+                    let fresh = engine.snapshot(false).await;
+                    let res = cmd::gc::apply(&plan, &fresh, &cfg, &cmd::quiet()).await;
                     let failed: Vec<_> = res.iter().filter(|r| !r.ok()).collect();
                     if !failed.is_empty() {
                         anyhow::bail!(
-                            "{} of {} failed (each rolled back): {}",
+                            "{} of {} not done (each rolled back or skipped): {}",
                             failed.len(),
                             res.len(),
                             failed

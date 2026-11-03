@@ -456,18 +456,25 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
     }
 }
 
-/// Keys of the close popup (pure, so it is tested): without blockers (or once forced)
-/// `y`/`Enter` closes; with blockers `Enter` does nothing and `F` arms force. Returns an
-/// error for the status line when force cannot be planned.
+/// Keys of the close popup (pure, so it is tested). Nothing blocks: `y`/`Enter` closes.
+/// Blocked: `F` arms force and lists in red what will be lost; only a second `F` closes
+/// (`Enter`/`y` do nothing then, so a reflexive Enter never destroys work). Returns a
+/// message for the status line.
 fn close_keys(plan: Box<ClosePlan>, code: KeyCode) -> (Outcome, Option<String>) {
+    let armed = plan.force && !plan.blockers.is_empty();
     match code {
         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
             (Outcome::Close, None)
         }
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !plan.blocked() => {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !plan.blocked() && !armed => {
             (Outcome::Submit(PopupCmd::Close(plan)), None)
         }
-        KeyCode::Char('F') if plan.blocked() => match plan.forced(false) {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if armed => (
+            Outcome::Keep(Popup::Close(plan)),
+            Some("press F again to close anyway (the red items are lost), Esc to cancel".into()),
+        ),
+        KeyCode::Char('F') if armed => (Outcome::Submit(PopupCmd::Close(plan)), None),
+        KeyCode::Char('F') if plan.blocked() => match plan.forced() {
             Ok(p) => (Outcome::Keep(Popup::Close(Box::new(p))), None),
             Err(e) => (Outcome::Keep(Popup::Close(plan)), Some(format!("{e:#}"))),
         },
@@ -532,7 +539,7 @@ fn close_lines(plan: &ClosePlan) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             if plan.force {
-                "LOST when you press Enter:"
+                "LOST when you press F again:"
             } else {
                 "blocked — this would be lost:"
             },
@@ -545,9 +552,9 @@ fn close_lines(plan: &ClosePlan) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         if plan.blocked() {
-            "F force (then Enter) · Esc cancel"
+            "F = force (shows what is lost, then F again closes) · Esc cancel"
         } else if plan.force && !plan.blockers.is_empty() {
-            "Enter / y = close anyway · Esc cancel"
+            "F again = close anyway · Esc cancel"
         } else {
             "Enter / y = close · Esc cancel · all-or-nothing: a failure restores what was done"
         },
@@ -917,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_plan_needs_force_then_enter() {
+    fn blocked_plan_needs_f_twice() {
         let (out, _) = close_keys(plan(true), KeyCode::Enter);
         let Outcome::Keep(Popup::Close(p)) = out else {
             panic!("Enter on a blocked plan must keep the popup")
@@ -931,8 +938,14 @@ mod tests {
         assert!(close_lines(&p)
             .iter()
             .any(|l| l.to_string().contains("LOST")));
+        // Armed: Enter / y do nothing but explain; only a second F closes.
+        for k in [KeyCode::Enter, KeyCode::Char('y')] {
+            let (out, msg) = close_keys(p.clone(), k);
+            assert!(matches!(out, Outcome::Keep(Popup::Close(_))), "{k:?}");
+            assert!(msg.unwrap().contains("F again"));
+        }
         assert!(matches!(
-            close_keys(p, KeyCode::Enter).0,
+            close_keys(p, KeyCode::Char('F')).0,
             Outcome::Submit(PopupCmd::Close(p)) if p.force
         ));
     }

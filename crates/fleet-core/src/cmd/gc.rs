@@ -1,8 +1,10 @@
-//! `fleet worktree gc`: dry run first, then apply. Each candidate worktree is closed through
-//! the same planner and transaction engine as `fleet worktree close` (non-forced, branch
-//! deleted only if merged); orphans (dead tmux sessions, tasks whose worktree is gone, stale
-//! rename links) get one small transaction each. Transactions are independent: one failing
-//! candidate is rolled back on its own and does not stop the others.
+//! `fleet worktree gc`: list everything that can be cleaned, then clean it in one go.
+//! Candidates are finished worktrees (`gc_verdict` = yes: merged, in base, folder missing,
+//! stale tmp, review gone), each closed through the same planner and transaction engine as
+//! `fleet worktree close` (never forced: a blocked one is listed as blocked); orphans (dead
+//! tmux sessions, tasks whose worktree is gone, stale rename links) get one small
+//! transaction each. Transactions are independent: one failing is rolled back on its own.
+//! Apply re-plans from a fresh snapshot and skips an item that changed since the dry run.
 
 use super::close::{self, CloseOpts, Resolved};
 use super::txn::{self, Step, Txn, TxnReport};
@@ -17,16 +19,13 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GcPlan {
     pub txns: Vec<Txn>,
-    /// Worktrees that would qualify but are protected (dirty / commits only here / agent alive).
+    /// Finished worktrees that close would refuse (dirty, not merged, busy agent, locked), and why.
     pub blocked: Vec<(String, String)>,
 }
 
 pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
     let mut p = GcPlan::default();
-    let opts = CloseOpts {
-        force: false,
-        gc: true,
-    };
+    let opts = CloseOpts { force: false };
 
     for w in &fleet.worktrees {
         match &w.gc {
@@ -45,7 +44,7 @@ pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
                         w.worktree.name.clone(),
                         cp.blockers
                             .iter()
-                            .map(|b| b.lines(0)[0].trim_end_matches(':').to_string())
+                            .map(close::Blocker::summary)
                             .collect::<Vec<_>>()
                             .join("; "),
                     )),
@@ -55,7 +54,7 @@ pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
                     }
                 }
             }
-            GcVerdict::No(reason) if matches!(reason.as_str(), "dirty" | "unpushed") => {
+            GcVerdict::No(reason) if reason == "dirty" => {
                 p.blocked.push((w.worktree.name.clone(), reason.clone()));
             }
             _ => {}
@@ -138,10 +137,32 @@ pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
     p
 }
 
-pub async fn apply(plan: &GcPlan, log: &Progress) -> Vec<TxnReport> {
+/// Apply the chosen items. `fresh` is a new snapshot: every item is planned again and run
+/// only when its steps are unchanged, so an agent started (or a file changed) while the dry
+/// run was on screen skips that item instead of being killed with it.
+pub async fn apply(plan: &GcPlan, fresh: &Fleet, cfg: &Config, log: &Progress) -> Vec<TxnReport> {
+    let now = self::plan(fresh, cfg).await;
     let mut out = vec![];
     for t in &plan.txns {
-        out.push(txn::apply(t, &txn::Real, log).await);
+        match now.txns.iter().find(|n| *n == t) {
+            Some(n) => out.push(txn::apply(n, &txn::Real, log).await),
+            None => {
+                let why = match now
+                    .blocked
+                    .iter()
+                    .find(|(name, _)| t.label.contains(name.as_str()))
+                {
+                    Some((_, r)) => format!("now blocked: {r}"),
+                    None => "changed since the dry run; run gc again".into(),
+                };
+                log(&format!("{}: skipped ({why})", t.label));
+                out.push(TxnReport {
+                    label: t.label.clone(),
+                    skipped: Some(why),
+                    ..Default::default()
+                });
+            }
+        }
     }
     out
 }

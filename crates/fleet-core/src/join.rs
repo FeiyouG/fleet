@@ -283,6 +283,7 @@ mod tests {
             detached: branch.is_none(),
             is_main: path.ends_with("main"),
             missing: false,
+            in_base: false,
         }
     }
     fn agent(pid: u32, cwd: &str, act: Activity) -> AgentRow {

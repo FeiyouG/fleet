@@ -123,6 +123,7 @@ async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow 
             dirty: false,
             detached: e.detached,
             missing,
+            in_base: false,
         };
         if !missing {
             let dirty_f = git_ok(
@@ -139,7 +140,28 @@ async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow 
                 )
                 .await
             };
-            let (dirty, upstream) = tokio::join!(dirty_f, upstream_f);
+            let in_base_f = async {
+                if e.detached || path == *main_path || e.head.is_empty() {
+                    return false;
+                }
+                let mut anchors = vec![format!("refs/heads/{}", repo.base)];
+                if let Some(remotes) = git_ok(&repo.repo, &["remote"]).await {
+                    anchors.extend(
+                        remotes
+                            .lines()
+                            .filter(|r| !r.is_empty())
+                            .map(|r| format!("refs/remotes/{r}/{}", repo.base)),
+                    );
+                }
+                for a in anchors {
+                    if is_ancestor(&repo.repo, &e.head, &a).await {
+                        return true;
+                    }
+                }
+                false
+            };
+            let (dirty, upstream, in_base) = tokio::join!(dirty_f, upstream_f, in_base_f);
+            row.in_base = in_base;
             row.dirty = dirty.map(|s| !s.is_empty()).unwrap_or(false);
             row.upstream = upstream;
             if row.upstream.is_some() {
@@ -346,6 +368,92 @@ pub async fn commits_only_here(
         RemoteAnchors::TrackingRefs => args.push("--remotes"),
     }
     args.extend(also.iter().map(String::as_str));
+    Ok(git(repo, &args)
+        .await?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// `git merge-base --is-ancestor <a> <b>`: `a` is `b` or one of its ancestors. False when
+/// either is not a commit in this clone.
+pub async fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Where the base branch (`main`) is, as reachability anchors: the local branch, every
+/// remote-tracking `<remote>/<base>`, and the tip `git ls-remote` reports for each remote
+/// (when that commit is present locally). The second value is a note when a remote could not
+/// be reached (the local refs are still used).
+pub async fn base_anchors(repo: &Path, base: &str) -> (Vec<String>, Option<String>) {
+    let mut anchors = vec![];
+    if rev_parse(repo, &format!("refs/heads/{base}"))
+        .await
+        .is_some()
+    {
+        anchors.push(format!("refs/heads/{base}"));
+    }
+    let remotes: Vec<String> = git(repo, &["remote"])
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    let mut live = vec![];
+    let mut note = None;
+    for r in &remotes {
+        let tracking = format!("refs/remotes/{r}/{base}");
+        if rev_parse(repo, &tracking).await.is_some() {
+            anchors.push(tracking);
+        }
+        let fut = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["ls-remote", "--heads", r, &format!("refs/heads/{base}")])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(20), fut).await {
+            Ok(Ok(o)) if o.status.success() => live.extend(
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().next().map(String::from)),
+            ),
+            _ => {
+                note = Some(format!(
+                    "remote {r} unreachable: \"merged into {base}\" uses {r}/{base} from the last fetch"
+                ))
+            }
+        }
+    }
+    anchors.extend(existing_commits(repo, &live).await.unwrap_or_default());
+    (anchors, note)
+}
+
+/// Commits of `rev` that are in none of `anchors` (refs or shas): `--oneline`, newest first,
+/// at most `limit`. With the base branch as anchors these are the commits not merged into it.
+pub async fn commits_not_in(
+    repo: &Path,
+    rev: &str,
+    anchors: &[String],
+    limit: usize,
+) -> Result<Vec<String>> {
+    let n = format!("-n{limit}");
+    let mut args: Vec<&str> = vec!["rev-list", "--oneline", &n, rev, "--not"];
+    args.extend(anchors.iter().map(String::as_str));
     Ok(git(repo, &args)
         .await?
         .lines()

@@ -22,10 +22,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CloseOpts {
-    /// Close despite blockers (uncommitted files, commits only here, running agents, lock).
+    /// Close despite blockers (uncommitted files, unmerged commits, busy agents, lock).
     pub force: bool,
-    /// gc mode: delete the branch only if merged (`git branch -d`), never fail on it.
-    pub gc: bool,
     // A future `remote: bool` adds a `DeleteRemoteBranch` step in `plan`.
 }
 
@@ -58,7 +56,13 @@ pub enum Blocker {
     Dirty {
         files: Vec<String>,
     },
-    /// Commits on no live remote branch, tag, other local branch or merged review head.
+    /// Commits of the branch that are not in the base branch nor in a merged review of it.
+    Unmerged {
+        base: String,
+        commits: Vec<String>,
+        more: bool,
+    },
+    /// Detached checkout: commits on no live remote branch, tag or local branch.
     Unpushed {
         commits: Vec<String>,
         more: bool,
@@ -76,6 +80,31 @@ pub enum Blocker {
 }
 
 impl Blocker {
+    /// One short phrase (gc's "blocked" list).
+    pub fn summary(&self) -> String {
+        match self {
+            Blocker::Dirty { files } => format!("dirty ({} files)", files.len()),
+            Blocker::Unmerged {
+                base,
+                commits,
+                more,
+            } => format!(
+                "not merged ({}{} commit(s) not in {base})",
+                commits.len(),
+                if *more { "+" } else { "" }
+            ),
+            Blocker::Unpushed { commits, more } => format!(
+                "{}{} commit(s) only here",
+                commits.len(),
+                if *more { "+" } else { "" }
+            ),
+            Blocker::AgentRunning {
+                adapter, activity, ..
+            } => format!("{adapter} {}", activity.label()),
+            Blocker::Locked { .. } => "locked".into(),
+        }
+    }
+
     /// A header line plus up to `limit` item lines.
     pub fn lines(&self, limit: usize) -> Vec<String> {
         let list = |head: String, items: &[String], more: bool| {
@@ -99,9 +128,22 @@ impl Blocker {
                 files,
                 false,
             ),
+            Blocker::Unmerged {
+                base,
+                commits,
+                more,
+            } => list(
+                format!(
+                    "not merged: {}{} commit(s) not in {base} and in no merged PR/MR of this branch (merged on the forge? `git fetch` and retry):",
+                    commits.len(),
+                    if *more { "+" } else { "" }
+                ),
+                commits,
+                *more,
+            ),
             Blocker::Unpushed { commits, more } => list(
                 format!(
-                    "commits only on this branch ({}{}), on no remote branch, tag, other branch or merged review:",
+                    "commits only in this checkout ({}{}), on no remote branch, tag or local branch:",
                     commits.len(),
                     if *more { "+" } else { "" }
                 ),
@@ -115,7 +157,7 @@ impl Blocker {
                 pane,
                 session_id,
             } => vec![format!(
-                "agent running: {adapter} pid {pid} {}{}{}",
+                "agent busy: {adapter} pid {pid} {}{}{}",
                 activity.label(),
                 pane.as_deref()
                     .map(|p| format!(" in {p}"))
@@ -224,8 +266,8 @@ impl ClosePlan {
     }
 
     /// The same close, with `--force`.
-    pub fn forced(&self, gc: bool) -> Result<ClosePlan> {
-        plan(&self.facts, &CloseOpts { force: true, gc })
+    pub fn forced(&self) -> Result<ClosePlan> {
+        plan(&self.facts, &CloseOpts { force: true })
     }
 
     /// Every step with its undo, for the CLI and the TUI popup.
@@ -278,6 +320,10 @@ impl ClosePlan {
             },
         }
     }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 // ───────────────────────── resolve ─────────────────────────
@@ -768,52 +814,30 @@ pub async fn gather(r: &Resolved, fleet: &Fleet) -> Result<Facts> {
         }
     }
 
-    // ── what deleting the branch would lose ──
-    let (mut only_here, landed) = if head.is_empty() || is_main {
-        (vec![], vec![])
-    } else {
-        let anchors = match git::live_remote_tips(repo).await {
-            Ok(t) => git::RemoteAnchors::Live(t),
-            Err(e) => {
-                notes.push(format!(
-                    "remote unreachable ({e:#}); trusting remote-tracking refs from the last fetch"
-                ));
-                git::RemoteAnchors::TrackingRefs
-            }
-        };
-        let all = git::commits_only_here(repo, &head, branch.as_deref(), &anchors, &[], LIMIT + 1)
-            .await?;
-        match &merged {
-            Some(m) if !all.is_empty() => {
-                let heads = git::existing_commits(repo, std::slice::from_ref(&m.head_sha))
-                    .await
-                    .unwrap_or_default();
-                if heads.is_empty() {
-                    notes.push(format!(
-                        "{} is merged, but its head {} is not in this clone, so fleet cannot tell whether the commits below are in it; `git fetch` and retry",
-                        m.display_id,
-                        &m.head_sha[..m.head_sha.len().min(8)]
-                    ));
-                    (all, vec![])
-                } else {
-                    let after = git::commits_only_here(
-                        repo,
-                        &head,
-                        branch.as_deref(),
-                        &anchors,
-                        &heads,
-                        LIMIT + 1,
-                    )
-                    .await?;
-                    let landed = all.into_iter().filter(|c| !after.contains(c)).collect();
-                    (after, landed)
-                }
-            }
-            _ => (all, vec![]),
+    // A merged review counts only when its head is really on this branch: branch names get
+    // reused, and an old merged PR of the same name says nothing about today's commits.
+    if let Some(m) = &merged {
+        if !head.is_empty() && !git::is_ancestor(repo, &m.head_sha, &head).await {
+            let local = !git::existing_commits(repo, std::slice::from_ref(&m.head_sha))
+                .await
+                .unwrap_or_default()
+                .is_empty();
+            notes.push(if local {
+                format!(
+                    "{} (merged) is an older use of this branch name: its head {} is not on this branch, so it does not count",
+                    m.display_id,
+                    short(&m.head_sha)
+                )
+            } else {
+                format!(
+                    "{} is merged, but its head {} is not in this clone, so fleet cannot tell whether this branch is in it; `git fetch` and retry",
+                    m.display_id,
+                    short(&m.head_sha)
+                )
+            });
+            merged = None;
         }
-    };
-    let only_here_more = only_here.len() > LIMIT;
-    only_here.truncate(LIMIT);
+    }
 
     let keep_branch = branch.as_ref().and_then(|b| {
         if *b == r.project.base {
@@ -825,6 +849,46 @@ pub async fn gather(r: &Resolved, fleet: &Fleet) -> Result<Facts> {
             .find(|(i, x)| Some(*i) != idx && x.branch.as_deref() == Some(b.as_str()))
             .map(|(_, x)| format!("{b} is also checked out in {}", txn::tilde(&x.path)))
     });
+
+    // ── what closing would lose ──
+    // A branch must be merged: every commit in the base branch (local, remote-tracking, or
+    // live on the remote), or inside a merged review of this branch (squash/rebase merges
+    // leave the branch commits out of the base). A kept branch loses nothing.
+    // A detached checkout (`review-N`) has no branch: its commits only need to exist
+    // somewhere else (a live remote branch, a tag, a local branch).
+    let (mut only_here, landed) = if head.is_empty() || is_main || keep_branch.is_some() {
+        (vec![], vec![])
+    } else if branch.is_some() {
+        let (base, note) = git::base_anchors(repo, &r.project.base).await;
+        notes.extend(note);
+        let all = git::commits_not_in(repo, &head, &base, LIMIT + 1).await?;
+        match &merged {
+            Some(m) if !all.is_empty() => {
+                let mut with_pr = base.clone();
+                with_pr.push(m.head_sha.clone());
+                let after = git::commits_not_in(repo, &head, &with_pr, LIMIT + 1).await?;
+                let landed = all.into_iter().filter(|c| !after.contains(c)).collect();
+                (after, landed)
+            }
+            _ => (all, vec![]),
+        }
+    } else {
+        let anchors = match git::live_remote_tips(repo).await {
+            Ok(t) => git::RemoteAnchors::Live(t),
+            Err(e) => {
+                notes.push(format!(
+                    "remote unreachable ({e:#}); trusting remote-tracking refs from the last fetch"
+                ));
+                git::RemoteAnchors::TrackingRefs
+            }
+        };
+        (
+            git::commits_only_here(repo, &head, None, &anchors, &[], LIMIT + 1).await?,
+            vec![],
+        )
+    };
+    let only_here_more = only_here.len() > LIMIT;
+    only_here.truncate(LIMIT);
 
     let tasks: Vec<TaskFacts> = reg_tasks
         .into_iter()
@@ -954,6 +1018,15 @@ pub async fn gather(r: &Resolved, fleet: &Fleet) -> Result<Facts> {
 
 // ───────────────────────── plan (pure) ─────────────────────────
 
+/// The agent runs this `fleet` (its process, or its pane, is an ancestor of this process).
+fn hosts(f: &Facts, a: &AgentRow) -> bool {
+    f.host_agents.contains(&a.pid)
+        || a.pane_target
+            .as_ref()
+            .map(|p| f.host_panes.contains(p))
+            .unwrap_or(false)
+}
+
 pub fn plan(f: &Facts, opts: &CloseOpts) -> Result<ClosePlan> {
     let where_ = f
         .path
@@ -974,9 +1047,17 @@ pub fn plan(f: &Facts, opts: &CloseOpts) -> Result<ClosePlan> {
         });
     }
     if !f.only_here.is_empty() {
-        blockers.push(Blocker::Unpushed {
-            commits: f.only_here.clone(),
-            more: f.only_here_more,
+        blockers.push(if f.branch.is_some() {
+            Blocker::Unmerged {
+                base: f.project.base.clone(),
+                commits: f.only_here.clone(),
+                more: f.only_here_more,
+            }
+        } else {
+            Blocker::Unpushed {
+                commits: f.only_here.clone(),
+                more: f.only_here_more,
+            }
         });
     }
     if let Some(id) = &f.review_merged {
@@ -990,7 +1071,13 @@ pub fn plan(f: &Facts, opts: &CloseOpts) -> Result<ClosePlan> {
             ));
         }
     }
-    for a in &f.agents {
+    // An idle agent is just stopped (its conversation can be resumed). A busy one (working,
+    // or waiting on you) blocks, unless it is the agent running this very `fleet`.
+    for a in f
+        .agents
+        .iter()
+        .filter(|a| a.activity.is_busy() && !hosts(f, a))
+    {
         blockers.push(Blocker::AgentRunning {
             adapter: a.adapter.clone(),
             pid: a.pid,
@@ -1033,11 +1120,6 @@ pub fn plan(f: &Facts, opts: &CloseOpts) -> Result<ClosePlan> {
     let host_session = |s: &str| f.host_panes.iter().any(|p| p.split(':').next() == Some(s));
     let mut agent_panes = vec![];
     for a in &f.agents {
-        let pane_hosts = a
-            .pane_target
-            .as_ref()
-            .map(|p| f.host_panes.contains(p))
-            .unwrap_or(false);
         if let Some(p) = &a.pane_target {
             agent_panes.push(p.clone());
         }
@@ -1046,7 +1128,7 @@ pub fn plan(f: &Facts, opts: &CloseOpts) -> Result<ClosePlan> {
             pid: a.pid,
             pane: a.pane_target.clone(),
             session_id: a.session_id.clone(),
-            hosts_self: f.host_agents.contains(&a.pid) || pane_hosts,
+            hosts_self: hosts(f, a),
         });
     }
     let force_level = if !opts.force || f.missing {
@@ -1076,7 +1158,6 @@ pub fn plan(f: &Facts, opts: &CloseOpts) -> Result<ClosePlan> {
             branch: b.clone(),
             sha: f.head.clone(),
             upstream: f.upstream.clone(),
-            best_effort: opts.gc,
         }),
         (Some(_), Some(why)) => notes.push(format!("branch kept: {why}")),
         (None, _) => {}
@@ -1271,15 +1352,9 @@ mod tests {
             ]
         );
         match &p.txn.steps[3] {
-            Step::DeleteBranch {
-                sha,
-                upstream,
-                best_effort,
-                ..
-            } => {
+            Step::DeleteBranch { sha, upstream, .. } => {
                 assert!(sha.starts_with("89aa2b0"));
                 assert_eq!(upstream.as_deref(), Some("origin/feat/x"));
-                assert!(!best_effort);
             }
             s => panic!("{s:?}"),
         }
@@ -1299,7 +1374,8 @@ mod tests {
                 Blocker::Dirty {
                     files: vec![" M src/a.rs".into(), "?? notes.md".into()]
                 },
-                Blocker::Unpushed {
+                Blocker::Unmerged {
+                    base: "main".into(),
                     commits: vec!["1a2b3c4 feat: x".into()],
                     more: false
                 },
@@ -1327,14 +1403,7 @@ mod tests {
         let mut f = clean();
         f.dirty = vec!["?? x".into()];
         f.agents = vec![agent(4242, Some("feat-x:1.1"))];
-        let p = plan(
-            &f,
-            &CloseOpts {
-                force: true,
-                gc: false,
-            },
-        )
-        .unwrap();
+        let p = plan(&f, &CloseOpts { force: true }).unwrap();
         assert!(!p.blocked());
         assert_eq!(
             kinds(&p),
@@ -1353,7 +1422,7 @@ mod tests {
         ));
         // The same plan forced from the popup's stored facts.
         let unforced = plan(&f, &CloseOpts::default()).unwrap();
-        assert_eq!(unforced.forced(false).unwrap().txn, p.txn);
+        assert_eq!(unforced.forced().unwrap().txn, p.txn);
     }
 
     #[test]
@@ -1382,7 +1451,8 @@ mod tests {
         let p = plan(&f, &CloseOpts::default()).unwrap();
         assert_eq!(
             p.blockers,
-            vec![Blocker::Unpushed {
+            vec![Blocker::Unmerged {
+                base: "main".into(),
                 commits: vec!["9f9f9f9 wip: after merge".into()],
                 more: false
             }]
@@ -1401,14 +1471,7 @@ mod tests {
     fn main_clone_is_refused_even_forced() {
         let mut f = clean();
         f.is_main = true;
-        assert!(plan(
-            &f,
-            &CloseOpts {
-                force: true,
-                gc: false
-            }
-        )
-        .is_err());
+        assert!(plan(&f, &CloseOpts { force: true }).is_err());
     }
 
     #[test]
@@ -1440,14 +1503,7 @@ mod tests {
         f.dirty = vec!["?? x".into()]; // stale, cannot be read anyway
         f.locked = Some(String::new());
         f.sessions.clear();
-        let p = plan(
-            &f,
-            &CloseOpts {
-                force: true,
-                gc: false,
-            },
-        )
-        .unwrap();
+        let p = plan(&f, &CloseOpts { force: true }).unwrap();
         assert!(p.blockers.is_empty());
         assert!(p.txn.steps.iter().any(|s| matches!(
             s,
@@ -1529,14 +1585,7 @@ mod tests {
             panes: vec!["main:2.0".into(), "main:2.1".into()],
         }];
         f.agents = vec![agent(7, Some("main:2.1"))];
-        let p = plan(
-            &f,
-            &CloseOpts {
-                force: true,
-                gc: false,
-            },
-        )
-        .unwrap();
+        let p = plan(&f, &CloseOpts { force: true }).unwrap();
         assert_eq!(
             kinds(&p),
             [
@@ -1576,14 +1625,7 @@ mod tests {
         f.agents = vec![agent(4242, Some("feat-x:1.1"))];
         f.host_agents = vec![4242];
         f.host_panes = vec!["feat-x:1.1".into()];
-        let p = plan(
-            &f,
-            &CloseOpts {
-                force: true,
-                gc: false,
-            },
-        )
-        .unwrap();
+        let p = plan(&f, &CloseOpts { force: true }).unwrap();
         let n = p.txn.steps.len();
         assert!(p.txn.steps[n - 2..].iter().all(Step::hosts_self));
         assert!(matches!(p.txn.steps[n - 3], Step::DeleteBranch { .. }));
@@ -1600,14 +1642,7 @@ mod tests {
                 reason: "on usb".into()
             }]
         );
-        let p = plan(
-            &f,
-            &CloseOpts {
-                force: true,
-                gc: false,
-            },
-        )
-        .unwrap();
+        let p = plan(&f, &CloseOpts { force: true }).unwrap();
         assert!(p
             .txn
             .steps
@@ -1616,22 +1651,57 @@ mod tests {
     }
 
     #[test]
-    fn gc_mode_deletes_branch_best_effort() {
-        let p = plan(
-            &clean(),
-            &CloseOpts {
-                force: false,
-                gc: true,
-            },
-        )
-        .unwrap();
-        assert!(p.txn.steps.iter().any(|s| matches!(
-            s,
-            Step::DeleteBranch {
-                best_effort: true,
+    fn idle_agent_is_stopped_not_a_blocker() {
+        let mut f = clean();
+        let mut a = agent(4242, Some("feat-x:1.1"));
+        a.activity = Activity::Idle;
+        f.agents = vec![a];
+        let p = plan(&f, &CloseOpts::default()).unwrap();
+        assert!(p.blockers.is_empty(), "{:?}", p.blockers);
+        assert!(kinds(&p).contains(&"stop_agent"));
+        // Waiting on you is busy: it blocks.
+        for act in [
+            Activity::WaitPlan,
+            Activity::WaitQuestion,
+            Activity::WaitPermission,
+        ] {
+            f.agents[0].activity = act;
+            assert!(
+                plan(&f, &CloseOpts::default()).unwrap().blocked(),
+                "{act:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn busy_agent_running_this_fleet_does_not_block_its_own_close() {
+        let mut f = clean();
+        f.agents = vec![agent(4242, Some("feat-x:1.0"))]; // Working: it is running us
+        f.host_agents = vec![4242];
+        f.host_panes = vec!["feat-x:1.0".into()];
+        let p = plan(&f, &CloseOpts::default()).unwrap();
+        assert!(!p.blocked(), "{:?}", p.blockers);
+        // Its tmux session goes before the agent itself: stopping the agent kills this process.
+        let n = p.txn.steps.len();
+        assert!(
+            matches!(&p.txn.steps[n - 2], Step::KillSession { session, hosts_self: true } if session == "feat-x")
+        );
+        assert!(matches!(
+            p.txn.steps[n - 1],
+            Step::StopAgent {
+                hosts_self: true,
                 ..
             }
-        )));
+        ));
+    }
+
+    #[test]
+    fn detached_checkout_uses_unpushed_not_unmerged() {
+        let mut f = clean();
+        f.branch = None;
+        f.only_here = vec!["1a2b3c4 local".into()];
+        let p = plan(&f, &CloseOpts::default()).unwrap();
+        assert!(matches!(p.blockers[..], [Blocker::Unpushed { .. }]));
     }
 
     fn fleet_with(wts: &[(&str, &str, &str)], panes: &[(&str, &str)]) -> Fleet {
@@ -1653,6 +1723,7 @@ mod tests {
             detached: false,
             is_main: false,
             missing: false,
+            in_base: false,
         };
         Fleet {
             worktrees: wts

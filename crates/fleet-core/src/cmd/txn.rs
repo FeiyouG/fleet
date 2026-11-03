@@ -6,7 +6,7 @@
 //! failures happen before anything is lost), agents stopped before their folder goes, the
 //! worktree before its branch (git refuses to delete a checked-out branch), tmux kills last
 //! (they are the only irreversible step of a normal close), and the session hosting this very
-//! `fleet` process after everything else.
+//! `fleet` process after everything else (its tmux first, the agent that runs it last).
 //!
 //! Every step carries what its own undo needs, captured at plan time, and running a step whose
 //! target is already gone succeeds, so re-running an interrupted close finishes the job.
@@ -57,14 +57,13 @@ pub enum Step {
         /// The folder was already gone: only git's entry is dropped, nothing to re-create.
         missing: bool,
     },
-    /// Delete a local branch. Undo: `git branch <branch> <sha>` (+ upstream).
-    /// `best_effort` (gc): `git branch -d`, and a refusal (unmerged) is not a failure.
+    /// Delete a local branch (`git branch -D`: the planner already checked it is merged, or
+    /// you forced it). Undo: `git branch <branch> <sha>` (+ upstream).
     DeleteBranch {
         repo: PathBuf,
         branch: String,
         sha: String,
         upstream: Option<String>,
-        best_effort: bool,
     },
     // A future `--remote` adds `DeleteRemoteBranch { remote, branch, sha }` ranked right after
     // `DeleteBranch` (undo: push the sha back).
@@ -80,9 +79,11 @@ impl Step {
         match self {
             Step::CloseTask { .. } => 1,
             Step::RemoveSymlink { .. } => 2,
+            // After the hosting tmux kill: stopping the agent that runs this `fleet` kills
+            // this process, so anything ranked after it would never run.
             Step::StopAgent { hosts_self, .. } => {
                 if *hosts_self {
-                    7
+                    8
                 } else {
                     3
                 }
@@ -164,16 +165,9 @@ impl Step {
                     _ => " (--force --force: locked)",
                 }
             ),
-            Step::DeleteBranch {
-                branch,
-                sha,
-                best_effort,
-                ..
-            } => format!(
-                "delete branch {branch} (at {}){}",
-                short(sha),
-                if *best_effort { ", if merged" } else { "" }
-            ),
+            Step::DeleteBranch { branch, sha, .. } => {
+                format!("delete branch {branch} (at {})", short(sha))
+            }
             Step::KillPane { target, hosts_self } => format!(
                 "kill tmux pane {target}{}",
                 if *hosts_self {
@@ -303,17 +297,22 @@ pub struct TxnReport {
     pub rolled_back: Vec<RolledBack>,
     /// Steps that ran before the failure and cannot be undone (agents stopped, tmux killed).
     pub not_restorable: Vec<Step>,
+    /// Not run at all, and why (gc: the item changed since the dry run).
+    pub skipped: Option<String>,
 }
 
 impl TxnReport {
     pub fn ok(&self) -> bool {
-        self.failed.is_none()
+        self.failed.is_none() && self.skipped.is_none()
     }
     pub fn rollback_complete(&self) -> bool {
         self.rolled_back.iter().all(|r| r.error.is_none())
     }
     /// Human summary of a failure (empty when ok).
     pub fn failure_lines(&self) -> Vec<String> {
+        if let Some(why) = &self.skipped {
+            return vec![format!("SKIPPED, nothing done: {why}")];
+        }
         let Some((s, e)) = &self.failed else {
             return vec![];
         };
@@ -432,24 +431,14 @@ impl Exec for Real {
                 }
                 git::worktree_remove(repo, path, if *missing { 0 } else { *force }).await
             }
-            Step::DeleteBranch {
-                repo,
-                branch,
-                best_effort,
-                ..
-            } => {
+            Step::DeleteBranch { repo, branch, .. } => {
                 if git::rev_parse(repo, &format!("refs/heads/{branch}"))
                     .await
                     .is_none()
                 {
                     return Ok(());
                 }
-                if *best_effort {
-                    let _ = git::branch_delete(repo, branch).await;
-                    Ok(())
-                } else {
-                    git::branch_delete_force(repo, branch).await
-                }
+                git::branch_delete_force(repo, branch).await
             }
             Step::KillPane { target, .. } => tmux::kill_pane(target).await,
             Step::KillSession { session, .. } => tmux::kill_session(session).await,
@@ -604,7 +593,6 @@ mod tests {
                 branch: "feat/t".into(),
                 sha: "abc".into(),
                 upstream: None,
-                best_effort: false,
             },
             Step::KillPane {
                 target: "me:1.0".into(),
