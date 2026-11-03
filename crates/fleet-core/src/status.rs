@@ -53,13 +53,15 @@ fn is_tmp(p: &Path) -> bool {
         || s.starts_with("/var/folders/")
 }
 
-/// Would `gc` remove this worktree, and why / why not?
+/// Would `gc` remove this worktree, and why / why not? Only finished work qualifies; the
+/// close planner then checks it again (uncommitted files, unmerged commits) before anything
+/// is removed, so a "yes" here can still end up "blocked".
 pub fn gc_verdict(w: &WorktreeRow, agents: &[AgentRow], review: Option<&ReviewRow>) -> GcVerdict {
     if w.is_main {
         return GcVerdict::No("main clone".into());
     }
-    if !agents.is_empty() {
-        return GcVerdict::No("agent alive".into());
+    if agents.iter().any(|a| a.activity.is_busy()) {
+        return GcVerdict::No("agent busy".into());
     }
     if w.missing {
         return GcVerdict::Yes("folder missing".into());
@@ -67,13 +69,17 @@ pub fn gc_verdict(w: &WorktreeRow, agents: &[AgentRow], review: Option<&ReviewRo
     if w.dirty {
         return GcVerdict::No("dirty".into());
     }
-    if w.ahead > 0 {
-        return GcVerdict::No("unpushed".into());
-    }
+    // An idle agent on merged work is stopped by gc; on anything else it means "in use".
     if let Some(r) = review {
         if r.status.is_done() {
             return GcVerdict::Yes(r.status.label().into());
         }
+    }
+    if !agents.is_empty() {
+        return GcVerdict::No("agent alive".into());
+    }
+    if w.in_base && !w.detached && review.is_none() {
+        return GcVerdict::Yes("in base".into());
     }
     if w.detached && is_tmp(&w.path) {
         return GcVerdict::Yes("stale tmp".into());
@@ -103,6 +109,7 @@ mod tests {
             detached: false,
             is_main: false,
             missing: false,
+            in_base: false,
         }
     }
     fn agent(a: Activity) -> AgentRow {
@@ -194,25 +201,46 @@ mod tests {
 
     #[test]
     fn gc_rules() {
+        // A busy agent keeps it; an idle one keeps it unless the work is merged.
+        assert_eq!(
+            gc_verdict(&wt(0, 0, false), &[agent(Activity::Working)], None),
+            GcVerdict::No("agent busy".into())
+        );
         assert_eq!(
             gc_verdict(&wt(0, 0, false), &[agent(Activity::Idle)], None),
             GcVerdict::No("agent alive".into())
         );
         assert_eq!(
+            gc_verdict(
+                &wt(0, 0, false),
+                &[agent(Activity::Idle)],
+                Some(&review(ReviewStatus::Merged, Ci::None))
+            ),
+            GcVerdict::Yes("merged".into())
+        );
+        assert_eq!(
+            gc_verdict(
+                &wt(0, 0, false),
+                &[agent(Activity::WaitQuestion)],
+                Some(&review(ReviewStatus::Merged, Ci::None))
+            ),
+            GcVerdict::No("agent busy".into())
+        );
+        // Pushed or not is not the question any more: the planner checks "merged".
+        assert_eq!(
             gc_verdict(&wt(2, 0, false), &[], None),
-            GcVerdict::No("unpushed".into())
+            GcVerdict::No("in use".into())
         );
         assert_eq!(
             gc_verdict(&wt(0, 0, true), &[], None),
             GcVerdict::No("dirty".into())
         );
+        let mut b = wt(0, 0, false);
+        b.in_base = true;
+        assert_eq!(gc_verdict(&b, &[], None), GcVerdict::Yes("in base".into()));
         assert_eq!(
-            gc_verdict(
-                &wt(0, 0, false),
-                &[],
-                Some(&review(ReviewStatus::Merged, Ci::None))
-            ),
-            GcVerdict::Yes("merged".into())
+            gc_verdict(&b, &[agent(Activity::Idle)], None),
+            GcVerdict::No("agent alive".into())
         );
         let mut t = wt(0, 0, false);
         t.detached = true;

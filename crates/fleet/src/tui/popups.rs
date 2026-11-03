@@ -2,7 +2,8 @@ use super::app::App;
 use super::keys::{Action, Key};
 use super::util::{accent, dim};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use fleet_core::cmd::gc::{self, GcPlan};
+use fleet_core::cmd::close::ClosePlan;
+use fleet_core::cmd::gc::GcPlan;
 use fleet_core::Config;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -39,10 +40,8 @@ pub enum PopupCmd {
         old: String,
         new: String,
     },
-    RemoveWorktree {
-        repo: String,
-        path: std::path::PathBuf,
-    },
+    /// Close a task; `plan.force` says whether blockers were overridden.
+    Close(Box<ClosePlan>),
     ApplyGc(GcPlan),
 }
 
@@ -58,6 +57,8 @@ pub enum Popup {
         cmd: PopupCmd,
     },
     Start(StartForm),
+    /// Everything `w x` would remove, its blockers, and (once `F` is pressed) force.
+    Close(Box<ClosePlan>),
     Message(MessageForm),
     Gc {
         plan: GcPlan,
@@ -323,8 +324,11 @@ impl Popup {
     pub fn confirm(text: String, cmd: PopupCmd) -> Popup {
         Popup::Confirm { text, cmd }
     }
+    pub fn close(plan: Box<ClosePlan>) -> Popup {
+        Popup::Close(plan)
+    }
     pub fn gc(plan: GcPlan) -> Popup {
-        let n = plan.actions.len();
+        let n = plan.txns.len();
         Popup::Gc {
             plan,
             checked: vec![true; n],
@@ -444,6 +448,13 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
             }
             _ => Outcome::Keep(Popup::Confirm { text, cmd }),
         },
+        Popup::Close(plan) => {
+            let (out, err) = close_keys(plan, ev.code);
+            if let Some(e) = err {
+                app.set_status(e, true);
+            }
+            out
+        }
         Popup::Gc {
             plan,
             mut checked,
@@ -451,7 +462,7 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
         } => match ev.code {
             KeyCode::Esc | KeyCode::Char('q') => Outcome::Close,
             KeyCode::Char('j') | KeyCode::Down => {
-                selected = (selected + 1).min(plan.actions.len().saturating_sub(1));
+                selected = (selected + 1).min(plan.txns.len().saturating_sub(1));
                 Outcome::Keep(Popup::Gc {
                     plan,
                     checked,
@@ -486,18 +497,18 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 })
             }
             KeyCode::Enter => {
-                let actions: Vec<_> = plan
-                    .actions
+                let txns: Vec<_> = plan
+                    .txns
                     .iter()
                     .zip(&checked)
                     .filter(|(_, c)| **c)
                     .map(|(a, _)| a.clone())
                     .collect();
-                if actions.is_empty() {
+                if txns.is_empty() {
                     Outcome::Close
                 } else {
                     Outcome::Submit(PopupCmd::ApplyGc(GcPlan {
-                        actions,
+                        txns,
                         blocked: plan.blocked.clone(),
                     }))
                 }
@@ -687,6 +698,32 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
     }
 }
 
+/// Keys of the close popup (pure, so it is tested). Nothing blocks: `y`/`Enter` closes.
+/// Blocked: `F` arms force and lists in red what will be lost; only a second `F` closes
+/// (`Enter`/`y` do nothing then, so a reflexive Enter never destroys work). Returns a
+/// message for the status line.
+fn close_keys(plan: Box<ClosePlan>, code: KeyCode) -> (Outcome, Option<String>) {
+    let armed = plan.force && !plan.blockers.is_empty();
+    match code {
+        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+            (Outcome::Close, None)
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if !plan.blocked() && !armed => {
+            (Outcome::Submit(PopupCmd::Close(plan)), None)
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter if armed => (
+            Outcome::Keep(Popup::Close(plan)),
+            Some("press F again to close anyway (the red items are lost), Esc to cancel".into()),
+        ),
+        KeyCode::Char('F') if armed => (Outcome::Submit(PopupCmd::Close(plan)), None),
+        KeyCode::Char('F') if plan.blocked() => match plan.forced() {
+            Ok(p) => (Outcome::Keep(Popup::Close(Box::new(p))), None),
+            Err(e) => (Outcome::Keep(Popup::Close(plan)), Some(format!("{e:#}"))),
+        },
+        _ => (Outcome::Keep(Popup::Close(plan)), None),
+    }
+}
+
 /// Suspend the TUI, run `$EDITOR` on a temp file, resume. Returns `None` when unchanged.
 fn edit_in_editor(current: &str) -> anyhow::Result<Option<String>> {
     use crossterm::{execute, terminal};
@@ -711,6 +748,62 @@ fn edit_in_editor(current: &str) -> anyhow::Result<Option<String>> {
 }
 
 // ───────────────────────── drawing ─────────────────────────
+
+/// Body of the close popup: what is removed (with undo), notes, blockers, keys.
+fn close_lines(plan: &ClosePlan) -> Vec<Line<'static>> {
+    let red = Style::default().fg(Color::Red);
+    let yellow = Style::default().fg(Color::Yellow);
+    let mut lines = vec![
+        Line::from(Span::styled(plan.header(), accent())),
+        Line::from(Span::styled("this removes, in this order:", dim())),
+    ];
+    let w = plan
+        .step_lines()
+        .iter()
+        .map(|(d, _)| d.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (i, (d, u)) in plan.step_lines().into_iter().enumerate() {
+        let undo_style = if u.starts_with("cannot") {
+            yellow
+        } else {
+            dim()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!(" {:>2} {d:<w$}  ", i + 1)),
+            Span::styled(u, undo_style),
+        ]));
+    }
+    for n in &plan.notes {
+        lines.push(Line::from(Span::styled(format!(" note: {n}"), dim())));
+    }
+    if !plan.blockers.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if plan.force {
+                "LOST when you press F again:"
+            } else {
+                "blocked — this would be lost:"
+            },
+            red.add_modifier(Modifier::BOLD),
+        )));
+        for l in plan.blocker_lines(10) {
+            lines.push(Line::from(Span::styled(format!(" {l}"), red)));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if plan.blocked() {
+            "F = force (shows what is lost, then F again closes) · Esc cancel"
+        } else if plan.force && !plan.blockers.is_empty() {
+            "F again = close anyway · Esc cancel"
+        } else {
+            "Enter / y = close · Esc cancel · all-or-nothing: a failure restores what was done"
+        },
+        dim(),
+    )));
+    lines
+}
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width.saturating_sub(2));
@@ -833,24 +926,31 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             selected,
         } => {
             let mut items: Vec<ListItem> = plan
-                .actions
+                .txns
                 .iter()
                 .zip(checked)
                 .enumerate()
-                .map(|(i, (a, c))| {
+                .map(|(i, (t, c))| {
                     let mark = if *c { "[x]" } else { "[ ]" };
                     let style = if i == *selected {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
                         Style::default()
                     };
-                    ListItem::new(Line::from(Span::styled(
-                        format!(" {mark} {}", gc::describe(a)),
+                    let mut lines = vec![Line::from(Span::styled(
+                        format!(" {mark} {}", t.label),
                         style,
-                    )))
+                    ))];
+                    for s in &t.steps {
+                        lines.push(Line::from(Span::styled(
+                            format!("       {}", s.describe()),
+                            dim(),
+                        )));
+                    }
+                    ListItem::new(Text::from(lines))
                 })
                 .collect();
-            if plan.actions.is_empty() {
+            if plan.txns.is_empty() {
                 items.push(ListItem::new(Span::styled(" nothing to clean", dim())));
             }
             for (n, r) in &plan.blocked {
@@ -860,13 +960,41 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 )));
             }
             items.push(ListItem::new(Span::styled(
-                " Space toggle · a all · Enter apply checked · Esc cancel",
+                " Space toggle · a all · Enter apply checked (each all-or-nothing) · Esc cancel",
                 dim(),
             )));
-            let rect = centered(area, 100, items.len() as u16 + 2);
+            let h: usize = items.iter().map(ListItem::height).sum();
+            let rect = centered(area, 110, h as u16 + 2);
             f.render_widget(Clear, rect);
             f.render_widget(
                 List::new(items).block(frame_block("worktree gc (dry run)")),
+                rect,
+            );
+        }
+        Popup::Close(plan) => {
+            let lines = close_lines(plan);
+            let rect = centered(area, 120, lines.len() as u16 + 2);
+            f.render_widget(Clear, rect);
+            let (title, border) = if plan.force && !plan.blockers.is_empty() {
+                (
+                    "FORCE close — the items marked lost go for good",
+                    Color::Red,
+                )
+            } else if plan.blocked() {
+                ("close task — blocked", Color::Yellow)
+            } else {
+                ("close task", Color::Magenta)
+            };
+            f.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(border))
+                        .title(Span::styled(
+                            format!(" {title} "),
+                            Style::default().fg(border),
+                        )),
+                ),
                 rect,
             );
         }
@@ -1107,6 +1235,82 @@ fn draw_picker(f: &mut Frame, area: Rect, p: &Picker, models: &[String], none_la
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_core::cmd::close::{self, CloseOpts, Facts};
+    use fleet_core::config::Project;
+
+    fn plan(dirty: bool) -> Box<ClosePlan> {
+        let f = Facts {
+            project: Project {
+                name: "svc".into(),
+                repo: "/r".into(),
+                worktrees: None,
+                reviews: None,
+                base: "main".into(),
+            },
+            path: Some("/w/feat-x".into()),
+            name: "feat-x".into(),
+            is_main: false,
+            listed: true,
+            missing: false,
+            branch: Some("feat/x".into()),
+            branch_guessed: false,
+            head: "89aa2b0aaaaaaaaa".into(),
+            upstream: None,
+            locked: None,
+            dirty: if dirty { vec!["?? x".into()] } else { vec![] },
+            only_here: vec![],
+            only_here_more: false,
+            landed: vec![],
+            review_merged: None,
+            keep_branch: None,
+            tasks: vec![],
+            agents: vec![],
+            sessions: vec![],
+            host_panes: vec![],
+            host_agents: vec![],
+            notes: vec![],
+        };
+        Box::new(close::plan(&f, &CloseOpts::default()).unwrap())
+    }
+
+    #[test]
+    fn clean_plan_closes_on_enter() {
+        assert!(matches!(
+            close_keys(plan(false), KeyCode::Enter).0,
+            Outcome::Submit(PopupCmd::Close(p)) if !p.force
+        ));
+        assert!(matches!(
+            close_keys(plan(false), KeyCode::Esc).0,
+            Outcome::Close
+        ));
+    }
+
+    #[test]
+    fn blocked_plan_needs_f_twice() {
+        let (out, _) = close_keys(plan(true), KeyCode::Enter);
+        let Outcome::Keep(Popup::Close(p)) = out else {
+            panic!("Enter on a blocked plan must keep the popup")
+        };
+        let (out, err) = close_keys(p, KeyCode::Char('F'));
+        assert!(err.is_none());
+        let Outcome::Keep(Popup::Close(p)) = out else {
+            panic!("F arms force")
+        };
+        assert!(p.force && !p.blocked());
+        assert!(close_lines(&p)
+            .iter()
+            .any(|l| l.to_string().contains("LOST")));
+        // Armed: Enter / y do nothing but explain; only a second F closes.
+        for k in [KeyCode::Enter, KeyCode::Char('y')] {
+            let (out, msg) = close_keys(p.clone(), k);
+            assert!(matches!(out, Outcome::Keep(Popup::Close(_))), "{k:?}");
+            assert!(msg.unwrap().contains("F again"));
+        }
+        assert!(matches!(
+            close_keys(p, KeyCode::Char('F')).0,
+            Outcome::Submit(PopupCmd::Close(p)) if p.force
+        ));
+    }
 
     #[test]
     fn picker_filters_by_every_word() {

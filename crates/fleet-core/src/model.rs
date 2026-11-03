@@ -47,6 +47,11 @@ pub enum Activity {
 }
 
 impl Activity {
+    /// Working, or waiting on you (plan, question, permission): stopping it cuts work off.
+    /// Idle agents are not busy: `close` and gc stop them (the conversation resumes later).
+    pub fn is_busy(self) -> bool {
+        !matches!(self, Activity::Idle | Activity::None)
+    }
     pub fn is_waiting(self) -> bool {
         matches!(
             self,
@@ -220,6 +225,10 @@ pub struct WorktreeRow {
     pub detached: bool,
     pub is_main: bool,
     pub missing: bool,
+    /// The branch tip is in the project's base branch (local or remote-tracking): merged with
+    /// a merge commit, fast-forwarded, or no commits of its own yet.
+    #[serde(default)]
+    pub in_base: bool,
 }
 
 impl WorktreeRow {

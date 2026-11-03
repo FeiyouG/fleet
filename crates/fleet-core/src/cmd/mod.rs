@@ -1,6 +1,7 @@
-//! Commands that change the world: start, rename, review, send, gc.
+//! Commands that change the world: start, rename, review, send, close, gc.
 
 pub mod agent_hook;
+pub mod close;
 pub mod gc;
 pub mod project;
 pub mod rename;
@@ -8,6 +9,7 @@ pub mod review;
 pub mod send;
 pub mod setup;
 pub mod start;
+pub mod txn;
 
 use anyhow::{Context, Result};
 use std::net::TcpListener;

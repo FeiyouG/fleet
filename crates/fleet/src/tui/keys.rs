@@ -48,7 +48,7 @@ pub enum Action {
     WorktreeShell,
     WorktreePush,
     WorktreePull,
-    WorktreeRemove,
+    WorktreeClose,
     WorktreeGc,
     WorktreeColumns,
     WorktreeOpenReview,
@@ -109,7 +109,7 @@ impl Action {
         Action::WorktreeShell,
         Action::WorktreePush,
         Action::WorktreePull,
-        Action::WorktreeRemove,
+        Action::WorktreeClose,
         Action::WorktreeGc,
         Action::WorktreeColumns,
         Action::WorktreeOpenReview,
@@ -170,7 +170,7 @@ impl Action {
             Action::WorktreeShell => ("worktree.shell", "w s", "shell here (tmux window)"),
             Action::WorktreePush => ("worktree.push", "w p", "push -u"),
             Action::WorktreePull => ("worktree.pull", "w P", "pull --ff-only"),
-            Action::WorktreeRemove => ("worktree.remove", "w D", "remove worktree (confirm)"),
+            Action::WorktreeClose => ("worktree.close", "w x", "close task: everything (confirm)"),
             Action::WorktreeGc => ("worktree.gc", "w g", "gc (dry run)"),
             Action::WorktreeColumns => ("worktree.columns", "w c", "toggle name/path columns"),
             Action::WorktreeOpenReview => ("worktree.open_review", "w o", "open its review"),
@@ -481,6 +481,10 @@ mod tests {
         match km.resolve(&[g, Key::parse("g").unwrap()]) {
             Resolution::Exact(Action::Top) => {}
             _ => panic!("g g should be Top"),
+        }
+        match km.resolve(&[Key::parse("w").unwrap(), Key::parse("x").unwrap()]) {
+            Resolution::Exact(Action::WorktreeClose) => {}
+            _ => panic!("w x should be WorktreeClose"),
         }
     }
 }

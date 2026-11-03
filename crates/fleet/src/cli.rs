@@ -1,7 +1,7 @@
 use crate::tui;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use fleet_core::cmd::{self, gc, rename, review, send, start};
+use fleet_core::cmd::{self, close, gc, rename, review, send, start};
 use fleet_core::model::Fleet;
 use fleet_core::{Config, Engine};
 use std::io::{IsTerminal, Read, Write};
@@ -44,7 +44,7 @@ enum Cmd {
     /// Reviews (MRs / PRs): list, start a review agent
     #[command(subcommand)]
     Review(ReviewCmd),
-    /// Worktrees: list, gc
+    /// Worktrees: list, gc, close
     #[command(subcommand)]
     Worktree(WorktreeCmd),
     /// tmux: list sessions/windows/panes with what runs in them
@@ -52,6 +52,8 @@ enum Cmd {
     Tmux(TmuxCmd),
     /// Alias of `agent start`
     Start(StartArgs),
+    /// Alias of `worktree close`
+    Close(CloseArgs),
     /// Print the config path and an example config
     Config {
         /// Write the example config if none exists (the cwd's repo becomes the first project)
@@ -187,6 +189,25 @@ enum WorktreeCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Finish a task: stop its agents, kill its tmux, remove the worktree and its local
+    /// branch, close the registry task. All-or-nothing; refuses when files are uncommitted,
+    /// the branch is not merged, an agent is busy, or the worktree is locked.
+    Close(CloseArgs),
+}
+
+#[derive(Args, Clone)]
+struct CloseArgs {
+    /// Task name, worktree folder name, branch, tmux session, or a path
+    target: String,
+    /// Close even with uncommitted files, an unmerged branch, a busy agent or a lock
+    #[arg(long)]
+    force: bool,
+    /// Do not ask (without it, a non-interactive run is a dry run)
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Print the plan (and the result) as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -258,8 +279,19 @@ fn cli_config_path(explicit: &Option<PathBuf>) -> PathBuf {
         .unwrap_or_else(fleet_core::config::config_path)
 }
 
+/// A one-shot snapshot without per-branch merged-review lookups: one forge call per project,
+/// not one per worktree (`fleet status` may run every few seconds from a status bar).
 async fn snapshot(cfg: &Config) -> Fleet {
-    Engine::new(cfg.clone()).snapshot(true).await
+    Engine::new(cfg.clone())
+        .merged_lookups(false)
+        .snapshot(true)
+        .await
+}
+
+/// A snapshot with merged reviews looked up per worktree branch, for the commands that show
+/// or act on gc verdicts (`worktree list`, `worktree gc`).
+async fn snapshot_gc(engine: &Engine) -> Fleet {
+    engine.snapshot(true).await
 }
 
 fn print_json<T: serde::Serialize>(v: &T) -> Result<()> {
@@ -360,7 +392,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 agent,
                 no_attach,
             } => {
-                let engine = Engine::new(cfg);
+                let engine = Engine::new(cfg).merged_lookups(false);
                 let repo = repo.or(project).or_else(|| cwd_repo(&engine.config));
                 let out = review::start(
                     &engine,
@@ -394,7 +426,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
         },
         Cmd::Worktree(w) => match w {
             WorktreeCmd::List { json } => {
-                let mut f = snapshot(&cfg).await;
+                let mut f = snapshot_gc(&Engine::new(cfg.clone())).await;
                 if let Some(p) = &project {
                     f.worktrees.retain(|w| w.worktree.repo == *p);
                 }
@@ -425,49 +457,52 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 Ok(())
             }
             WorktreeCmd::Gc { yes, json } => {
-                let f = snapshot(&cfg).await;
-                let plan = gc::plan(&f, &cfg);
+                let engine = Engine::new(cfg.clone());
+                let f = snapshot_gc(&engine).await;
+                let plan = gc::plan(&f, &cfg).await;
                 if json {
                     print_json(&plan)?;
                     if !yes {
                         return Ok(());
                     }
                 } else {
-                    if plan.actions.is_empty() {
+                    if plan.txns.is_empty() {
                         println!("nothing to clean");
                     }
-                    for a in &plan.actions {
-                        println!("  {}", gc::describe(a));
+                    for t in &plan.txns {
+                        println!("  {}", gc::describe(t));
                     }
                     for (n, r) in &plan.blocked {
                         println!("  blocked: {n} ({r})");
                     }
                 }
-                if plan.actions.is_empty() {
+                if plan.txns.is_empty() {
                     return Ok(());
                 }
-                if !yes {
-                    if !std::io::stdin().is_terminal() {
-                        println!("(dry run; pass --yes to apply)");
-                        return Ok(());
-                    }
-                    print!("apply {} actions? [y/N] ", plan.actions.len());
-                    std::io::stdout().flush()?;
-                    let mut s = String::new();
-                    std::io::stdin().read_line(&mut s)?;
-                    if !matches!(s.trim(), "y" | "Y" | "yes") {
-                        println!("aborted");
-                        return Ok(());
+                if !yes && !confirm(&format!("apply {} items?", plan.txns.len()))? {
+                    return Ok(());
+                }
+                let fresh = snapshot_gc(&engine).await;
+                let reports = gc::apply(&plan, &fresh, &cfg, &progress()).await;
+                let failed: Vec<_> = reports.iter().filter(|r| !r.ok()).collect();
+                for r in &failed {
+                    eprintln!("{}:", r.label);
+                    for l in r.failure_lines() {
+                        eprintln!("  {l}");
                     }
                 }
-                let results = gc::apply(&plan, &cfg, &progress()).await;
-                let failed = results.iter().filter(|(_, r)| r.is_err()).count();
-                if failed > 0 {
-                    bail!("{failed} action(s) failed");
+                if !failed.is_empty() {
+                    bail!(
+                        "{} of {} item(s) not done (failed and rolled back, or skipped)",
+                        failed.len(),
+                        reports.len()
+                    );
                 }
                 Ok(())
             }
+            WorktreeCmd::Close(args) => close_cmd(args, cfg, project).await,
         },
+        Cmd::Close(args) => close_cmd(args, cfg, project).await,
         Cmd::Tmux(TmuxCmd::List { json }) => {
             let f = snapshot(&cfg).await;
             if json {
@@ -665,6 +700,89 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
     }
 }
 
+/// `[y/N]` on a terminal; without one it is a dry run (returns false).
+fn confirm(q: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        println!("(dry run; pass --yes to apply)");
+        return Ok(false);
+    }
+    print!("{q} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s)?;
+    if matches!(s.trim(), "y" | "Y" | "yes") {
+        Ok(true)
+    } else {
+        println!("aborted");
+        Ok(false)
+    }
+}
+
+async fn close_cmd(a: CloseArgs, cfg: Config, project: Option<String>) -> Result<()> {
+    // close asks the forge about its one branch itself; no per-worktree lookups needed.
+    let engine = Engine::new(cfg.clone()).merged_lookups(false);
+    let f = engine.snapshot(true).await;
+    let r = close::resolve(&f, &cfg, &a.target, project.as_deref()).await?;
+    let opts = close::CloseOpts { force: a.force };
+    let plan = close::plan(&close::gather(&r, &f).await?, &opts)?;
+    if a.json {
+        print_json(&plan)?;
+    } else {
+        println!("{}", plan.header());
+        let w = plan
+            .step_lines()
+            .iter()
+            .map(|(d, _)| d.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (i, (d, u)) in plan.step_lines().iter().enumerate() {
+            println!("  {} {d:<w$}  {u}", i + 1);
+        }
+        for n in &plan.notes {
+            println!("  note: {n}");
+        }
+        if plan.force && !plan.blockers.is_empty() {
+            println!("--force: these will be lost:");
+            for l in plan.blocker_lines(10) {
+                println!("  {l}");
+            }
+        }
+    }
+    if plan.blocked() {
+        bail!("{}", close::refusal(&plan));
+    }
+    if !a.yes && !confirm(&format!("close {}?", plan.target.name))? {
+        return Ok(());
+    }
+    let fresh = engine.snapshot(false).await;
+    let rep = close::apply_real(&plan, &fresh, &opts, &progress()).await?;
+    if a.json {
+        print_json(&rep)?;
+    }
+    if !rep.ok() {
+        for l in rep.failure_lines() {
+            eprintln!("{l}");
+        }
+        bail!("close {} failed", plan.target.name);
+    }
+    if !a.json {
+        println!("closed {}", plan.target.name);
+        for s in &rep.done {
+            if let cmd::txn::Step::StopAgent {
+                adapter,
+                session_id,
+                ..
+            } = s
+            {
+                if let Some(h) = cmd::txn::resume_hint(adapter, session_id.as_deref()) {
+                    println!("  resume its conversation later: {h}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The project whose repo contains the cwd (no single-project fallback).
 fn cwd_project_strict(cfg: &Config) -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
@@ -707,7 +825,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     &repo,
                 )?,
             };
-            let engine = Engine::new(cfg);
+            let engine = Engine::new(cfg).merged_lookups(false);
             let out = start::start(
                 &engine,
                 start::StartOpts {
@@ -815,7 +933,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
             mode,
             model,
         } => {
-            let engine = Engine::new(cfg);
+            let engine = Engine::new(cfg).merged_lookups(false);
             let f = engine.snapshot(false).await;
             let msg = fleet_core::agents::SendMsg {
                 text: text.join(" "),

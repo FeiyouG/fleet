@@ -705,3 +705,165 @@ The v2 fields (`control_url`, `token`, `current_session`) live in the agent-neut
 Verified [LOCAL] on the pre-merge branch, throwaway agents (temp repo, temp data dir, free models): start with `--model opencode/big-pickle` → reply from Big Pickle; `send --model opencode/glm-5.3-flash-free` → that turn from GLM with agent `build` kept; a following plain `send` → back to Big Pickle; bad token → 401.
 
 Deploy order: old plugin + new fleet → no `control_url`, plain messages go by tmux keys, overrides error with the setup hint. New plugin + old fleet → extra state-file fields are ignored; old fleet's port-based send works as before where the port listens.
+
+---
+
+# fleet v0.3 — close a task
+
+**Settled:** works on any worktree (by task, folder, branch, tmux session or path) · removes agents, tmux, worktree, *local* branch, registry task, rename symlinks; remote branches untouched · refuses when something would be lost, `--force` overrides · all-or-nothing with rollback, irreversible steps last · TUI confirm popup listing everything, force only when blocked.
+
+## Background (terms used below)
+
+- **Task**: a git worktree + its branch + a tmux session (agent pane, nvim, shells) + agent processes + a registry row (fleet-started tasks only) + rename symlinks (left at old paths by `fleet agent rename`).
+- **Transaction**: an ordered list of steps that either all happen, or the ones done are undone in reverse order when a later one fails.
+- **Blocker**: something `close` would lose; it refuses unless `--force`.
+
+# SECTION 1 — Decisions
+
+## Q1. Level: **Decided: close acts on the whole task, from any row.**
+`fleet worktree close TARGET` (alias `fleet close`); TUI `w x` on a worktree, agent, session or pane row closes that row's task. A destructive key must not change meaning with the cursor position. `fleet agent stop` (`a x`) and tmux kill (`K`) stay the narrow verbs. The old `w D` (bare `git worktree remove`, leaving branch, session and registry row behind) is replaced by `w x`. A review row with several local worktrees asks you to select one.
+
+## Q2. Closing from inside the task: **Decided: the pane/session/agent hosting `fleet` is killed last.**
+`fleet` walks its own parent processes; a step whose target hosts it is ranked after everything else, and the summary is logged before it runs. So `fleet close` typed in the task's own session works, and an agent can close its own task with `--force --yes`.
+
+## Q3. "Would be lost" commits: **Decided: commits reachable from no remote branch, no tag and no other local branch; a merged review downgrades them to a note.**
+`git rev-list HEAD --not --exclude=<own branch> --branches --remotes --tags`. Today's gc rule (`ahead > 0`) misses a branch that was never pushed (no upstream ⇒ ahead = 0). Counting other local branches too means commits already merged into a local `main` are not "lost". A merged MR/PR (squash merge leaves the branch commits on no remote) is a note, not a blocker. gc uses the same rule, so it no longer removes a detached `$TMPDIR` worktree holding the only copy of a commit.
+
+# SECTION 2 — Changes
+
+## Change 1 🔴 Transaction engine (`cmd/txn.rs`), shared by close and gc
+
+`Step` carries everything its undo needs (captured at plan time); `Step::rank` is the one place the order lives; `Txn::new` sorts by it; `apply(txn, exec, log)` runs steps, and on the first failure undoes the done reversible steps in reverse, returning a `TxnReport` (done, failed, rolled_back with per-step errors, not_restorable). `Exec` is a trait: `Real` (git, tmux, registry, fs, signals) and a fake in tests. Running a step whose target is already gone succeeds (re-runs are safe).
+
+| # | Step | Runs | Undo on a later failure | Cannot be restored |
+|---|---|---|---|---|
+| 1 | close registry task(s) | `closed_at = now` | reopen (`closed_at = NULL`) | — |
+| 2 | remove rename symlink(s) | `rm` | re-create the link | — |
+| 3 | stop agent(s) (only reached with `--force`) | kill its tmux pane (SIGHUP), else SIGTERM; SIGKILL after 5 s; waits for exit | none | the process; the conversation resumes with `opencode -s <session>` |
+| 4 | remove worktree | `git worktree remove [-f [-f]]` (`-f` only when forced and dirty, `-f -f` when forced and locked) | `git worktree add <path> <branch>` / `--detach <sha>` | with `--force`: uncommitted and untracked files; always: ignored files (build output) |
+| 5 | delete local branch | `git branch -D` (gc: `-d`, a refusal is fine) | `git branch <b> <sha>` + `--set-upstream-to` | — |
+| 6 | kill tmux | `kill-session` when every pane is in the worktree or it is the task's registered session, else `kill-pane` per pane | none | scrollback, unsaved editor buffers |
+| 7 | kill what hosts `fleet` (Q2) | as 3 / 6 | never needed: nothing runs after it | as 3 / 6 |
+
+Why this order: cheap reversible steps first, so most failures happen before anything is lost; agents stopped before their folder goes, so nothing writes into it; worktree before branch because git refuses to delete a checked-out branch; tmux kills are the only irreversible step of a normal close, so they come last. A future `--remote` adds `DeleteRemoteBranch` right after step 5 (`CloseOpts` has the seam).
+
+If an undo itself fails, the report says *rollback incomplete* and lists what is left in which state (exit 1). Proven end-to-end: a `reference-transaction` hook refusing the branch delete makes close fail at step 5 and restore steps 4, 2, 1 with the tmux session untouched.
+
+## Change 2 🔴 `cmd/close.rs`: resolve → gather → plan → apply
+
+- **resolve**: a path (any folder inside a worktree, or a rename symlink; any repo: `git rev-parse --git-common-dir` finds the main clone, configured or not), else a registry slug, worktree folder name, branch or tmux session. Several matches → error listing them (the cwd's project breaks ties).
+- **gather** (all reads): porcelain entry (full sha, branch, upstream, lock), `git status --porcelain`, commits only here (Q3), merged review from the snapshot, whether the branch must stay (project base, or checked out elsewhere), registry tasks for the path or any old path, agents and panes inside the worktree (not inside a nested one), sessions (whole or shared), the ancestors of this process. When git no longer lists the worktree but a registry task remains (an earlier close stopped after step 4), it finishes the job.
+- **plan** (pure, unit-tested): refuses the main clone (even forced); blockers = dirty, commits only here, running agents, lock; steps per the table; notes (merged review, branch kept, folder already gone, own session last, remote untouched). `ClosePlan::forced()` re-plans from the stored facts (the popup's `F`).
+- **apply**: gathers and plans again; refuses when blocked, and when the steps differ from what you confirmed ("changed since you confirmed, nothing was done").
+
+## Change 3 🟠 gc on the same planner
+
+Each `gc_verdict = yes` worktree goes through `close::plan(force: false, gc: true)`: blocked plans become `blocked`, others become one transaction (labelled with the gc reason). Orphans keep small transactions: a session whose cwd is gone, a task whose worktree is gone (+ its links), links of a task whose agent is gone. Transactions apply independently. `fleet worktree gc --json` is now `{txns: [{label, steps: [{kind, …}]}], blocked}` (was `{actions}`); the gc popup toggles per transaction. `git worktree prune` (which pruned every stale entry of the repo) is no longer used: `git worktree remove` on a missing folder drops just that entry.
+
+## Change 4 🟠 CLI and TUI
+
+- `fleet worktree close TARGET [--force] [--yes] [--json]`, alias `fleet close`: prints the steps with their undo, notes, and (forced) what will be lost; blocked → the refusal with every file/commit/agent, exit 1; TTY → `[y/N]`; no TTY and no `--yes` → dry run. On failure: the failed step, what was rolled back, what could not be, exit 1.
+- TUI `w x` (`worktree.close`): the plan is built in a background task and opens a popup (border yellow when blocked, red when forced). Blocked: `Enter` does nothing, `F` arms force; then `Enter` closes. `fleet agent stop` now waits for the agent to exit (same routine as step 3).
+
+## Tests
+
+Unit: planner (order, each blocker with exact contents, force, merged note, main clone, kept branch, detached restore, missing folder, half-finished re-run, shared session, own session/agent last, lock), name resolution, transaction rollback at every failure index and a failing undo, registry reopen and old-path lookup, porcelain `locked`, popup keys. End-to-end: `scripts/e2e-close.sh` (42 checks; scratch repo + bare origin under `/tmp`, isolated registry, opencode data dir and tmux server, a stub `opencode` binary).
+
+## Known gaps
+
+- No on-disk journal: if `fleet` itself is killed mid-transaction, nothing is rolled back; re-running `close` finishes the job (every step is idempotent and a half-closed task is still resolvable through its registry row).
+- A locked worktree is re-added unlocked by a rollback.
+- Remote branches are never deleted (future `--remote`).
+
+## Revision after a real-world run (v0.3.1)
+
+Three squash-merged GitLab MRs in monid-services were closed with the first build. Two closed, but
+only by luck; one could not be closed at all.
+
+**Fix A 🔴 Stale remote-tracking refs counted as "pushed".** The "commits only here" check used
+`--remotes`, i.e. local `refs/remotes/*`. GitLab had already deleted the merged branches, but
+`origin/<branch>` still existed locally, so the commits looked safe. After `git fetch --prune` the
+same close would have been blocked. Now the anchors are the branch tips that exist on the remotes
+*now* (`git ls-remote --heads <remote>`, restricted to commits present locally, 20 s timeout, no
+prompts). When a remote is unreachable fleet falls back to the tracking refs and says so in a note.
+
+**Fix B 🔴 A merged review could never be seen.** Both forges are fetched open-only
+(`state=opened`, `--state open`), so `review_merged` and `gc_verdict`'s `merged` rule were dead.
+`ReviewAdapter::merged_for_branch(branch)` (GitLab `merge_requests?state=merged&source_branch=`,
+GitHub `gh pr list --head <b> --state merged`) is asked:
+- by the snapshot, for every non-main worktree branch with no open review (cached per
+  `(source, branch)` for `review_ttl_secs`, looked up in the background in the TUI, awaited by
+  one-shot CLI commands); the joiner matches these to worktrees only, never to Reviews rows, so
+  `gc_verdict` sees `merged`;
+- by `close::gather` directly (live), when the snapshot has none.
+"Landed" is then precise rather than trusting the status: the commits only here are recomputed
+with the merged review's head sha as an extra anchor. Commits it contains become a note; commits
+after it (or when its head is not in the clone: a note says `git fetch`) still block.
+
+**Fix C 🔴 A worktree-less task could not be closed.** `internal-api-deno`: folder and git entry
+gone, but branch `refactor/internal-api-deno` and a 2-pane session remained; every target failed.
+`Resolved` is now `{project, path: Option, branch: Option}`. Name resolution runs in two tiers:
+listed worktrees, registry slugs and sessions on listed worktrees first; only when none match,
+leftovers — tmux panes in a vanished folder (by session name or folder name; the project is the
+one whose repo or worktrees dir contains the folder) and local branches checked out nowhere named
+`<target>` or `*/<target>`. A vanished folder and exactly one branch named like it merge into one
+candidate. `gather` plans the remaining steps (close registry task, delete branch, kill session),
+with a note when the branch was matched by name only. A relative `refactor/x` that does not exist
+on disk is treated as a name, not a path.
+
+Also: blockers and resume hints name the agent's adapter (`claude --resume`, `codex resume`), and
+the e2e script drives tmux only through an explicit socket (see `AGENTS.md`): run from inside your
+own tmux, a bare `tmux kill-server` ignores `TMUX_TMPDIR` and kills your server.
+
+## Revision after review (v0.3.2): close only what is merged
+
+Review of PR #2 found three bugs (reproduced with the e2e setup) and the owner restated the rule
+for close. Decisions:
+
+**Rule.** `fleet worktree close` removes the worktree, its tmux session(s), its local branch, the
+registry row and rename links. It refuses (exit 1, nothing changed; `--force` overrides) when:
+uncommitted/untracked files · the branch is **not merged** · an agent is **busy** · the worktree
+is locked. v0.3 Q3 ("commits on no remote branch, tag or other branch") is replaced for
+branches: *pushed is not merged*.
+
+**"Merged"** (`git::base_anchors` + `commits_not_in`): every commit of the branch is in the base
+branch (`refs/heads/<base>`, every `refs/remotes/*/<base>`, and the `git ls-remote` tip of each
+remote when present locally), or in the head of a merged MR/PR of this branch. Blocker
+`Unmerged { base, commits, more }`; the `landed` note for squash merges stays. A **detached**
+checkout (`review-N`, made detached on purpose by `fleet review start`: the author's branch is
+usually checked out elsewhere, fork PRs have no branch in `origin`, and a review must not commit
+to the author's branch) keeps v0.3's rule (`Unpushed`): only commits that exist nowhere else
+block. A kept branch (base, or checked out elsewhere) loses nothing.
+
+**A merged review counts only when its head is on the branch** (`git merge-base --is-ancestor
+<pr head> <branch tip>`), in `close::gather` and in `Engine::related_merged` (the snapshot).
+Bug: matching by name alone attached an old merged PR of a reused branch name (`fix/typo`, a
+reused slug, a fork PR with the same head name) to a new branch; `worktree list` said `merged`
+and gc planned to kill the live task's tmux session (e2e 9d).
+
+**Agents.** `Activity::is_busy` = working or waiting on a plan/question/permission: blocks. Idle
+= stopped by a normal step (resume command printed). The agent that runs this `fleet` is never a
+blocker (it is busy only because of us).
+
+**Order fix.** The hosting `StopAgent` now ranks 8, after the hosting tmux kill (7). Bug: both
+ranked 7 and `StopAgent` came first, so an agent closing its own task killed its pane, and with
+it its child `fleet`, before the session kill ran; the session survived (e2e 11).
+
+**Merged lookups only where used.** `Engine::merged_lookups(bool)`: on for the TUI (background,
+cached) and for `worktree list` / `worktree gc`; off for the rest of the CLI (`close` asks for
+its one branch live). Bug: the cache is per process, so every one-shot command made 1 + N forge
+calls; `fleet status --short` in a 15 s status bar with 20 worktrees is ~5,000 `gh` calls/hour
+(e2e 9e).
+
+**gc = "list what is finished, clean it in one go".** `gc_verdict`: busy agent → no; folder
+missing → yes; dirty → no; merged/closed review → yes (an idle agent is stopped); any agent → no
+("agent alive"); `in base` (new `WorktreeRow::in_base`: tip in the base branch) → yes; stale tmp,
+review gone → yes. The `ahead > 0` rule is gone: the planner decides. Every candidate goes through
+`close::plan` unforced; blocked ones are listed with `Blocker::summary`. The branch is deleted
+with `-D` like close (the planner proved it merged); `DeleteBranch.best_effort` and
+`CloseOpts.gc` are removed: `-d` refused every squash-merged branch, so gc left it behind.
+**Apply re-plans** from a fresh snapshot and runs an item only if its transaction is unchanged;
+otherwise `TxnReport.skipped` ("changed since the dry run"; e2e 9f drives a real `[y/N]` gc).
+
+**TUI force needs `F` twice.** Blocked popup: `F` arms force and shows "LOST when you press F
+again"; `Enter`/`y` then only explain; a second `F` closes.

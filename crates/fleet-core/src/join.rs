@@ -12,6 +12,9 @@ pub struct Inputs<'a> {
     pub agents: Vec<AgentRow>,
     pub worktrees: Vec<WorktreeRow>,
     pub reviews: Vec<ReviewRow>,
+    /// Merged reviews looked up per local branch that has no open review (the open-review
+    /// list never has them). Used only to match worktrees, never shown as Reviews rows.
+    pub merged: Vec<ReviewRow>,
     pub procs: Option<&'a ProcTable>,
     /// repo name -> review source (`gitlab:group/project`), from config.
     pub repo_sources: HashMap<String, String>,
@@ -30,6 +33,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
         agents,
         worktrees,
         reviews,
+        merged,
         procs,
         repo_sources,
     } = inp;
@@ -107,10 +111,23 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
         // Reviews on this worktree's branch; for a detached `review-N` checkout, the review
         // whose head it sits at (or whose id its name carries, once the MR moved on).
         let rvs: Vec<ReviewRow> = match w.branch.as_deref() {
-            Some(b) => review_by_branch
-                .get(b)
-                .map(|v| v.iter().map(|r| (*r).clone()).collect())
-                .unwrap_or_default(),
+            Some(b) => {
+                let open: Vec<ReviewRow> = review_by_branch
+                    .get(b)
+                    .map(|v| v.iter().map(|r| (*r).clone()).collect())
+                    .unwrap_or_default();
+                if open.is_empty() && !w.is_main {
+                    merged
+                        .iter()
+                        .filter(|r| {
+                            r.source_branch == b && repo_sources.get(&w.repo) == Some(&r.source)
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    open
+                }
+            }
             None => {
                 let by_name = w
                     .name
@@ -266,6 +283,7 @@ mod tests {
             detached: branch.is_none(),
             is_main: path.ends_with("main"),
             missing: false,
+            in_base: false,
         }
     }
     fn agent(pid: u32, cwd: &str, act: Activity) -> AgentRow {
@@ -335,6 +353,7 @@ mod tests {
             agents,
             worktrees: wts,
             reviews,
+            merged: vec![],
             procs: None,
             repo_sources: HashMap::new(),
         });
@@ -357,5 +376,50 @@ mod tests {
             .find(|w| w.worktree.name == "wt-head")
             .unwrap();
         assert_eq!(dead.gc, GcVerdict::Yes("stale tmp".into()));
+    }
+
+    #[test]
+    fn merged_lookup_matches_worktrees_only_and_feeds_gc() {
+        let merged = ReviewRow {
+            source: "gitlab:g/svc".into(),
+            id: 514,
+            display_id: "!514".into(),
+            title: "t".into(),
+            author: "me".into(),
+            source_branch: "feat/x".into(),
+            target_branch: "main".into(),
+            draft: false,
+            ci: Ci::None,
+            approvals: vec![],
+            threads: Threads::default(),
+            status: ReviewStatus::Merged,
+            head_sha: "deadbeef".into(),
+            url: "u".into(),
+            updated_at: None,
+        };
+        let mut other_source = merged.clone();
+        other_source.source = "gitlab:g/web".into();
+        other_source.source_branch = "feat/y".into();
+        let f = join(Inputs {
+            panes: vec![],
+            agents: vec![],
+            worktrees: vec![
+                wt("/r/main", Some("main")),
+                wt("/r/wt/x", Some("feat/x")),
+                wt("/r/wt/y", Some("feat/y")),
+            ],
+            reviews: vec![],
+            merged: vec![merged, other_source],
+            procs: None,
+            repo_sources: HashMap::from([("svc".to_string(), "gitlab:g/svc".to_string())]),
+        });
+        let x = f.worktrees.iter().find(|w| w.worktree.name == "x").unwrap();
+        assert_eq!(x.gc, GcVerdict::Yes("merged".into()));
+        assert_eq!(x.review.as_ref().unwrap().display_id, "!514");
+        // Same branch name in another forge project does not count.
+        let y = f.worktrees.iter().find(|w| w.worktree.name == "y").unwrap();
+        assert!(y.review.is_none());
+        // Merged reviews never become Reviews-tab rows.
+        assert!(f.reviews.is_empty());
     }
 }

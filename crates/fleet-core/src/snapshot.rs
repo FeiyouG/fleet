@@ -26,11 +26,20 @@ struct ReviewCache {
     last_error: Option<String>,
 }
 
+/// `(source, branch)` -> when looked up, and the merged review found (if any).
+type MergedCache = HashMap<(String, String), (Instant, Option<ReviewRow>)>;
+
 pub struct Engine {
     pub config: Config,
     agent_adapters: Vec<Box<dyn AgentAdapter>>,
     review_adapters: Vec<Box<dyn ReviewAdapter>>,
     reviews: Arc<Mutex<ReviewCache>>,
+    merged: Arc<Mutex<MergedCache>>,
+    /// Look up a merged review per worktree branch (one forge call each, cached for
+    /// `review_ttl_secs`). On for the TUI (in the background) and for the one-shot commands
+    /// that show gc verdicts (`worktree list`, `worktree gc`); off for the rest of the CLI,
+    /// whose process-local cache would be empty on every run (`fleet status` in a status bar).
+    merged_lookups: bool,
 }
 
 impl Engine {
@@ -58,7 +67,15 @@ impl Engine {
                 in_flight: false,
                 last_error: None,
             })),
+            merged: Arc::new(Mutex::new(HashMap::new())),
+            merged_lookups: true,
         }
+    }
+
+    /// See [`Engine::merged_lookups`](Self).
+    pub fn merged_lookups(mut self, on: bool) -> Self {
+        self.merged_lookups = on;
+        self
     }
 
     pub fn review_adapter(&self, source: &str) -> Option<&dyn ReviewAdapter> {
@@ -201,17 +218,35 @@ impl Engine {
             warnings.push(format!("reviews: {e}"));
         }
 
-        let repo_sources = self
+        let repo_sources: HashMap<String, String> = self
             .config
             .projects
             .iter()
             .filter_map(|r| r.reviews.clone().map(|s| (r.name.clone(), s)))
             .collect();
+        // Local branches without an open review: was it merged? (gc needs to know.)
+        let wanted: Vec<(String, String)> = if self.merged_lookups {
+            worktrees
+                .iter()
+                .filter(|w| !w.is_main)
+                .filter_map(|w| Some((repo_sources.get(&w.repo)?.clone(), w.branch.clone()?)))
+                .filter(|(src, b)| {
+                    !reviews
+                        .iter()
+                        .any(|r| r.source == *src && r.source_branch == *b)
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let merged = self.merged_cached(wanted, wait_for_reviews).await;
+        let merged = self.related_merged(merged, &worktrees, &repo_sources).await;
         let mut fleet = join::join(Inputs {
             panes,
             agents,
             worktrees,
             reviews,
+            merged,
             procs: procs.as_ref(),
             repo_sources,
         });
@@ -293,9 +328,103 @@ impl Engine {
         c.in_flight = false;
     }
 
+    /// Merged reviews for `(source, branch)` pairs from the cache; stale or missing entries
+    /// are looked up in the background (awaited when `wait`, for one-shot CLI commands).
+    async fn merged_cached(&self, wanted: Vec<(String, String)>, wait: bool) -> Vec<ReviewRow> {
+        let ttl = Duration::from_secs(self.config.defaults.review_ttl_secs);
+        let stale: Vec<(String, String)> = {
+            let c = self.merged.lock().await;
+            wanted
+                .iter()
+                .filter(|k| c.get(*k).map(|(t, _)| t.elapsed() > ttl).unwrap_or(true))
+                .cloned()
+                .collect()
+        };
+        if !stale.is_empty() {
+            let cache = self.merged.clone();
+            let job = async move {
+                {
+                    // Claim the keys so concurrent snapshots do not look them up again.
+                    let mut c = cache.lock().await;
+                    for k in &stale {
+                        let prev = c.get(k).and_then(|(_, r)| r.clone());
+                        c.insert(k.clone(), (Instant::now(), prev));
+                    }
+                }
+                let lookups = stale.iter().map(|(src, b)| async move {
+                    let r = match reviews::adapter_for(src) {
+                        Ok(a) => a.merged_for_branch(b).await,
+                        Err(e) => Err(e),
+                    };
+                    ((src.clone(), b.clone()), r)
+                });
+                for (k, r) in futures::future::join_all(lookups).await {
+                    let mut c = cache.lock().await;
+                    // On an error keep the old answer; it is retried after the TTL.
+                    if let Ok(v) = r {
+                        c.insert(k, (Instant::now(), v));
+                    }
+                }
+            };
+            if wait {
+                job.await;
+            } else {
+                tokio::spawn(job);
+            }
+        }
+        let c = self.merged.lock().await;
+        wanted
+            .iter()
+            .filter_map(|k| c.get(k).and_then(|(_, r)| r.clone()))
+            .collect()
+    }
+
+    /// Keep a merged review only when its head is on the local branch of the same name
+    /// (ancestor of, or equal to, its tip). Branch names are reused; an old merged PR of
+    /// `fix/typo` says nothing about today's `fix/typo`.
+    async fn related_merged(
+        &self,
+        merged: Vec<ReviewRow>,
+        worktrees: &[WorktreeRow],
+        repo_sources: &HashMap<String, String>,
+    ) -> Vec<ReviewRow> {
+        let checks = merged.into_iter().map(|r| async move {
+            let repo = worktrees
+                .iter()
+                .filter(|w| {
+                    !w.is_main
+                        && w.branch.as_deref() == Some(r.source_branch.as_str())
+                        && repo_sources.get(&w.repo) == Some(&r.source)
+                })
+                .find_map(|w| self.config.project(&w.repo).map(|p| p.repo.clone()))?;
+            let tip = format!("refs/heads/{}", r.source_branch);
+            git::is_ancestor(&repo, &r.head_sha, &tip)
+                .await
+                .then_some(r)
+        });
+        futures::future::join_all(checks)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// A live lookup (no cache) of the merged review of `branch` in `source`.
+    pub async fn merged_review(&self, source: &str, branch: &str) -> Result<Option<ReviewRow>> {
+        let r = reviews::adapter_for(source)?
+            .merged_for_branch(branch)
+            .await?;
+        self.merged.lock().await.insert(
+            (source.to_string(), branch.to_string()),
+            (Instant::now(), r.clone()),
+        );
+        Ok(r)
+    }
+
     /// Force a refresh now (key `R`).
     pub async fn refresh_reviews(&self) {
         self.reviews.lock().await.fetched_instant = None;
+        self.merged.lock().await.clear();
         self.fetch_reviews().await;
     }
 }
@@ -346,5 +475,8 @@ async fn fetch_all(
 
 /// Convenience for one-shot commands.
 pub async fn once(config: Config) -> Result<Fleet> {
-    Ok(Engine::new(config).snapshot(true).await)
+    Ok(Engine::new(config)
+        .merged_lookups(false)
+        .snapshot(true)
+        .await)
 }

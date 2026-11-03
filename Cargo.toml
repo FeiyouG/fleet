@@ -14,7 +14,7 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

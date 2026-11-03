@@ -79,11 +79,11 @@ pub async fn attach(fleet: &Fleet, name: &str) -> Result<()> {
     tmux::attach(&pane.target()).await
 }
 
+/// Stop the row's (first) agent: kill its pane, and wait until the process has exited.
 pub async fn stop(fleet: &Fleet, name: &str) -> Result<()> {
     let row = find_row(fleet, name).with_context(|| format!("no agent/worktree named `{name}`"))?;
     let agent = first_agent(row).with_context(|| format!("`{name}` has no running agent"))?;
-    let target = agent.pane_target.context("no agent pane to stop")?;
-    tmux::kill_pane(&target).await
+    super::txn::stop_pid(agent.pid, agent.pane_target.as_deref()).await
 }
 
 #[cfg(test)]
