@@ -132,6 +132,10 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
                     Some(Ok(Event::Key(k))) if k.kind != KeyEventKind::Release => {
                         if let Err(e) = app.on_key(Key::from_event(&k), &k).await { app.set_status(format!("{e:#}"), true); }
                     }
+                    // Bracketed paste: the whole clipboard in one event. Without it a paste
+                    // arrives as keystrokes and every newline is an Enter, which the start
+                    // popup's name field and the message popup both treat as "submit/next".
+                    Some(Ok(Event::Paste(text))) => app.on_paste(text),
                     Some(Ok(Event::Resize(..))) => {}
                     Some(Err(e)) => break Err(e.into()),
                     None => break Ok(()),
@@ -175,7 +179,8 @@ fn enter() -> Result<Term> {
     execute!(
         out,
         terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
     )?;
     let term = Terminal::new(CrosstermBackend::new(out))?;
     Ok(term)
@@ -185,6 +190,7 @@ fn leave(term: &mut Term) -> Result<()> {
     terminal::disable_raw_mode()?;
     execute!(
         term.backend_mut(),
+        crossterm::event::DisableBracketedPaste,
         crossterm::event::DisableMouseCapture,
         terminal::LeaveAlternateScreen
     )?;
@@ -195,6 +201,13 @@ fn leave(term: &mut Term) -> Result<()> {
 impl App {
     pub fn set_status(&mut self, s: String, err: bool) {
         self.status_line = Some((s, err));
+    }
+
+    /// A paste goes to the open popup's text field; outside a popup it means nothing.
+    pub fn on_paste(&mut self, text: String) {
+        if let Some(p) = self.popup.take() {
+            self.popup = Some(popups::paste(p, &text));
+        }
     }
 
     /// Load the modes/models `adapter` offers in `dir` unless a fresh answer is already here.

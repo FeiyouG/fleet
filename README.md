@@ -115,6 +115,10 @@ fleet setup [--remove|--check] | config [--init] | keys
 while the agent is alive (opencode keeps absolute paths), renames the tmux
 session and updates the registry. With a name, everything is named up front.
 
+In the TUI (`a s`) the prompt box takes multi-line text: paste as much as you like (bracketed
+paste, every line kept; the title shows the line count), type Enter for a new line, `C-e` to
+write it in `$EDITOR`, `C-s` to start. `-f FILE` (`-` = stdin) does the same on the CLI.
+
 ### Close a task
 
 `fleet worktree close feat-x` (alias `fleet close feat-x`; `w x` on any row of that task in the

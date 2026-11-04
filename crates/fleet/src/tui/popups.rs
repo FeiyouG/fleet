@@ -648,7 +648,17 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 FOCUS_PROMPT => {
                     form.prompt.input(*ev);
                 }
-                _ => {}
+                // A letter typed on a selector field (repo/agent/mode/model) is prompt text that
+                // started before Tab reached the prompt (or a paste in a terminal without
+                // bracketed paste): move there and keep it instead of dropping it.
+                _ => {
+                    if let KeyCode::Char(_) = ev.code {
+                        if !ctrl {
+                            form.focus = FOCUS_PROMPT;
+                            form.prompt.input(*ev);
+                        }
+                    }
+                }
             }
             Outcome::Keep(Popup::Start(form))
         }
@@ -695,6 +705,41 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
             }
             Outcome::Keep(Popup::Message(form))
         }
+    }
+}
+
+/// Line endings as they come from terminals -> `\n`.
+pub fn normalise_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Insert pasted text into a textarea as lines, cursor left at its end.
+pub fn insert_paste(ta: &mut TextArea<'static>, text: &str) {
+    ta.insert_str(normalise_paste(text));
+}
+
+/// Where a paste lands. The start popup's prompt takes it whatever field has focus (nobody
+/// pastes a repo name); the message popup appends it; one-line inputs take the first line.
+pub fn paste(p: Popup, text: &str) -> Popup {
+    match p {
+        Popup::Start(mut form) => {
+            form.focus = FOCUS_PROMPT;
+            insert_paste(&mut form.prompt, text);
+            Popup::Start(form)
+        }
+        Popup::Message(mut form) => {
+            form.text.push_str(&normalise_paste(text));
+            Popup::Message(form)
+        }
+        Popup::Input {
+            title,
+            mut value,
+            kind,
+        } => {
+            value.push_str(normalise_paste(text).lines().next().unwrap_or(""));
+            Popup::Input { title, value, kind }
+        }
+        other => other,
     }
 }
 
@@ -1019,7 +1064,8 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             f.render_widget(List::new(items).block(frame_block("project")), rect);
         }
         Popup::Message(form) => {
-            let rect = centered(area, 90, 6);
+            let text_lines = form.text.split('\n').count();
+            let rect = centered(area, 90, (6 + text_lines.saturating_sub(1) as u16).min(20));
             f.render_widget(Clear, rect);
             let title = format!(
                 "message to {}  ·  Enter send · Tab mode · C-o model · Esc cancel",
@@ -1038,18 +1084,22 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 Some(m) => Span::styled(m.clone(), accent()),
                 None => Span::raw(format!("unchanged ({})", now(&form.current_model))),
             };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::raw(format!(" {}", form.text)),
-                    Span::styled("▏", accent()),
-                ]),
-                Line::from(vec![
-                    Span::styled(" mode ", dim()),
-                    mode,
-                    Span::styled("   model ", dim()),
-                    model,
-                ]),
-            ];
+            // Every line of the text; the cursor sits after the last.
+            let mut lines: Vec<Line> = vec![];
+            let parts: Vec<&str> = form.text.split('\n').collect();
+            for (i, l) in parts.iter().enumerate() {
+                let mut spans = vec![Span::raw(format!(" {l}"))];
+                if i + 1 == parts.len() {
+                    spans.push(Span::styled("▏", accent()));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.extend([Line::from(vec![
+                Span::styled(" mode ", dim()),
+                mode,
+                Span::styled("   model ", dim()),
+                model,
+            ])]);
             let note = choices_note(app, &form.adapter, dir).or_else(|| {
                 (form.mode.is_some() || form.model.is_some()).then(|| {
                     "applies to this message; the agent's TUI keeps its own selection".into()
@@ -1065,7 +1115,9 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             }
         }
         Popup::Start(form) => {
-            let rect = centered(area, 90, 21);
+            // Tall enough to show a pasted multi-paragraph prompt (the box scrolls with the
+            // cursor; the title says how many lines it holds).
+            let rect = centered(area, 100, area.height.saturating_sub(4).clamp(21, 40));
             f.render_widget(Clear, rect);
             let block =
                 frame_block("start agent  ·  Tab fields · C-e $EDITOR · C-s start · Esc cancel");
@@ -1137,11 +1189,20 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             ]);
             f.render_widget(Paragraph::new(model_line), rows[3]);
             let mut prompt = form.prompt.clone();
+            let n = form.prompt.lines().len();
+            let visible = rows[4].height.saturating_sub(1) as usize;
+            let title = if n > visible {
+                format!("prompt · {n} lines (scrolls)")
+            } else if n > 1 {
+                format!("prompt · {n} lines")
+            } else {
+                "prompt".to_string()
+            };
             prompt.set_block(
                 Block::default()
                     .borders(Borders::TOP)
                     .border_style(dim())
-                    .title(Span::styled("prompt", focus(FOCUS_PROMPT))),
+                    .title(Span::styled(title, focus(FOCUS_PROMPT))),
             );
             f.render_widget(&prompt, rows[4]);
             // preview
@@ -1237,6 +1298,74 @@ mod tests {
     use super::*;
     use fleet_core::cmd::close::{self, CloseOpts, Facts};
     use fleet_core::config::Project;
+
+    #[test]
+    fn paste_normalises_line_endings_and_keeps_every_line() {
+        assert_eq!(normalise_paste("a\r\nb\rc\n"), "a\nb\nc\n");
+        let mut ta = TextArea::default();
+        ta.insert_str("typed ");
+        insert_paste(&mut ta, "one\r\ntwo\n\nfour");
+        assert_eq!(ta.lines(), ["typed one", "two", "", "four"]);
+        assert_eq!(ta.cursor(), (3, 4));
+    }
+
+    #[test]
+    fn paste_into_start_popup_lands_in_prompt_whatever_has_focus() {
+        let mut cfg = Config::default();
+        cfg.projects.push(Project {
+            name: "svc".into(),
+            repo: "/r".into(),
+            worktrees: None,
+            reviews: None,
+            base: "main".into(),
+        });
+        let Popup::Start(mut form) = Popup::start(&cfg) else {
+            panic!("start popup")
+        };
+        form.focus = 0; // name field
+        let p = paste(Popup::Start(form), "Fix the thing.\n\nSecond paragraph.");
+        let Popup::Start(form) = p else { panic!() };
+        assert_eq!(form.focus, FOCUS_PROMPT);
+        assert_eq!(
+            form.prompt.lines().join("\n"),
+            "Fix the thing.\n\nSecond paragraph."
+        );
+        assert_eq!(form.name.lines().join(""), "");
+    }
+
+    #[test]
+    fn paste_into_message_and_input() {
+        let m = Popup::message(
+            "t".into(),
+            fleet_core::model::AgentRow {
+                adapter: "opencode".into(),
+                pid: 1,
+                cwd: "/w".into(),
+                session_id: None,
+                title: None,
+                mode: None,
+                model: None,
+                activity: fleet_core::model::Activity::Idle,
+                running_tool: None,
+                plan_url: None,
+                plan_title: None,
+                port: None,
+                last_activity: None,
+                pane_target: None,
+                pending: vec![],
+                control_url: None,
+                control_token: None,
+            },
+        );
+        let Popup::Message(f) = paste(m, "a\r\nb") else {
+            panic!()
+        };
+        assert_eq!(f.text, "a\nb");
+        let Popup::Input { value, .. } = paste(Popup::command(), "one\ntwo") else {
+            panic!()
+        };
+        assert_eq!(value, "one");
+    }
 
     fn plan(dirty: bool) -> Box<ClosePlan> {
         let f = Facts {
