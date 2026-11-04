@@ -728,6 +728,19 @@ pub async fn gather(r: &Resolved, fleet: &Fleet) -> Result<Facts> {
             // A branch tied to a deleted folder by name only (resolve matched them) is a guess.
             let mut guessed = r.branch.is_some() && r.path.is_some() && r.branch != reg_branch;
             let mut branch = r.branch.clone().or(reg_branch);
+            // The registry remembers the branch a task was started on; if it has already been
+            // deleted (an earlier close of a review checkout on the same branch, or by hand),
+            // there is nothing to delete now: close what is left instead of failing.
+            if let Some(b) = branch.clone() {
+                if git::rev_parse(repo, &format!("refs/heads/{b}"))
+                    .await
+                    .is_none()
+                {
+                    notes.push(format!("local branch {b} is already gone"));
+                    branch = None;
+                    guessed = false;
+                }
+            }
             if branch.is_none() {
                 if let Some(leaf) = r.path.as_ref().and_then(|p| p.file_name()) {
                     let found = git::loose_branches_named(repo, &leaf.to_string_lossy())
@@ -1576,6 +1589,27 @@ mod tests {
         let r = p.resolved();
         assert_eq!(r.path, None);
         assert_eq!(r.branch.as_deref(), Some("feat/x"));
+    }
+
+    /// Registry row only: worktree and branch both already gone (an earlier close deleted the
+    /// branch through another checkout). `gather` drops the vanished branch with a note; the
+    /// plan is just the bookkeeping, never "no local branch" as an error.
+    #[test]
+    fn registry_row_only_closes_the_task() {
+        let mut f = clean();
+        f.listed = false;
+        f.missing = true;
+        f.branch = None;
+        f.head = String::new();
+        f.upstream = None;
+        f.sessions.clear();
+        for t in &mut f.tasks {
+            t.symlinks.clear();
+        }
+        f.notes.push("local branch feat/x is already gone".into());
+        let p = plan(&f, &CloseOpts::default()).unwrap();
+        assert_eq!(kinds(&p), ["close_task"]);
+        assert!(p.notes.iter().any(|n| n.contains("already gone")));
     }
 
     #[test]
