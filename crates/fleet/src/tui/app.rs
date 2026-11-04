@@ -41,6 +41,8 @@ pub struct App {
     pub sort: SortMode,
     pub loading: bool,
     pub quit: bool,
+    /// mtime of this process's binary at startup; the header warns when a newer one lands.
+    pub started_exe: Option<std::time::SystemTime>,
     notifier: Notifier,
     tx: mpsc::UnboundedSender<Msg>,
     /// Modes/models per (adapter, directory), loaded in the background when a popup needs
@@ -114,6 +116,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
         sort: SortMode::Severity,
         loading: true,
         quit: false,
+        started_exe: util::exe_mtime(),
         tx,
         choices: HashMap::new(),
         choices_loading: HashSet::new(),

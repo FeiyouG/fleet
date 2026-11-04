@@ -78,9 +78,9 @@ pub fn gc_verdict(w: &WorktreeRow, agents: &[AgentRow], review: Option<&ReviewRo
     if !agents.is_empty() {
         return GcVerdict::No("agent alive".into());
     }
-    if w.in_base && !w.detached && review.is_none() {
-        return GcVerdict::Yes("in base".into());
-    }
+    // A branch worktree with no merged review is NEVER a candidate, however stale it looks:
+    // a branch parked on an old main with no MR is kept on purpose (the user's rule: close
+    // only merged-MR work with nothing outstanding). Detached throwaways below still are.
     if w.detached && is_tmp(&w.path) {
         return GcVerdict::Yes("stale tmp".into());
     }
@@ -235,9 +235,10 @@ mod tests {
             gc_verdict(&wt(0, 0, true), &[], None),
             GcVerdict::No("dirty".into())
         );
+        // Tip already in the base branch but no merged review: parked on purpose, keep.
         let mut b = wt(0, 0, false);
         b.in_base = true;
-        assert_eq!(gc_verdict(&b, &[], None), GcVerdict::Yes("in base".into()));
+        assert_eq!(gc_verdict(&b, &[], None), GcVerdict::No("in use".into()));
         assert_eq!(
             gc_verdict(&b, &[agent(Activity::Idle)], None),
             GcVerdict::No("agent alive".into())

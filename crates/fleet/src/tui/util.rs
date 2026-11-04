@@ -107,3 +107,43 @@ pub fn copy_to_clipboard(s: &str) -> anyhow::Result<()> {
     c.wait()?;
     Ok(())
 }
+
+/// Whether the `fleet` binary on disk is newer than the one this process was started from.
+///
+/// A running TUI keeps the code it was started with; `cargo install` swaps the file under
+/// it, so an old TUI left in a tmux pane silently keeps old behaviour (an old `w D` that only
+/// removed the worktree looked like a broken `w x`). `started` is the exe's mtime at startup.
+pub fn newer_binary_installed(started: Option<std::time::SystemTime>) -> bool {
+    let (Some(started), Ok(exe)) = (started, std::env::current_exe()) else {
+        return false;
+    };
+    std::fs::metadata(exe)
+        .and_then(|m| m.modified())
+        .map(|now| now > started)
+        .unwrap_or(false)
+}
+
+/// The exe's mtime right now, to remember at startup.
+pub fn exe_mtime() -> Option<std::time::SystemTime> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn newer_only_when_disk_mtime_moved_forward() {
+        // The test binary's own mtime is "now-ish": a start time far in the future is never stale,
+        // a start time at the epoch always is, and None (unknown) is never stale.
+        assert!(!newer_binary_installed(Some(
+            SystemTime::now() + Duration::from_secs(3600)
+        )));
+        assert!(newer_binary_installed(Some(SystemTime::UNIX_EPOCH)));
+        assert!(!newer_binary_installed(None));
+    }
+}

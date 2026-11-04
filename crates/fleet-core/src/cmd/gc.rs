@@ -1,5 +1,5 @@
 //! `fleet worktree gc`: list everything that can be cleaned, then clean it in one go.
-//! Candidates are finished worktrees (`gc_verdict` = yes: merged, in base, folder missing,
+//! Candidates are finished worktrees (`gc_verdict` = yes: merged, folder missing,
 //! stale tmp, review gone), each closed through the same planner and transaction engine as
 //! `fleet worktree close` (never forced: a blocked one is listed as blocked); orphans (dead
 //! tmux sessions, tasks whose worktree is gone, stale rename links) get one small

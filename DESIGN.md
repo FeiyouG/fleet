@@ -857,8 +857,10 @@ calls; `fleet status --short` in a 15 s status bar with 20 worktrees is ~5,000 `
 
 **gc = "list what is finished, clean it in one go".** `gc_verdict`: busy agent → no; folder
 missing → yes; dirty → no; merged/closed review → yes (an idle agent is stopped); any agent → no
-("agent alive"); `in base` (new `WorktreeRow::in_base`: tip in the base branch) → yes; stale tmp,
-review gone → yes. The `ahead > 0` rule is gone: the planner decides. Every candidate goes through
+("agent alive"); stale tmp, review gone (detached throwaways) → yes; everything else → no. A branch
+worktree is a candidate ONLY through a merged/closed review: "tip already in base, no MR"
+(`WorktreeRow::in_base`) is a parked branch the user keeps on purpose, not garbage (v0.3.2: the
+`in base → yes` arm was removed after it listed six kept branches). The `ahead > 0` rule is gone: the planner decides. Every candidate goes through
 `close::plan` unforced; blocked ones are listed with `Blocker::summary`. The branch is deleted
 with `-D` like close (the planner proved it merged); `DeleteBranch.best_effort` and
 `CloseOpts.gc` are removed: `-d` refused every squash-merged branch, so gc left it behind.

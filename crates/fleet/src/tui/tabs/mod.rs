@@ -754,6 +754,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         };
         spans.push(Span::styled(text, Style::default().fg(Color::Red)));
     }
+    if util::newer_binary_installed(app.started_exe) {
+        spans.push(Span::styled(
+            " · restart: newer fleet installed",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
