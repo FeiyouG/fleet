@@ -219,6 +219,17 @@ mod tests {
     }
 
     #[test]
+    fn target_split() {
+        assert_eq!(split_target("s"), ("s".into(), None, None));
+        assert_eq!(split_target("=s:"), ("s".into(), None, None));
+        assert_eq!(split_target("s:2"), ("s".into(), Some("2".into()), None));
+        assert_eq!(
+            split_target("fix-x:1.1"),
+            ("fix-x".into(), Some("1".into()), Some("1".into()))
+        );
+    }
+
+    #[test]
     fn session_target_is_exact_and_session_only() {
         assert_eq!(session_target("fleet"), "=fleet:");
         assert_eq!(session_target("wip-x"), "=wip-x:");
@@ -230,4 +241,88 @@ mod tests {
         assert!(is_gone("no server running on /tmp/tmux-501/default"));
         assert!(!is_gone("permission denied"));
     }
+}
+
+/// `sess`, `sess:1` or `sess:1.2` -> (session, window, pane).
+pub fn split_target(target: &str) -> (String, Option<String>, Option<String>) {
+    let (sess, rest) = match target.split_once(':') {
+        Some((s, r)) => (s, Some(r)),
+        None => (target, None),
+    };
+    let sess = sess.trim_start_matches('=').to_string();
+    match rest {
+        None | Some("") => (sess, None, None),
+        Some(r) => match r.split_once('.') {
+            Some((w, p)) => (sess, Some(w.to_string()), Some(p.to_string())),
+            None => (sess, Some(r.to_string()), None),
+        },
+    }
+}
+
+/// Bring a tmux target in front of the user from OUTSIDE any pane (a notification click, a
+/// shell): every attached client is switched to the session, window and pane, and the terminal
+/// application that hosts the first client is activated (brought to the front) on macOS.
+/// Nothing to do without an attached client: the session is left as it is.
+pub async fn focus(target: &str) -> Result<()> {
+    let (sess, win, pane) = split_target(target);
+    let clients = run(&["list-clients", "-F", "#{client_tty}\t#{client_pid}"]).await?;
+    let mut first_pid: Option<u32> = None;
+    let mut any = false;
+    for line in clients.lines() {
+        let Some((tty, pid)) = line.split_once('\t') else {
+            continue;
+        };
+        any = true;
+        if first_pid.is_none() {
+            first_pid = pid.trim().parse().ok();
+        }
+        run(&["switch-client", "-c", tty, "-t", &session_target(&sess)]).await?;
+        if let Some(w) = &win {
+            let wt = format!("{}:{w}", session_target(&sess).trim_end_matches(':'));
+            run(&["select-window", "-t", &wt]).await.ok();
+            if let Some(p) = &pane {
+                run(&["select-pane", "-t", &format!("{wt}.{p}")]).await.ok();
+            }
+        }
+    }
+    if !any {
+        bail!("no tmux client is attached; nothing to focus");
+    }
+    if let Some(app) = first_pid.and_then(terminal_app_of) {
+        activate_app(&app).await;
+    }
+    Ok(())
+}
+
+/// The macOS application that hosts the tmux client `pid`: walk the parents until a process
+/// name that looks like a terminal (`WezTerm`, `iTerm2`, `Terminal`, `Ghostty`, `kitty`,
+/// `Alacritty`, `Warp`, `Hyper`). `None` when unknown.
+pub fn terminal_app_of(client_pid: u32) -> Option<String> {
+    let table = crate::procs::ProcTable::snapshot();
+    for pid in table.ancestors(client_pid) {
+        let Some(name) = table.get(pid).map(|p| p.name.to_ascii_lowercase()) else {
+            continue;
+        };
+        let app = match name.as_str() {
+            n if n.contains("wezterm") => "WezTerm",
+            n if n.contains("iterm") => "iTerm2",
+            n if n.contains("ghostty") => "Ghostty",
+            n if n.contains("kitty") => "kitty",
+            n if n.contains("alacritty") => "Alacritty",
+            n if n.contains("warp") => "Warp",
+            n if n.contains("hyper") => "Hyper",
+            "terminal" => "Terminal",
+            _ => continue,
+        };
+        return Some(app.to_string());
+    }
+    None
+}
+
+/// `osascript -e 'tell application "X" to activate'`; silent when it fails (not macOS, app gone).
+pub async fn activate_app(app: &str) {
+    let _ = tokio::process::Command::new("osascript")
+        .args(["-e", &format!("tell application \"{app}\" to activate")])
+        .output()
+        .await;
 }

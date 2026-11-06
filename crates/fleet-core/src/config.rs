@@ -28,7 +28,12 @@ pub struct Defaults {
     /// config file (no hidden fallback): `validate` rejects an empty value.
     pub agent: String,
     pub mode: String,
-    pub nvim_pane: bool,
+    /// A task's tmux window is split: a plain shell on the LEFT, the agent on the RIGHT.
+    /// `left_pane` is a command typed into that shell at start (e.g. `"nvim"`); unset or empty
+    /// = leave it as a bare prompt. Replaces the old `nvim_pane = true|false` (still accepted:
+    /// `true` means `"nvim"`).
+    #[serde(default, deserialize_with = "left_pane_compat", alias = "nvim_pane")]
+    pub left_pane: Option<String>,
     pub notify: bool,
     pub refresh_secs: u64,
     pub review_ttl_secs: u64,
@@ -39,7 +44,7 @@ impl Default for Defaults {
         Self {
             agent: String::new(),
             mode: "plan".into(),
-            nvim_pane: true,
+            left_pane: None,
             notify: true,
             refresh_secs: 2,
             review_ttl_secs: 60,
@@ -184,6 +189,21 @@ impl Default for Config {
             keys: BTreeMap::new(),
         }
     }
+}
+
+/// `left_pane = "nvim"` | `left_pane = ""` (bare shell) | legacy `nvim_pane = true|false`.
+fn left_pane_compat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Flag(bool),
+        Cmd(String),
+    }
+    Ok(match Option::<Raw>::deserialize(d)? {
+        None | Some(Raw::Flag(false)) => None,
+        Some(Raw::Flag(true)) => Some("nvim".into()),
+        Some(Raw::Cmd(c)) => Some(c.trim().to_string()).filter(|c| !c.is_empty()),
+    })
 }
 
 /// A Lua `{}` is an empty *table*, which arrives as a map, not a sequence. Accept both.
@@ -383,7 +403,7 @@ return {
   defaults = {
     agent = "opencode",     -- adapter preselected by `fleet agent start`: opencode | claude | codex
     mode = "plan",          -- plan (read-only) | build, or an opencode agent (`fleet agent choices`)
-    nvim_pane = true,       -- open an nvim pane next to the agent
+    -- left_pane = "nvim", -- command for the LEFT (shell) pane of a new task; unset = bare shell
     notify = true,          -- macOS banner when an agent starts waiting for you
     refresh_secs = 2,
     review_ttl_secs = 60,
@@ -504,6 +524,26 @@ mod tests {
             data_dir().join("worktrees").join("svc")
         );
         assert_eq!(c.keys["agent.start"], "C-n");
+    }
+
+    #[test]
+    fn left_pane_shapes() {
+        let c = |extra: &str| {
+            Config::from_lua(
+                &format!(
+                    r#"return {{ defaults = {{ agent = "opencode" {extra} }}, agents = {{ opencode = {{}} }} }}"#
+                ),
+                "t",
+            )
+            .unwrap()
+            .defaults
+            .left_pane
+        };
+        assert_eq!(c(""), None);
+        assert_eq!(c(r#", left_pane = "nvim""#), Some("nvim".into()));
+        assert_eq!(c(r#", left_pane = """#), None);
+        assert_eq!(c(", nvim_pane = true"), Some("nvim".into()));
+        assert_eq!(c(", nvim_pane = false"), None);
     }
 
     #[test]

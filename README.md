@@ -47,7 +47,8 @@ return {
   defaults = {
     agent = "opencode",                -- required: adapter preselected by `fleet agent start`
     mode = "plan",                     -- plan | build (every adapter), or an opencode agent (`fleet agent choices`)
-    nvim_pane = true, notify = true, refresh_secs = 2, review_ttl_secs = 60,
+    notify = true, refresh_secs = 2, review_ttl_secs = 60,
+    -- left_pane = "nvim",  -- command for the LEFT (shell) pane of a new task; unset = bare shell
   },
   -- required: every adapter, explicitly. model = the model for new agents in that CLI's own
   -- naming (unset = the CLI's default); args are appended to every launch.
@@ -93,7 +94,7 @@ The list is cached for 5 minutes (in memory and in `~/.local/share/fleet/cache/`
 ```
 fleet [--project NAME]                 the TUI (default scope: the project containing the cwd, else all)
 fleet status [--short|--json]          one-shot snapshot (tmux status bar / scripts)
-fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--agent opencode|claude|codex] [--mode MODE] [--model MODEL] [--no-nvim]
+fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--agent opencode|claude|codex] [--mode MODE] [--model MODEL] [--left-pane CMD|--no-left-pane]
 fleet agent send NAME TEXT [--mode MODE] [--model MODEL]
 fleet agent list | choices [--repo P] [--agent A] | attach NAME | rename OLD NEW | stop NAME
 fleet review list [--source S] | review start ID|URL        (re-review when it already exists)

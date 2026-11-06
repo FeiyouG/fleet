@@ -143,11 +143,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
                 plan_title: None,
                 port: task.port,
                 last_activity: None,
-                pane_target: Some(format!(
-                    "{}:1.{}",
-                    task.tmux_session,
-                    if cfg.defaults.nvim_pane { 1 } else { 0 }
-                )),
+                pane_target: Some(format!("{}:1.1", task.tmux_session)),
                 pending: vec![],
                 control_url: None,
                 control_token: None,
@@ -215,13 +211,12 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     });
     log(&format!("tmux new-session -s {slug}"));
     tmux::new_session(&slug, &path).await?;
-    let target = if cfg.defaults.nvim_pane {
-        tmux::split_window(&format!("{slug}:1"), &path, None).await?;
-        tmux::send_keys(&format!("{slug}:1.0"), "nvim").await.ok();
-        format!("{slug}:1.1")
-    } else {
-        format!("{slug}:1.0")
-    };
+    // Shell on the left (pane 0), the agent on the right (pane 1).
+    tmux::split_window(&format!("{slug}:1"), &path, None).await?;
+    if let Some(c) = cfg.defaults.left_pane.as_deref().filter(|c| !c.is_empty()) {
+        tmux::send_keys(&format!("{slug}:1.0"), c).await.ok();
+    }
+    let target = format!("{slug}:1.1");
     tmux::send_keys(&target, &cmd).await?;
     tmux::select_pane(&target).await.ok();
     if opts.attach {

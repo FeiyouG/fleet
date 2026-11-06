@@ -145,9 +145,12 @@ struct StartArgs {
     /// Base branch (default: repo's `base`, usually main)
     #[arg(long)]
     base: Option<String>,
-    /// Do not open an nvim pane
-    #[arg(long)]
-    no_nvim: bool,
+    /// Command for the left (shell) pane, e.g. `nvim`; overrides defaults.left_pane
+    #[arg(long, value_name = "CMD")]
+    left_pane: Option<String>,
+    /// Leave the left pane a bare shell even when defaults.left_pane is set
+    #[arg(long, conflicts_with = "left_pane")]
+    no_left_pane: bool,
     /// Do not attach after starting
     #[arg(long)]
     no_attach: bool,
@@ -239,6 +242,12 @@ enum TmuxCmd {
     List {
         #[arg(long)]
         json: bool,
+    },
+    /// Bring a session/window/pane in front of you from outside tmux (notification clicks use
+    /// this): switches every attached client and activates the terminal app
+    Focus {
+        /// `session`, `session:win` or `session:win.pane`
+        target: String,
     },
 }
 
@@ -503,6 +512,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             WorktreeCmd::Close(args) => close_cmd(args, cfg, project).await,
         },
         Cmd::Close(args) => close_cmd(args, cfg, project).await,
+        Cmd::Tmux(TmuxCmd::Focus { target }) => fleet_core::tmux::focus(&target).await,
         Cmd::Tmux(TmuxCmd::List { json }) => {
             let f = snapshot(&cfg).await;
             if json {
@@ -836,7 +846,11 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     mode: args.mode,
                     model: args.model,
                     base: args.base,
-                    nvim: if args.no_nvim { Some(false) } else { None },
+                    left_pane: if args.no_left_pane {
+                        Some(None)
+                    } else {
+                        args.left_pane.map(Some)
+                    },
                     attach: !args.no_attach,
                 },
                 &progress(),

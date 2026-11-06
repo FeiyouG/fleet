@@ -258,7 +258,7 @@ Colours: NEEDS YOU yellow, FAILED red, READY green, WORKING default, IDLE dim, D
 ## Change 3 🟠 `fleet agent start [NAME]` + `fleet agent rename`
 
 ```
-fleet agent start [NAME] [-m TEXT | -f FILE] [--mode plan|build] [--repo PATH|NAME] [--base main] [--no-nvim]
+fleet agent start [NAME] [-m TEXT | -f FILE] [--mode plan|build] [--repo PATH|NAME] [--base main] [--left-pane CMD|--no-left-pane]
 fleet agent rename OLD NEW
 ```
 **start:**
@@ -267,7 +267,7 @@ fleet agent rename OLD NEW
 3. Slug = NAME, else `wip-<4 random chars>`. Branch = `<type>/<rest>` when the slug starts with `feat|fix|update|refactor|docs|chore|test` (`fix-sfs-content-type` → `fix/sfs-content-type`), else `feat/<slug>`; `wip-*` → `wip/<slug>`. Worktree = `${worktrees_dir}/<repo>/<slug>`; tmux session = `<slug>`.
 4. `git worktree add -b <branch> <path> origin/<base>`.
 5. Free port; registry row `{slug, kind:start, repo, branch, path, tmux, port, mode, prompt}`.
-6. `tmux new-session -d -s <slug> -c <path>`; nvim pane unless `--no-nvim`; `send-keys` `opencode --port <port> --agent <mode> --prompt "<header>\n\n<prompt>"`. Header = `Task: <slug> · Repo: <repo> · Branch: <branch> · Base: <base>`; for `wip-*`: `Before any other step, pick a short kebab-case name for this task and run: fleet agent rename wip-xxxx <name>`.
+6. `tmux new-session -d -s <slug> -c <path>`, split: a plain shell on the LEFT (pane 1.0; `defaults.left_pane` / `--left-pane` types a command into it, e.g. `nvim`), the agent on the RIGHT (pane 1.1, always); `send-keys` `opencode --port <port> --agent <mode> --prompt "<header>\n\n<prompt>"`. Header = `Task: <slug> · Repo: <repo> · Branch: <branch> · Base: <base>`; for `wip-*`: `Before any other step, pick a short kebab-case name for this task and run: fleet agent rename wip-xxxx <name>`.
 7. Attach.
 
 **rename** (safe while the agent runs): `git branch -m` → `git worktree move` → `ln -s <new> <old>` (opencode keeps absolute paths of its start directory; the symlink keeps them valid; `gc` removes it once no process uses it) → `tmux rename-session` → registry update. Discovery canonicalises paths, so the row stays joined.
@@ -360,7 +360,7 @@ worktrees_dir = "~/.local/share/fleet/worktrees"
 review_ttl_secs = 60
 refresh_secs = 2
 default_mode = "plan"
-nvim_pane = true
+left_pane = nil  -- was nvim_pane = true; the left pane is a bare shell unless a command is given
 notify = true
 
 [[repos]]
@@ -617,7 +617,7 @@ pub fn flatten(tree: Vec<TreeNode>, unfolded: &HashSet<RowKey>) -> Vec<Node>   /
 -- ~/.config/fleet/init.lua
 local home = os.getenv("HOME")
 return {
-  defaults = { mode = "plan", nvim_pane = true, notify = true, refresh_secs = 2, review_ttl_secs = 60 },
+  defaults = { mode = "plan", notify = true, refresh_secs = 2, review_ttl_secs = 60 },
   agent_args = {},                    -- extra args for opencode, e.g. { "--model", "anthropic/claude-opus-5" }
   projects = {
     {

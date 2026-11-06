@@ -24,7 +24,8 @@ pub struct StartOpts {
     /// Model in the adapter's naming; `None` = `agents.<name>.model`, else the CLI's default.
     pub model: Option<String>,
     pub base: Option<String>,
-    pub nvim: Option<bool>,
+    /// Override `defaults.left_pane` for this start: `Some(None)` = bare shell.
+    pub left_pane: Option<Option<String>>,
     pub attach: bool,
 }
 
@@ -158,13 +159,16 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
 
     log(&format!("tmux new-session -s {slug}"));
     tmux::new_session(&slug, &path).await?;
-    let agent_target = if opts.nvim.unwrap_or(cfg.defaults.nvim_pane) {
-        tmux::split_window(&format!("{slug}:1"), &path, None).await?;
-        tmux::send_keys(&format!("{slug}:1.0"), "nvim").await.ok();
-        format!("{slug}:1.1")
-    } else {
-        format!("{slug}:1.0")
-    };
+    // Always two panes: a shell on the left (pane 0), the agent on the right (pane 1).
+    tmux::split_window(&format!("{slug}:1"), &path, None).await?;
+    let left = opts
+        .left_pane
+        .clone()
+        .unwrap_or_else(|| cfg.defaults.left_pane.clone());
+    if let Some(c) = left.filter(|c| !c.is_empty()) {
+        tmux::send_keys(&format!("{slug}:1.0"), &c).await.ok();
+    }
+    let agent_target = format!("{slug}:1.1");
     tmux::send_keys(&agent_target, &cmd).await?;
     tmux::select_pane(&agent_target).await.ok();
 

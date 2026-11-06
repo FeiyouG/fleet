@@ -547,7 +547,7 @@ impl App {
                             mode,
                             model,
                             base: None,
-                            nvim: None,
+                            left_pane: None,
                             attach: false,
                         },
                         &cmd::quiet(),
