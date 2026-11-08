@@ -78,6 +78,8 @@ pub fn scoped(app: &App) -> Vec<&ReviewView> {
             _ => true,
         })
         .collect();
+    // Reviews are ordered by MR/PR number, newest (highest) first, in every mode: that is how
+    // people refer to them and how the forge lists them. Severity only groups by status first.
     match app.sort {
         SortMode::Severity => rows.sort_by(|a, b| {
             let score = |r: &ReviewView| match r.review.status {
@@ -87,9 +89,7 @@ pub fn scoped(app: &App) -> Vec<&ReviewView> {
                 ReviewStatus::Draft => 3,
                 _ => 4,
             };
-            score(a)
-                .cmp(&score(b))
-                .then(b.review.updated_at.cmp(&a.review.updated_at))
+            score(a).cmp(&score(b)).then(b.review.id.cmp(&a.review.id))
         }),
         SortMode::Activity => rows.sort_by(|a, b| b.review.updated_at.cmp(&a.review.updated_at)),
         SortMode::Name => rows.sort_by(|a, b| b.review.id.cmp(&a.review.id)),

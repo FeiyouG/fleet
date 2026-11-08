@@ -464,7 +464,8 @@ async fn fetch_all(
             Err(e) => errs.push(format!("{}: {e}", a.source())),
         }
     }
-    rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // Newest MR/PR first (by number within a source); `fleet review list` prints this order.
+    rows.sort_by(|a, b| a.source.cmp(&b.source).then(b.id.cmp(&a.id)));
     let err = if errs.is_empty() {
         None
     } else {

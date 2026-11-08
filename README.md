@@ -202,7 +202,7 @@ foldable section per project plus "outside projects". `:project [name|all]` and 
 | `Space` | detail panel |
 | `/` | live filter · `Esc` clears |
 | `p`/`P` | next / previous project |
-| `r`, `R`, `S` | refresh now / refresh reviews / cycle sort |
+| `r`, `R`, `S` | refresh now / refresh reviews / cycle sort (severity → activity → name; reviews are always listed by MR/PR number, newest first — severity only groups by status) |
 | `:` | run any `fleet …` subcommand, or `:project X` |
 | `g a/t/w/v` | this row in Agents / Tmux / Worktrees / Reviews |
 | `a a/s/m/n/x/o/c` | agent: attach, start, message, rename, stop, open plan, copy plan |
