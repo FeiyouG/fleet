@@ -56,3 +56,7 @@
 
 - [~] 9.1 Spike on InstaBox (one machine, `fleet-spike-*`, cleaned up); results into design.md — machine lifecycle, start, ssh, pause/resume done; agent/plan/idle/docker pending
 - [ ] 9.2 `docs/machines.md`; archive the change
+
+## 10. Later
+
+- [ ] 10.1 Provider-neutral credentials pushed from the laptop (deferred; design.md Q7) — today secrets are entered in InstaBox by hand

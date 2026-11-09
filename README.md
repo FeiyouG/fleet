@@ -188,6 +188,19 @@ on the laptop. tmux is required on every machine. Agent names are unique across 
 InstaBox pauses an idle machine itself (memory kept, so tmux and the agent survive); attaching
 or `fleet machine shell` wakes it. Fleet never pauses or stops a machine on its own.
 
+**Secrets (entered in InstaBox by hand, for now).** The profile names secrets; you create them
+in InstaBox (Settings → Secrets). Nothing refreshes a pasted value, so paste long-lived ones:
+
+| Secret | Paste | Not |
+|---|---|---|
+| `GITLAB_TOKEN` (proxy) | a GitLab personal/project access token (`api`, `write_repository`) | glab's OAuth token (expires in ~2 h) |
+| `OPENCODE_AUTH` (file) | an `auth.json` with API keys only, e.g. `{"anthropic":{"type":"api","key":"sk-ant-…"}}` | your laptop's OAuth `auth.json` (access token < 8 h; a refresh token there can sign your laptop out) |
+
+To use an OAuth subscription anyway, `fleet creds sync --profile ibx` uploads the laptop file
+with refresh tokens removed; re-run it at least every 8 h. The InstaBox API key stays in your
+laptop shell (`INSTABOX_API_KEY`), never in the config. Provider-neutral credentials (fleet
+pushing the laptop's own logins to any machine) are planned: `openspec/changes/add-remote-machines/design.md` Q7.
+
 `fleet machine ls | create PROFILE | pause | resume | stop | start | rm | keep M [1h] | release |
 idle M 10m|off | max-run M 4h|off | shell M [--print] [-- CMD…] | doctor M | url M PORT`.
 Attach uses the system `ssh` (or `mosh`) with a short-lived certificate fleet requests for its

@@ -336,6 +336,54 @@ The interface keeps `pause`, `keepalive` and `set_idle`, so a Fleet-driven polic
 **Recommended: A,** verified in the spike.
 
 
+## Q7. Credentials — today: manual InstaBox secrets; deferred: provider-neutral push
+
+**Decided (2026-11-09): manual InstaBox secrets for now.** The profile names secrets
+(`secrets = { "GITLAB_TOKEN" }`, `files = { [".local/share/opencode/auth.json"] = "OPENCODE_AUTH" }`)
+and the user enters their values in InstaBox (Settings → Secrets) by hand. No credential code
+changes. Manual values never update, so they must be long-lived: a GitLab personal/project
+access token (not glab's OAuth token, ~2 h), and an `auth.json` holding API keys only (the
+opencode Anthropic OAuth access token lasts < 8 h, and a pasted refresh token would let the
+machine sign the laptop out). `fleet creds sync` (refresh tokens stripped) stays available for
+an OAuth file, re-run at least every 8 h.
+
+**Why it is deferred, not final.** This path ties the config to one vendor: secret names live
+in InstaBox, and moving to another provider means re-creating every secret there.
+
+**Deferred design: the laptop pushes its own credentials (provider-neutral).**
+
+- Config names laptop **sources**, once, at the top level; profiles list them by name:
+  ```lua
+  credentials = {
+    gitlab   = { cmd = "glab config get token --host gitlab.com", env = "GITLAB_TOKEN" },
+    opencode = { file = "~/.local/share/opencode/auth.json", strip_refresh = true },
+    anthropic_key = { from_env = "ANTHROPIC_API_KEY", env = "ANTHROPIC_API_KEY" },
+  },
+  machines = { ibx = { provider = "instabox", api_key = { cmd = "security find-generic-password -s instabox -w" },
+                       credentials = { "gitlab", "opencode" } } },
+  ```
+  Source forms `cmd` / `file` / `from_env` (exactly one); target `env = NAME` or a path
+  (default: the same home-relative path). `api_key` replaces `api_key_env` with the same forms.
+- Delivery uses only `exec` + `write_file` (every adapter has them): files into
+  `/dev/shm/fleet/creds/` (0700 dir, 0600 files; memory only, survives a pause, gone on stop),
+  login files symlinked to their usual path, variables in `env.sh` sourced by `~/.profile`, and
+  git's credential helper reads the token file each time (rotation without restarting the
+  agent). Pushed on create, wake, attach, start, review.
+- `fleet creds sync` pushes changed values (hash per machine) to running machines every 5 min
+  and on a source's mtime change; paused machines get them on wake. `put_secret` and
+  `MachineSpec.secrets/files/env_secrets` are deleted. The in-machine publisher's InstaBox key
+  becomes an adapter-supplied credential (still workspace-wide; mitigation: a dedicated
+  workspace).
+- `fleet machine snapshot` wipes `/dev/shm/fleet` before saving.
+
+| | A. Push over the command channel (deferred choice) | B. Provider secret store (today) | C. Laptop serves them through a tunnel |
+|---|---|---|---|
+| Pros | Any provider; one path; nothing stored at the vendor; memory-only files | The agent sees only a placeholder for proxy secrets | The machine never holds a token |
+| Cons | The agent can read its tokens (mitigate with narrow tokens); variables rotate only for new shells | Vendor-specific; values re-created per provider; a second copy at the vendor | Fails when the laptop sleeps; every call crosses ~190 ms each way |
+
+Token lifetimes under A (only the laptop refreshes): Anthropic OAuth < 8 h, OpenAI OAuth days,
+glab OAuth ~2 h, API keys / PATs until revoked. Long unattended runs need non-expiring sources.
+
 ---
 
 
