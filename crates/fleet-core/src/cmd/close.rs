@@ -373,6 +373,10 @@ pub fn project_for_main(cfg: &Config, main: &Path) -> Project {
             worktrees: None,
             reviews: None,
             base: "main".into(),
+            defaults: Default::default(),
+            agents: Default::default(),
+            tasks: Default::default(),
+            keys: Default::default(),
         })
 }
 
@@ -1297,12 +1301,12 @@ mod tests {
 
     fn clean() -> Facts {
         Facts {
-            project: Project {
-                name: "svc".into(),
-                repo: "/r".into(),
-                worktrees: None,
-                reviews: None,
-                base: "main".into(),
+            project: {
+                let mut p = Project::new("svc", "/r");
+                p.worktrees = None;
+                p.reviews = None;
+                p.base = "main".into();
+                p
             },
             path: Some("/w/feat-x".into()),
             name: "feat-x".into(),
@@ -1811,6 +1815,7 @@ mod tests {
             port: None,
             agent: "opencode".into(),
             mode: None,
+            task: None,
             review_source: None,
             review_id: None,
             head_sha: None,
@@ -1821,12 +1826,12 @@ mod tests {
     }
 
     fn proj(name: &str, repo: &str, wts: &str) -> Project {
-        Project {
-            name: name.into(),
-            repo: repo.into(),
-            worktrees: Some(wts.into()),
-            reviews: None,
-            base: "main".into(),
+        {
+            let mut p = Project::new(name, repo);
+            p.worktrees = Some(wts.into());
+            p.reviews = None;
+            p.base = "main".into();
+            p
         }
     }
 

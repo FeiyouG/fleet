@@ -49,6 +49,10 @@ pub async fn detect(
         worktrees: worktrees.map(Path::to_path_buf),
         reviews,
         base,
+        defaults: Default::default(),
+        agents: Default::default(),
+        tasks: Default::default(),
+        keys: Default::default(),
     })
 }
 
@@ -109,21 +113,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleet-proj-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("init.lua");
-        let a = Project {
-            name: "a".into(),
-            repo: "/r/a".into(),
-            worktrees: None,
-            reviews: Some("gitlab:x/a".into()),
-            base: "main".into(),
+        let a = {
+            let mut p = Project::new("a", "/r/a");
+            p.worktrees = None;
+            p.reviews = Some("gitlab:x/a".into());
+            p.base = "main".into();
+            p
         };
         std::fs::write(&path, Config::example(&[a.clone()])).unwrap();
         let cfg = Config::load_from(&path).unwrap();
-        let b = Project {
-            name: "b".into(),
-            repo: "/r/b".into(),
-            worktrees: Some("/w/b".into()),
-            reviews: Some("github:x/b".into()),
-            base: "develop".into(),
+        let b = {
+            let mut p = Project::new("b", "/r/b");
+            p.worktrees = Some("/w/b".into());
+            p.reviews = Some("github:x/b".into());
+            p.base = "develop".into();
+            p
         };
         add_to_config(&cfg, &path, &b).unwrap();
         let cfg2 = Config::load_from(&path).unwrap();

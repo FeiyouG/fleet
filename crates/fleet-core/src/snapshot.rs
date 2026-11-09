@@ -44,7 +44,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: Config) -> Self {
-        let agent_adapters = agents::adapters(&config.agents, &config.agent_args);
+        let agent_adapters = agents::adapters(&config);
         let mut sources: Vec<String> = config
             .projects
             .iter()
@@ -83,6 +83,15 @@ impl Engine {
             .iter()
             .find(|a| a.source() == source)
             .map(|b| b.as_ref())
+    }
+
+    /// An adapter configured for one resolved agent (its bin / args / model), for launches.
+    /// Discovery uses the per-harness adapters in `agent_adapters`.
+    pub fn adapter_for_agent(
+        &self,
+        agent: &crate::config::ResolvedAgent,
+    ) -> Option<Box<dyn AgentAdapter>> {
+        agents::adapter_for(&agent.harness, crate::config::AgentConfig::from(agent))
     }
 
     pub fn agent_adapter(&self, name: &str) -> Option<&dyn AgentAdapter> {

@@ -160,9 +160,10 @@ pub async fn check(cfg: &Config, adapters: &[Box<dyn AgentAdapter>]) -> Check {
     let mut agent_checks = vec![];
     for a in adapters {
         let bin = cfg
-            .agents
-            .get(a.name())
-            .bin
+            .enabled_agents()
+            .into_iter()
+            .find(|x| x.harness == a.name())
+            .map(|x| x.bin)
             .unwrap_or_else(|| a.name().to_string());
         let bin_found = which(&bin).await;
         let pids: Vec<u32> = a
