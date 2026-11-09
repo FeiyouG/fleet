@@ -39,40 +39,85 @@ fleet                                          # the TUI
 
 ### Config: `~/.config/fleet/init.lua`
 
-Lua 5.4 is embedded (sandboxed: `string`, `table`, `math`, `os.getenv`); the file returns the config table, nvim-style.
+fleet ships a complete default configuration (`config/default/` in this repo, embedded in the
+binary). Your `~/.config/fleet/init.lua` is **deep-merged over it**: tables merge key by key,
+scalars and lists replace. Write only what differs. `fleet config --default` prints the shipped
+tree (the reference and the template), `fleet config --effective` the merged result,
+`fleet config --check` validates yours.
+
+Lua 5.4, sandboxed: `string`, `table`, `math`, `os.getenv`, plus `require("name")` (loads
+`name/mod.lua` or `name.lua` next to the calling file) and `read("file.md")` (the text of a file
+next to the calling file). Each section can be its own folder with a `mod.lua`, and a prompt
+lives beside the Lua that reads it — no `[[ … ]]` long strings.
+
+Three layers: a **harness** is an adapter in code (`opencode`, `claude`, `codex`); an **agent**
+is your named configuration of a harness (`agents.<name>`); a **task** is a preset for starting
+an agent (`tasks.<name>`). Every section can be overridden per project.
 
 ```lua
+-- ~/.config/fleet/init.lua
 local home = os.getenv("HOME")
 return {
-  defaults = {
-    agent = "opencode",                -- required: adapter preselected by `fleet agent start`
-    mode = "plan",                     -- plan | build (every adapter), or an opencode agent (`fleet agent choices`)
-    notify = true, refresh_secs = 2, review_ttl_secs = 60,
-    -- left_pane = "nvim",  -- command for the LEFT (shell) pane of a new task; unset = bare shell
-  },
-  -- required: every adapter, explicitly. model = the model for new agents in that CLI's own
-  -- naming (unset = the CLI's default); args are appended to every launch.
+  -- defaults = { agent = "opencode", mode = "plan" },         -- see `fleet config --default`
   agents = {
-    opencode = { enabled = true },     -- e.g. model = "anthropic/claude-opus-5-5"
-    claude   = { enabled = true },     -- e.g. model = "opus"
-    codex    = { enabled = false, sandbox = "workspace-write" },
+    opencode = { model = "anthropic/claude-opus-5-5" },         -- model in the harness's own naming
+    -- fast = { harness = "opencode", model = "anthropic/claude-sonnet-4-5" },
+    -- per agent: harness, enabled, bin, args, model, skills = { "/abs/SKILL.md" }, system = "…"
   },
-  -- fleet:projects (fleet project add appends here)
+  tasks = require("tasks"),                                     -- ~/.config/fleet/tasks/mod.lua, see below
   projects = {
-    {
-      name = "monid-services",
+    { name = "monid-services",
       repo = home .. "/Projects/monid/monid-services",
-      worktrees = home .. "/Projects/monid/worktrees",   -- where `fleet agent start` creates worktrees for THIS project
-      reviews = "gitlab:monid-ai/monid-services",         -- or "github:owner/repo"
+      worktrees = home .. "/Projects/monid/worktrees",          -- where new worktrees go
+      reviews = "gitlab:monid-ai/monid-services",                -- or "github:owner/repo"; omit = no Reviews for it
       base = "main",
+      -- any section, for this project only:
+      -- defaults = { agent = "claude", mode = "build" },
+      -- agents = { opencode = { model = "anthropic/claude-sonnet-4-5" } },
+      -- tasks = { review = { skills = { … } }, release = { key = "R", skills = { … } } },
+      -- keys = { ["tab.reviews"] = "5" },
     },
   },
-  -- fleet:projects:end
-  keys = { -- ["agent.start"] = "C-n" },
+  -- keys = { ["agent.stop"] = "K" },                           -- `fleet keys` lists every action
 }
 ```
 
-Discovery lists every worktree git knows for a project's repo wherever it lives; `worktrees` only decides where new ones go.
+```lua
+-- ~/.config/fleet/tasks/mod.lua
+local skills = os.getenv("HOME") .. "/.config/opencode/skills"
+return {
+  start  = { skills = { skills .. "/implement-change/SKILL.md" } },
+  review = { skills = { skills .. "/review-team-mr/SKILL.md" }, instructions = read("review.md") },
+  bugfix = { key = "b", mode = "build", prompt = "Fix the bug described below.",
+             instructions = read("bugfix.md") },
+}
+```
+
+Discovery lists every worktree git knows for a project's repo wherever it lives; `worktrees`
+only decides where new ones go. A project without `reviews` has no Reviews section and
+review tasks are greyed out for it.
+
+### Tasks
+
+A task is what `Space t <key>` in the TUI and `fleet task <name>` on the CLI start. Fields:
+`key` (the key after `Space t`), `on` (`project` → a new worktree from `base`; `review` → the
+selected MR/PR head, detached), `agent`, `mode`, `model`, `skills` (absolute `SKILL.md` paths),
+`instructions` (text after fleet's system text; keep it in a `.md` and `read()` it), `prompt`
+(preset, editable in the popup), `label`. Three ship: `start` (`s`), `review` (`r`, plan mode,
+with review instructions), `explain` (`e`, plan mode: explain a part of the codebase to a
+newcomer with diagrams and `file:line` excerpts).
+
+Resolution for every field: CLI flag / popup edit → project task → global task → project
+agent → global agent → project defaults → global defaults (your file over the shipped one at
+each level). Skills accumulate (agent + task); everything else: first one wins.
+
+What the agent receives: fleet's system text (`defaults.system`, placeholders `{slug} {repo}
+{branch} {base} {agent} {review_id} {review_url} {review_title} {source_branch}
+{target_branch}`), the rename line for a `wip-*` slug, the review line for review tasks,
+`Skills to read and follow first: …`, the agent's `system`, the task's `instructions`, then the
+prompt. Claude Code gets the system part through `--append-system-prompt`; opencode and
+Codex get it prepended to the first message. A skill outside the harness's own skill folders
+is symlinked into them so the agent can load it by name.
 
 ### The opencode plugin (`fleet setup`)
 
@@ -82,30 +127,36 @@ The plugin also opens a small control endpoint on `127.0.0.1` (random port, rand
 
 ### Modes and models
 
-Every adapter knows `plan` and `build`. `fleet agent choices [--repo P] [--agent A] [--json]` lists what you can pick in a project:
+Three modes everywhere: `plan` (read-only), `build` (edits in the worktree; the harness asks
+before risky steps), `yolo` (no prompts at all, full access — opencode `--agent build`, Claude
+`--permission-mode bypassPermissions`, Codex `--sandbox danger-full-access --ask-for-approval
+never`). How a mode maps to a harness's switches is adapter code, not config. opencode also
+offers its own primary agents as extra modes (`fleet agent choices`).
 
-- **opencode**: its primary agents (hidden internal ones dropped) as modes, each with its default model, and every model opencode has credentials for (`opencode models`, run in the repo so its `opencode.json` counts). `--mode` and `--model` are checked against this list.
-- **claude / codex**: `plan` and `build`; their CLIs can't list models, so any `--model` name is passed through (`--model` on their command line). They can't switch mode or model for a single message.
-
-The list is cached for 5 minutes (in memory and in `~/.local/share/fleet/cache/`, so separate `fleet` calls share it); a failed lookup is not cached. If the lookup itself fails, `start` and `send` warn and go ahead unchecked.
+Models are set per agent in the harness's own naming (`agents.opencode.model =
+"anthropic/claude-opus-5-5"`, `agents.claude.model = "opus"`); unset = the harness's default.
+`fleet agent choices [--repo P] [--agent A]` lists what a harness offers in a project
+(opencode: agents + models with credentials; claude/codex: plan/build/yolo, any model name
+passed through). Cached 5 minutes.
 
 ## Commands
 
 ```
 fleet [--project NAME]                 the TUI (default scope: the project containing the cwd, else all)
 fleet status [--short|--json]          one-shot snapshot (tmux status bar / scripts)
-fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--agent opencode|claude|codex] [--mode MODE] [--model MODEL] [--left-pane CMD|--no-left-pane]
+fleet task NAME [SLUG|REVIEW-ID] [-m TEXT|-f FILE] [--repo P] [--agent A] [--mode M] [--model ID] [--skill PATH…|--no-skills]
+fleet agent start [NAME] [-m TEXT|-f FILE] [--repo P] [--task T] [--agent A] [--mode plan|build|yolo] [--model ID] [--skill PATH…] [--left-pane CMD|--no-left-pane]
 fleet agent send NAME TEXT [--mode MODE] [--model MODEL]
 fleet agent list | choices [--repo P] [--agent A] | attach NAME | rename OLD NEW | stop NAME
-fleet review list [--source S] | review start ID|URL        (re-review when it already exists)
+fleet review list [--source S] | review start ID|URL [--task T] [--agent A] [--skill PATH…]   (re-review when it already exists)
 fleet worktree list | worktree gc [--yes]                   (dry run first)
 fleet worktree close TARGET [--force] [--yes] [--json]      (alias: fleet close; TARGET = task, folder, branch, session or path)
 fleet project list | project add [PATH] [--name N] [--reviews S] [--worktrees DIR] [--base B]
 fleet tmux list
-fleet setup [--remove|--check] | config [--init] | keys
+fleet setup [--remove|--check] | config [--init|--default|--effective|--check] | keys [--project P]
 ```
 
-`fleet start …` = `agent start`, `fleet review 514` = `review start 514`. `--project` scopes every list command.
+`fleet start …` = `agent start` = `fleet task start …`; `fleet review 514` = `review start 514` = `fleet task review 514`. `--project` scopes every list command.
 
 ### Start a task
 
@@ -116,7 +167,7 @@ fleet setup [--remove|--check] | config [--init] | keys
 while the agent is alive (opencode keeps absolute paths), renames the tmux
 session and updates the registry. With a name, everything is named up front.
 
-In the TUI (`a s`) the prompt box takes multi-line text: paste as much as you like (bracketed
+In the TUI (`Space t s`) the prompt box takes multi-line text: paste as much as you like (bracketed
 paste, every line kept; the title shows the line count), type Enter for a new line, `C-e` to
 write it in `$EDITOR`, `C-s` to start. `-f FILE` (`-` = stdin) does the same on the CLI.
 
@@ -192,27 +243,33 @@ worktrees, start a review agent for one without. The detail panel describes the 
 **Projects:** `p`/`P` cycle `project1 → project2 → all`; under `all`, Worktrees and Reviews get one
 foldable section per project plus "outside projects". `:project [name|all]` and `--project` set it.
 
+A Vim user should be able to drive fleet blind. Motions are Vim's; `Space` is the **leader**
+and opens a menu for the selected row showing only what applies to it; `Space t` opens the
+tasks menu. Every key below comes from the config (`fleet keys`, `fleet keys --project P`).
+
 | key | |
 |---|---|
-| `1`–`4`, `Tab` | tabs |
+| `1`–`4`, `Tab`/`S-Tab` | tabs |
 | `j`/`k`, `g g`/`G`, `C-u`/`C-d` | move |
 | `l`/`h`, `z o`/`z c` | unfold/fold one · all |
-| `Enter` | attach / shell / unfold / start review (per node) |
-| `o`, `c` | open / copy the plan URL (if waiting) else the review URL |
-| `Space` | detail panel |
-| `/` | live filter · `Esc` clears |
-| `p`/`P` | next / previous project |
-| `r`, `R`, `S` | refresh now / refresh reviews / cycle sort (severity → activity → name; reviews are always listed by MR/PR number, newest first — severity only groups by status) |
+| `/` · `f`/`F` · `*` | filter (`Esc` clears) · next/previous match (no filter: next row that needs you) · scope to the row's project |
+| `Enter` | attach / shell / unfold / start review (per row) |
+| `o`, `y` | open / yank (copy) the plan URL if waiting, else the review URL |
+| `i` | detail panel |
+| `[p` / `]p` | previous / next project scope |
+| `r`, `R`, `S` | refresh now / refresh reviews / cycle sort |
 | `:` | run any `fleet …` subcommand, or `:project X` |
 | `g a/t/w/v` | this row in Agents / Tmux / Worktrees / Reviews |
-| `a a/s/m/n/x/o/c` | agent: attach, start, message, rename, stop, open plan, copy plan |
-| `w s/p/P/x/g/c/o` | worktree: shell, push -u, pull --ff-only, close task (popup lists every step and blocker; `F` twice forces), gc, columns, open review |
-| `v o/c/r/w/a/f` | review: open, copy, review/re-review, worktrees, agents, filter preset (all/local/mine/others/needs-me/failed) |
-| `K`, `n` (Tmux) | kill / rename session |
+| `Space` … agent row | `a` attach · `m` message · `s` stop · `n` rename · `p` open plan · `y` copy plan |
+| `Space` … worktree row (and agent rows) | `S` shell · `x` close task · `u`/`U` push -u / pull --ff-only · `o` open review |
+| `Space` … review row | `r` review / re-review · `o` open · `y` copy · `w` worktrees · `a` agents · `f` filter preset |
+| `Space` … tmux row | `x` kill session · `n` rename |
+| `Space` … any row | `g` gc · `c` columns · `t` tasks → each task's `key` (`s` start, `r` review, `e` explain, yours) |
 
-`?` shows the full map after your `[keys]` overrides; prefix keys open a which-key menu.
+`?` shows the effective map. A key value that is a chord (`"a s"`) or a modified key (`C-n`) is
+a top-level binding, so old-style overrides keep working.
 
-**Start popup** (`a s`): name, repo, agent (opencode/claude/codex), mode (`←`/`→` through that agent's modes), model (`Enter` opens a filterable picker: type `opus` or `gpt 5.4`; for claude/codex type the name; `Backspace` = default), prompt. **Message popup** (`a m`): `Tab` cycles the mode (`unchanged` → each mode), `C-o` picks a model; both default to unchanged, so a plain `Enter` sends as before.
+**Start popup** (`Space t s`, or any project task): the title names the task and its skills; name, repo, agent (opencode/claude/codex), mode (`←`/`→` through that agent's modes), model (`Enter` opens a filterable picker: type `opus` or `gpt 5.4`; for claude/codex type the name; `Backspace` = default), prompt. **Message popup** (`Space m`): `Tab` cycles the mode (`unchanged` → each mode), `C-o` picks a model; both default to unchanged, so a plain `Enter` sends as before.
 
 ## How it works
 

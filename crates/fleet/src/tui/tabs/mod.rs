@@ -125,6 +125,10 @@ pub fn selected(app: &App) -> Option<Node> {
     nodes(app).into_iter().nth(app.tabs.state(app.tab).selected)
 }
 
+pub fn node_at(app: &App, i: usize) -> Option<Node> {
+    nodes(app).into_iter().nth(i)
+}
+
 /// `l` / Right.
 pub fn expand(app: &mut App) {
     let ns = nodes(app);

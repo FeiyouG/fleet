@@ -869,3 +869,49 @@ otherwise `TxnReport.skipped` ("changed since the dry run"; e2e 9f drives a real
 
 **TUI force needs `F` twice.** Blocked popup: `F` arms force and shows "LOST when you press F
 again"; `Enter`/`y` then only explain; a second `F` closes.
+
+
+## v0.4 — configuration as data: harness < agent < task
+
+**Nothing is hard-coded in Rust any more.** `config/default/` (a folder per section, each a
+`mod.lua`; prompt files beside the Lua that `read()`s them) is embedded in the binary and
+evaluated first; the user's `~/.config/fleet/init.lua` is deep-merged over it (tables by key,
+scalars/lists replace). Rust reads the merged result and assumes every field is present.
+`fleet config --default | --effective | --check`. The Lua sandbox gains `require` and `read`,
+confined to the tree being evaluated.
+
+**Three layers.** A *harness* is an adapter implementation (`agents/adapters/{opencode,claude,
+codex}`, behind `agents/interfaces`). An *agent* is the user's named configuration of a
+harness (`agents.<name> = { harness, enabled, bin, args, model, skills, system }`); the
+engine runs one discovery adapter per distinct harness and builds a per-agent adapter for
+launches. A *task* is a preset for starting an agent (`tasks.<name> = { key, on, agent, mode,
+model, skills, instructions, prompt, label }`); `on = project | review` is the only structural
+difference between the shipped `start` and `review`. Every section is overridable per project
+(`projects[i].{defaults,agents,tasks,keys}`), field by field. Resolution: CLI/popup → project
+task → global task → project agent → global agent → project defaults → global defaults.
+
+**Modes** are `plan | build | yolo`; the mapping to a harness's switches is adapter code
+(claude `--permission-mode plan|acceptEdits|bypassPermissions`; codex `--sandbox` +
+`--ask-for-approval`; opencode `--agent plan|build`). No `sandbox`/`permissions` field in config
+(the old `sandbox` warns). **Models** are per agent in the harness's own naming; there is no
+canonical-name table (decided against: not worth maintaining a mapping now).
+
+**Skills** are absolute `SKILL.md` paths in config. No harness has a "load this skill" flag;
+all three load a skill when the prompt names it, from their own skill folders. The adapter's
+`prepare_skill` symlinks a skill folder into its first skill dir when it lives elsewhere and
+returns the front-matter `name`; `cmd::prompt::system` names the skills first. Claude gets the
+system text via `--append-system-prompt`; the others prepend it to the first message.
+
+**Config problems** split into fatal (no agents, unknown harness, default agent undefined,
+two tasks on one key, duplicate project name, …: the CLI exits 1, the TUI never opens) and
+warnings (binary not on PATH, missing skill/repo path, unknown key with a did-you-mean,
+legacy fields): the TUI shows them once in a dismissable popup, `fleet config --check` prints
+them.
+
+**Keys** are data in `config/default/keys/mod.lua`. `Space` is the leader; its menu is built
+from the selected row's kind (agent / worktree / review / tmux) and shows only what applies;
+`Space t` lists the tasks with their own keys. An agent row is also a worktree row: on a
+shared key the agent action wins (so shipped worktree keys avoid agent ones: `S` shell, `u`/`U`
+push/pull). `f`/`F` find next/previous filter match, `*` scopes to the row's project, `y` yanks,
+`i` inspects, `[p`/`]p` cycle projects. A chord or modified-key value is a top-level binding, so
+old overrides still parse. The keymap is rebuilt when the project scope changes.

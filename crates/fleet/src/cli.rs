@@ -54,16 +54,27 @@ enum Cmd {
     Start(StartArgs),
     /// Alias of `worktree close`
     Close(CloseArgs),
+    /// Start a task preset from config: `fleet task bugfix -m "…"`, `fleet task review 514`
+    Task(TaskArgs),
     /// Print the config path and an example config
     Config {
         /// Write the example config if none exists (the cwd's repo becomes the first project)
         #[arg(long)]
         init: bool,
+        /// Print the shipped default configuration (every file)
+        #[arg(long)]
+        default: bool,
+        /// Print the effective configuration (defaults + your file, merged) as JSON
+        #[arg(long)]
+        effective: bool,
+        /// Validate the configuration: list fatal problems and warnings, exit 1 on fatal
+        #[arg(long)]
+        check: bool,
     },
     /// Projects: list, add
     #[command(subcommand)]
     Project(ProjectCmd),
-    /// Print every action and its current key binding
+    /// Print every action and its current key binding (per project with --project)
     Keys,
     /// Install each enabled agent's hook/plugin so fleet sees permission prompts (and print the tmux snippet)
     Setup {
@@ -133,12 +144,21 @@ struct StartArgs {
     /// Repo name from config (default: the cwd's repo, else the only repo)
     #[arg(long)]
     repo: Option<String>,
-    /// Which agent to launch: opencode | claude | codex (default: defaults.agent)
+    /// Task preset from config (default: start). `fleet task NAME …` is the same thing
+    #[arg(long)]
+    task: Option<String>,
+    /// Which agent (a name from `agents`; default: the task's, else defaults.agent)
     #[arg(long)]
     agent: Option<String>,
-    /// plan | build, or an opencode agent (`fleet agent choices` lists them)
+    /// plan | build | yolo, or a harness mode (`fleet agent choices` lists them)
     #[arg(long)]
     mode: Option<String>,
+    /// Skill files (absolute SKILL.md paths) to load instead of the task's; repeatable
+    #[arg(long = "skill", value_name = "PATH")]
+    skills: Vec<PathBuf>,
+    /// Load no skills even when the task or agent lists some
+    #[arg(long, conflicts_with = "skills")]
+    no_skills: bool,
     /// Model in the agent's naming, e.g. opencode provider/model (default: agents.<name>.model)
     #[arg(long)]
     model: Option<String>,
@@ -152,6 +172,33 @@ struct StartArgs {
     #[arg(long, conflicts_with = "left_pane")]
     no_left_pane: bool,
     /// Do not attach after starting
+    #[arg(long)]
+    no_attach: bool,
+}
+
+#[derive(Args)]
+struct TaskArgs {
+    /// Task name from config (`fleet config --effective` lists them)
+    task: String,
+    /// For `on = "review"` tasks: the MR/PR id or URL. For project tasks: the task slug.
+    target: Option<String>,
+    /// Prompt text (project tasks; else -f FILE, else the task's preset / $EDITOR)
+    #[arg(short = 'm', long)]
+    message: Option<String>,
+    #[arg(short = 'f', long)]
+    file: Option<PathBuf>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    mode: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long = "skill", value_name = "PATH")]
+    skills: Vec<PathBuf>,
+    #[arg(long, conflicts_with = "skills")]
+    no_skills: bool,
     #[arg(long)]
     no_attach: bool,
 }
@@ -171,9 +218,17 @@ enum ReviewCmd {
         id_or_url: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Which agent to launch (default: defaults.agent)
+        /// Task preset from config, an `on = "review"` one (default: review)
+        #[arg(long)]
+        task: Option<String>,
+        /// Which agent (default: the task's, else defaults.agent)
         #[arg(long)]
         agent: Option<String>,
+        /// Skill files to load instead of the task's; repeatable
+        #[arg(long = "skill", value_name = "PATH")]
+        skills: Vec<PathBuf>,
+        #[arg(long, conflicts_with = "skills")]
+        no_skills: bool,
         #[arg(long)]
         no_attach: bool,
     },
@@ -249,6 +304,17 @@ enum TmuxCmd {
         /// `session`, `session:win` or `session:win.pane`
         target: String,
     },
+}
+
+/// `--skill PATH…` / `--no-skills` -> the task's skills override.
+fn skills_opt(skills: Vec<PathBuf>, none: bool) -> Option<Vec<PathBuf>> {
+    if none {
+        Some(vec![])
+    } else if skills.is_empty() {
+        None
+    } else {
+        Some(skills)
+    }
 }
 
 fn progress() -> cmd::Progress {
@@ -346,6 +412,59 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
         }
         Cmd::Agent(a) => agent(a, cfg, project).await,
         Cmd::Start(args) => agent(AgentCmd::Start(args), cfg, project).await,
+        Cmd::Task(t) => {
+            let repo_name = t
+                .repo
+                .clone()
+                .or(project.clone())
+                .or_else(|| cwd_repo(&cfg));
+            let proj = repo_name.as_deref().and_then(|r| cfg.project(r));
+            let resolved = cfg.task(&t.task, proj)?;
+            match resolved.on {
+                fleet_core::config::On::Review => {
+                    let id = t.target.clone().context(
+                        "this task runs on a review: pass the MR/PR id or URL, e.g. `fleet task review 514`",
+                    )?;
+                    let engine = Engine::new(cfg).merged_lookups(false);
+                    let out = review::start(
+                        &engine,
+                        review::ReviewOpts {
+                            id_or_url: id,
+                            task: Some(t.task),
+                            repo: repo_name,
+                            agent: t.agent,
+                            skills: skills_opt(t.skills, t.no_skills),
+                            attach: !t.no_attach,
+                        },
+                        &progress(),
+                    )
+                    .await?;
+                    if let review::ReviewOutcome::Started { slug, path, port } = out {
+                        println!("started {slug} at {} (port {port})", path.display());
+                    }
+                    Ok(())
+                }
+                fleet_core::config::On::Project => {
+                    let args = StartArgs {
+                        name: t.target,
+                        message: t.message.or(resolved.prompt.clone()),
+                        file: t.file,
+                        repo: repo_name,
+                        task: Some(t.task),
+                        agent: t.agent,
+                        mode: t.mode,
+                        model: t.model,
+                        skills: t.skills,
+                        no_skills: t.no_skills,
+                        base: None,
+                        left_pane: None,
+                        no_left_pane: false,
+                        no_attach: t.no_attach,
+                    };
+                    agent(AgentCmd::Start(args), cfg, project).await
+                }
+            }
+        }
         Cmd::Review(r) => match r {
             ReviewCmd::List { json, source } => {
                 let f = snapshot(&cfg).await;
@@ -398,7 +517,10 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             ReviewCmd::Start {
                 id_or_url,
                 repo,
+                task,
                 agent,
+                skills,
+                no_skills,
                 no_attach,
             } => {
                 let engine = Engine::new(cfg).merged_lookups(false);
@@ -407,8 +529,10 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                     &engine,
                     review::ReviewOpts {
                         id_or_url,
+                        task,
                         repo,
                         agent,
+                        skills: skills_opt(skills, no_skills),
                         attach: !no_attach,
                     },
                     &progress(),
@@ -537,8 +661,42 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Config { init } => {
+        Cmd::Config {
+            init,
+            default,
+            effective,
+            check,
+        } => {
             let p = fleet_core::config::config_path();
+            if default {
+                for (path, contents) in fleet_core::config::shipped::FILES {
+                    println!("-- ===== config/default/{path} =====\n{contents}");
+                }
+                return Ok(());
+            }
+            if effective {
+                let user = p.exists().then(|| {
+                    (
+                        fleet_core::config::lua::Tree::Dir(p.parent().unwrap().to_path_buf()),
+                        "init.lua",
+                    )
+                });
+                let v = Config::effective_json(user.as_ref().map(|(t, e)| (t, *e)))?;
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            if check {
+                // `cfg` loaded above, so there was no fatal problem; show the warnings.
+                if cfg.warnings.is_empty() {
+                    println!("ok: {} (no warnings)", p.display());
+                } else {
+                    println!("ok with warnings: {}", p.display());
+                    for w in &cfg.warnings {
+                        println!("  ⚠ {w}");
+                    }
+                }
+                return Ok(());
+            }
             println!("{}", p.display());
             let detected = match std::env::current_dir() {
                 Ok(cwd) => cmd::project::detect(&cwd, None, None, None, None)
@@ -702,7 +860,12 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
         }
         Cmd::AgentHook { agent } => cmd::agent_hook::run(&agent),
         Cmd::Keys => {
-            for (action, key) in tui::keys::Keymap::from_config(&cfg).list() {
+            let proj = project.as_deref().and_then(|p| cfg.project(p));
+            let km = tui::keys::Keymap::from_config(&cfg, proj);
+            for e in &km.overrides_errors {
+                eprintln!("fleet: {e}");
+            }
+            for (action, key) in km.list() {
                 println!("{action:<22} {key}");
             }
             Ok(())
@@ -839,12 +1002,14 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
             let out = start::start(
                 &engine,
                 start::StartOpts {
+                    task: args.task,
                     name: args.name,
                     prompt,
                     repo,
                     agent: args.agent,
                     mode: args.mode,
                     model: args.model,
+                    skills: skills_opt(args.skills, args.no_skills),
                     base: args.base,
                     left_pane: if args.no_left_pane {
                         Some(None)
@@ -967,7 +1132,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                 .repo
                 .clone();
             let agent = agent.unwrap_or_else(|| cfg.defaults.agent.clone());
-            let configured = cfg.agents.get(&agent).model;
+            let configured = cfg.agent(&agent, None).and_then(|a| a.model);
             let engine = Engine::new(cfg);
             let adapter = engine
                 .agent_adapter(&agent)

@@ -1,4 +1,4 @@
-use super::keys::{Action, Key, Keymap, Resolution};
+use super::keys::{Action, Key, Keymap, MenuItem, Resolution, RowKind};
 use super::notify::Notifier;
 use super::popups::{self, Popup};
 use super::tabs::{self, Tab};
@@ -34,7 +34,7 @@ pub struct App {
     pub tab: Tab,
     pub tabs: tabs::TabStates,
     pub pending: Vec<Key>,
-    pub menu: Option<Vec<(Key, Action)>>,
+    pub menu: Option<Vec<MenuItem>>,
     pub popup: Option<Popup>,
     pub status_line: Option<(String, bool)>,
     pub show_detail: bool,
@@ -69,7 +69,7 @@ pub enum Msg {
 }
 
 pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
-    let keymap = Keymap::from_config(&cfg);
+    let keymap = Keymap::from_config(&cfg, project.as_deref().and_then(|p| cfg.project(p)));
     for e in &keymap.overrides_errors {
         eprintln!("fleet: {e}");
     }
@@ -93,6 +93,13 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
     }
 
     let project_names: Vec<String> = cfg.projects.iter().map(|p| p.name.clone()).collect();
+    let startup_popup = if cfg.warnings.is_empty() && keymap.overrides_errors.is_empty() {
+        None
+    } else {
+        let mut ws = cfg.warnings.clone();
+        ws.extend(keymap.overrides_errors.iter().cloned());
+        Some(Popup::ConfigWarnings(ws))
+    };
     let mut app = App {
         notifier: Notifier::new(cfg.defaults.notify),
         cfg,
@@ -121,6 +128,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
         choices: HashMap::new(),
         choices_loading: HashSet::new(),
     };
+    app.popup = startup_popup;
 
     let mut term = enter()?;
     let mut events = EventStream::new();
@@ -290,7 +298,8 @@ impl App {
             return Ok(());
         }
         self.pending.push(key);
-        match self.keymap.resolve(&self.pending) {
+        let kind = self.row_kind();
+        match self.keymap.resolve(&self.pending, kind) {
             Resolution::Exact(a) => {
                 self.pending.clear();
                 self.menu = None;
@@ -329,7 +338,7 @@ impl App {
             }
             Filter => self.popup = Some(Popup::filter(st.filter.clone())),
             Command => self.popup = Some(Popup::command()),
-            Detail => self.show_detail = !self.show_detail,
+            Inspect => self.show_detail = !self.show_detail,
             Up => st.up(1),
             Down => st.down(1, count),
             Top => st.selected = 0,
@@ -371,8 +380,8 @@ impl App {
                     None => self.set_status("nothing to open".into(), true),
                 }
             }
-            Copy | AgentCopyPlan | ReviewCopy => {
-                let url = if a == ReviewCopy {
+            Yank | AgentCopyPlan | ReviewCopy => {
+                let url = if matches!(a, ReviewCopy) {
                     self.selected_review_url()
                 } else {
                     self.selected_url()
@@ -390,16 +399,13 @@ impl App {
             GotoWorktree | ReviewGotoWorktrees => self.goto(Tab::Worktrees),
             GotoReview => self.goto(Tab::Reviews),
             AgentAttach => self.attach_selected().await?,
-            AgentStart => {
-                let p = Popup::start(&self.cfg);
-                if let Popup::Start(f) = &p {
-                    if let Some(dir) = f.repo_dir(&self.cfg) {
-                        let agent = f.agent().to_string();
-                        self.want_choices(&agent, dir);
-                    }
-                }
-                self.popup = Some(p);
-            }
+            Task(name) => self.run_task(&name).await?,
+            FindNext => self.find(1),
+            FindPrev => self.find(-1),
+            FilterProject => match self.selected_project_name() {
+                Some(p) => self.set_project(Some(p)),
+                None => self.set_status("no project on this row".into(), true),
+            },
             AgentSend => {
                 if let Some(row) = self.selected_send_target() {
                     self.want_choices(&row.adapter, row.cwd.clone());
@@ -528,6 +534,7 @@ impl App {
                 })));
             }
             Start {
+                task,
                 name,
                 prompt,
                 repo,
@@ -540,12 +547,14 @@ impl App {
                     let out = cmd::start::start(
                         &engine,
                         cmd::start::StartOpts {
+                            task: Some(task),
                             name,
                             prompt,
                             repo,
                             agent,
                             mode,
                             model,
+                            skills: None,
                             base: None,
                             left_pane: None,
                             attach: false,
@@ -727,6 +736,10 @@ impl App {
 
     /// Start (or re-run) a review agent for a review id like `!514` / `#12`.
     pub fn start_review(&mut self, id: String) {
+        self.start_review_task(id, None)
+    }
+
+    pub fn start_review_task(&mut self, id: String, task: Option<String>) {
         let num: String = id.trim_start_matches(['!', '#']).to_string();
         let source = self.selected_review().map(|r| r.source).or_else(|| {
             self.fleet
@@ -748,8 +761,10 @@ impl App {
                 &engine,
                 cmd::review::ReviewOpts {
                     id_or_url: num,
+                    task,
                     repo,
                     agent: None,
+                    skills: None,
                     attach: false,
                 },
                 &cmd::quiet(),
@@ -795,6 +810,7 @@ impl App {
         for t in Tab::ALL {
             self.tabs.state_mut(t).selected = 0;
         }
+        self.rebuild_keymap();
         self.set_status(
             format!("project: {}", self.tabs.project.as_deref().unwrap_or("all")),
             false,
@@ -875,6 +891,120 @@ impl App {
 
     pub fn selected_review_url(&self) -> Option<String> {
         self.selected_review().map(|r| r.url.clone())
+    }
+
+    /// What the leader menu is about: the selected row's kind.
+    pub fn row_kind(&self) -> RowKind {
+        match tabs::selected(self).map(|n| n.data) {
+            Some(tabs::NodeData::Agent { .. }) => RowKind::Agent,
+            Some(tabs::NodeData::Worktree(_)) => RowKind::Worktree,
+            Some(tabs::NodeData::Review(_)) => RowKind::Review,
+            Some(tabs::NodeData::Session { .. }) | Some(tabs::NodeData::Pane(_)) => RowKind::Tmux,
+            _ => RowKind::Other,
+        }
+    }
+
+    /// The project the selected row belongs to, if any.
+    pub fn selected_project_name(&self) -> Option<String> {
+        let n = tabs::selected(self)?;
+        match &n.data {
+            tabs::NodeData::Project { name, .. } => Some(name.clone()),
+            tabs::NodeData::Agent { project, .. } => project.clone(),
+            tabs::NodeData::Review(v) => self
+                .cfg
+                .projects
+                .iter()
+                .find(|p| p.reviews.as_deref() == Some(v.review.source.as_str()))
+                .map(|p| p.name.clone()),
+            _ => n.worktree().map(|w| w.repo.clone()),
+        }
+        .filter(|name| self.cfg.project(name).is_some())
+    }
+
+    /// The keymap depends on the project scope (per-project keys and tasks).
+    fn rebuild_keymap(&mut self) {
+        let project = self
+            .tabs
+            .project
+            .as_deref()
+            .and_then(|p| self.cfg.project(p));
+        self.keymap = Keymap::from_config(&self.cfg, project);
+        for e in &self.keymap.overrides_errors.clone() {
+            self.set_status(e.clone(), true);
+        }
+    }
+
+    /// `f` / `F`: the next / previous row that matches the filter text; with no filter, the
+    /// next / previous row that needs you.
+    fn find(&mut self, dir: i32) {
+        let count = self.row_count();
+        if count == 0 {
+            return;
+        }
+        let st = self.tabs.state(self.tab);
+        let filter = st.filter.to_lowercase();
+        let start = st.selected;
+        let matches = |i: usize| -> bool {
+            let Some(n) = tabs::node_at(self, i) else {
+                return false;
+            };
+            if filter.is_empty() {
+                n.agents().iter().any(|a| a.activity.is_waiting())
+            } else {
+                n.name().to_lowercase().contains(&filter)
+            }
+        };
+        for step in 1..=count {
+            let i = (start as i64 + dir as i64 * step as i64).rem_euclid(count as i64) as usize;
+            if matches(i) {
+                self.tabs.state_mut(self.tab).selected = i;
+                return;
+            }
+        }
+        self.set_status(
+            if filter.is_empty() {
+                "no row needs you".into()
+            } else {
+                format!("no other row matches `{}`", st.filter)
+            },
+            false,
+        );
+    }
+
+    /// Start a task from config on the selected row: `project` tasks open the start popup
+    /// prefilled; `review` tasks start on the selected review.
+    async fn run_task(&mut self, name: &str) -> Result<()> {
+        let project = self
+            .selected_project_name()
+            .or_else(|| self.tabs.project.clone())
+            .and_then(|p| self.cfg.project(&p).cloned());
+        let task = match self.cfg.task(name, project.as_ref()) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_status(format!("task {name}: {e:#}"), true);
+                return Ok(());
+            }
+        };
+        match task.on {
+            fleet_core::config::On::Review => match self.selected_review() {
+                Some(r) => self.start_review_task(r.display_id.clone(), Some(name.to_string())),
+                None => self.set_status(
+                    format!("task {name} runs on a review: select an MR/PR first"),
+                    true,
+                ),
+            },
+            fleet_core::config::On::Project => {
+                let p = Popup::start_task(&self.cfg, project.as_ref(), &task);
+                if let Popup::Start(f) = &p {
+                    if let Some(dir) = f.repo_dir(&self.cfg) {
+                        let agent = f.agent().to_string();
+                        self.want_choices(&agent, dir);
+                    }
+                }
+                self.popup = Some(p);
+            }
+        }
+        Ok(())
     }
 
     pub fn selected_review(&self) -> Option<fleet_core::model::ReviewRow> {

@@ -17,6 +17,7 @@ pub enum PopupCmd {
     StartReview(String),
     RunCommand(String),
     Start {
+        task: String,
         name: Option<String>,
         prompt: String,
         repo: String,
@@ -47,6 +48,8 @@ pub enum PopupCmd {
 
 pub enum Popup {
     Help,
+    /// Startup: configuration warnings (fleet runs, the listed items will not take effect).
+    ConfigWarnings(Vec<String>),
     Input {
         title: String,
         value: String,
@@ -94,6 +97,10 @@ pub struct StartForm {
     pub picker: Option<Picker>,
     /// 0 name, 1 repo, 2 agent, 3 mode, 4 model, 5 prompt
     pub focus: usize,
+    /// The task preset this popup starts (`start` by default).
+    pub task: String,
+    /// Skill names the task will load (shown in the title; edit them in config).
+    pub skills: Vec<String>,
 }
 
 const START_FIELDS: usize = 6;
@@ -248,7 +255,7 @@ fn default_model_label(
     dir: Option<&std::path::Path>,
     mode: &str,
 ) -> String {
-    if let Some(m) = app.cfg.agents.get(adapter).model {
+    if let Some(m) = app.cfg.agent(adapter, None).and_then(|a| a.model) {
         return format!("default ({m})");
     }
     match loaded(app, adapter, dir).and_then(|c| c.default_for(mode)) {
@@ -343,6 +350,48 @@ impl Popup {
         Popup::ProjectPick { options, selected }
     }
     pub fn start(cfg: &Config) -> Popup {
+        let project = std::env::current_dir()
+            .ok()
+            .and_then(|c| cfg.project_for_path(&c).cloned());
+        match cfg.task("start", project.as_ref()) {
+            Ok(t) => Self::start_task(cfg, project.as_ref(), &t),
+            Err(_) => Self::start_blank(cfg),
+        }
+    }
+
+    /// The start popup prefilled from a task: its agent, mode, model, preset prompt.
+    pub fn start_task(
+        cfg: &Config,
+        project: Option<&fleet_core::config::Project>,
+        task: &fleet_core::config::ResolvedTask,
+    ) -> Popup {
+        let Popup::Start(mut f) = Self::start_blank(cfg) else {
+            unreachable!()
+        };
+        if let Some(p) = project {
+            if let Some(i) = f.repos.iter().position(|r| *r == p.name) {
+                f.repo_idx = i;
+            }
+        }
+        if let Some(i) = f.agents.iter().position(|a| *a == task.agent.name) {
+            f.agent_idx = i;
+        }
+        f.mode = task.mode.clone();
+        f.model = task.model.clone();
+        if let Some(p) = &task.prompt {
+            f.prompt = TextArea::from(p.lines().map(String::from).collect::<Vec<_>>());
+            f.prompt.set_cursor_line_style(Style::default());
+        }
+        f.task = task.name.clone();
+        f.skills = task
+            .skills
+            .iter()
+            .map(|s| fleet_core::config::validate::skill_name(s))
+            .collect();
+        Popup::Start(f)
+    }
+
+    fn start_blank(cfg: &Config) -> Popup {
         let mut name = TextArea::default();
         name.set_placeholder_text("optional · leave empty for wip-xxxx (the agent renames itself)");
         name.set_cursor_line_style(Style::default());
@@ -357,7 +406,7 @@ impl Popup {
         let repo_idx = cwd_repo
             .and_then(|n| repos.iter().position(|r| *r == n))
             .unwrap_or(0);
-        let agents: Vec<String> = cfg.agents.enabled().into_iter().map(String::from).collect();
+        let agents: Vec<String> = cfg.enabled_agents().into_iter().map(|a| a.name).collect();
         let agent_idx = agents
             .iter()
             .position(|a| *a == cfg.defaults.agent)
@@ -373,6 +422,8 @@ impl Popup {
             model: None,
             picker: None,
             focus: FOCUS_PROMPT,
+            task: "start".into(),
+            skills: vec![],
         })
     }
 }
@@ -380,7 +431,7 @@ impl Popup {
 pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
     let esc = ev.code == KeyCode::Esc;
     match p {
-        Popup::Help => Outcome::Close,
+        Popup::Help | Popup::ConfigWarnings(_) => Outcome::Close,
         Popup::Input {
             title,
             mut value,
@@ -557,6 +608,7 @@ pub fn handle(p: Popup, ev: &KeyEvent, app: &mut App) -> Outcome {
                 }
                 let name = form.name.lines().join("").trim().to_string();
                 return Outcome::Submit(PopupCmd::Start {
+                    task: form.task.clone(),
                     name: if name.is_empty() { None } else { Some(name) },
                     prompt,
                     repo: form.repos.get(form.repo_idx).cloned().unwrap_or_default(),
@@ -868,7 +920,7 @@ fn frame_block(title: &str) -> Block<'_> {
         .title(Span::styled(format!(" {title} "), accent()))
 }
 
-pub fn draw_whichkey(f: &mut Frame, area: Rect, pending: &[Key], menu: &[(Key, Action)]) {
+pub fn draw_whichkey(f: &mut Frame, area: Rect, pending: &[Key], menu: &[super::keys::MenuItem]) {
     let prefix = pending
         .iter()
         .map(Key::display)
@@ -876,10 +928,18 @@ pub fn draw_whichkey(f: &mut Frame, area: Rect, pending: &[Key], menu: &[(Key, A
         .join(" ");
     let mut items: Vec<Line> = menu
         .iter()
-        .map(|(k, a)| {
+        .map(|m| {
+            let label = match &m.disabled {
+                Some(why) => format!("{} ({why})", m.label),
+                None => m.label.clone(),
+            };
             Line::from(vec![
-                Span::styled(format!(" {:<6}", k.display()), accent()),
-                Span::raw(a.label().to_string()),
+                Span::styled(format!(" {:<6}", m.key.display()), accent()),
+                if m.disabled.is_some() {
+                    Span::styled(label, dim())
+                } else {
+                    Span::raw(label)
+                },
             ])
         })
         .collect();
@@ -901,14 +961,46 @@ pub fn draw_whichkey(f: &mut Frame, area: Rect, pending: &[Key], menu: &[(Key, A
 
 pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
     match p {
+        Popup::ConfigWarnings(ws) => {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "fleet is running, but some configuration will not take effect:",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ];
+            for w in ws {
+                lines.push(Line::from(vec![
+                    Span::styled(" ⚠ ", Style::default().fg(Color::Yellow)),
+                    Span::raw(w.clone()),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "fix ~/.config/fleet/init.lua and restart · `fleet config --check` · any key to continue"
+                ),
+                dim(),
+            )));
+            let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let rect = centered(area, 100, h);
+            f.render_widget(Clear, rect);
+            f.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(frame_block("configuration")),
+                rect,
+            );
+        }
         Popup::Help => {
             let mut lines = vec![Line::from(Span::styled(
-                "keys (defaults; override in ~/.config/fleet/config.toml [keys])",
+                "keys (from config: `fleet config --default` shows the shipped map; override in init.lua `keys`)",
                 dim(),
             ))];
             let mut group = "";
             for a in Action::ALL {
-                let (name, _, label) = a.spec();
+                let name = a.name();
+                let label = a.label();
                 let g = name.split('.').next().unwrap_or("");
                 let g = match g {
                     "goto" | "top" | "bottom" | "fold" | "unfold" | "project" => "navigation",
@@ -925,8 +1017,8 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!(
-                            " {:<8}",
-                            app.keymap.chord_for(*a).unwrap_or_else(|| "—".into())
+                            " {:<10}",
+                            app.keymap.chord_for(a).unwrap_or_else(|| "—".into())
                         ),
                         Style::default().fg(Color::Yellow),
                     ),
@@ -1119,8 +1211,19 @@ pub fn draw(f: &mut Frame, area: Rect, p: &Popup, app: &App) {
             // cursor; the title says how many lines it holds).
             let rect = centered(area, 100, area.height.saturating_sub(4).clamp(21, 40));
             f.render_widget(Clear, rect);
-            let block =
-                frame_block("start agent  ·  Tab fields · C-e $EDITOR · C-s start · Esc cancel");
+            let title = if form.skills.is_empty() {
+                format!(
+                    "task {}  ·  Tab fields · C-e $EDITOR · C-s start · Esc cancel",
+                    form.task
+                )
+            } else {
+                format!(
+                    "task {} · skills: {}  ·  Tab fields · C-e $EDITOR · C-s start · Esc cancel",
+                    form.task,
+                    form.skills.join(", ")
+                )
+            };
+            let block = frame_block(&title);
             let inner = block.inner(rect);
             f.render_widget(block, rect);
             let rows = Layout::vertical([
@@ -1312,12 +1415,12 @@ mod tests {
     #[test]
     fn paste_into_start_popup_lands_in_prompt_whatever_has_focus() {
         let mut cfg = Config::default();
-        cfg.projects.push(Project {
-            name: "svc".into(),
-            repo: "/r".into(),
-            worktrees: None,
-            reviews: None,
-            base: "main".into(),
+        cfg.projects.push({
+            let mut p = Project::new("svc", "/r");
+            p.worktrees = None;
+            p.reviews = None;
+            p.base = "main".into();
+            p
         });
         let Popup::Start(mut form) = Popup::start(&cfg) else {
             panic!("start popup")
@@ -1369,12 +1472,12 @@ mod tests {
 
     fn plan(dirty: bool) -> Box<ClosePlan> {
         let f = Facts {
-            project: Project {
-                name: "svc".into(),
-                repo: "/r".into(),
-                worktrees: None,
-                reviews: None,
-                base: "main".into(),
+            project: {
+                let mut p = Project::new("svc", "/r");
+                p.worktrees = None;
+                p.reviews = None;
+                p.base = "main".into();
+                p
             },
             path: Some("/w/feat-x".into()),
             name: "feat-x".into(),
