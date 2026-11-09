@@ -133,7 +133,7 @@ impl Engine {
         let Ok(reg) = Registry::open() else {
             return (map, aliases);
         };
-        let Ok(tasks) = reg.open_tasks() else {
+        let Ok(tasks) = reg.local_tasks() else {
             return (map, aliases);
         };
         for t in tasks {

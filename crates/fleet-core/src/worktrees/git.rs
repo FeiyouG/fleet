@@ -181,6 +181,14 @@ async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow 
     }
 }
 
+/// The URL of `remote` (`git remote get-url`).
+pub async fn remote_url(repo: &Path, remote: &str) -> Result<String> {
+    Ok(git(repo, &["remote", "get-url", remote])
+        .await?
+        .trim()
+        .to_string())
+}
+
 pub async fn fetch(repo: &Path, remote: &str, refspec: &str) -> Result<()> {
     git(repo, &["fetch", "--quiet", remote, refspec])
         .await

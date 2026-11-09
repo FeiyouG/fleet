@@ -415,7 +415,7 @@ pub async fn resolve(
     scope: Option<&str>,
 ) -> Result<Resolved> {
     let tasks = Registry::open()
-        .and_then(|r| r.open_tasks())
+        .and_then(|r| r.local_tasks())
         .unwrap_or_default();
     if looks_like_path(target) {
         let p = expand(Path::new(target));
@@ -1822,6 +1822,8 @@ mod tests {
             first_prompt: None,
             created_at: chrono::Utc::now(),
             closed_at: None,
+            machine: "laptop".into(),
+            machine_id: "laptop".into(),
         }
     }
 

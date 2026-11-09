@@ -352,3 +352,32 @@ The interface keeps `pause`, `keepalive` and `set_idle`, so a Fleet-driven polic
 | Region | API in us-west-2 [LIVE] | US, EU | US | EU only | ? | — |
 | ~Month at our volume | ~$50 | ~$250 | ~$400+ | ~$35 | ~$10 | — |
 | Verdict | **chosen** | best backup | mature, RAM-limited | no pause, far away | no proxy | different product (no opencode/tmux) |
+
+## Live results (2026-11-09, InstaBox Free plan, scratch config)  [LIVE]
+
+One machine, `ibx-fleet-spike-1` from the default template, a public toy repo, a stub agent
+(`bin = "echo"`, no model called). The machine was deleted afterwards and `GET /v1/machines`
+returned an empty list.
+
+| Check | Result |
+|---|---|
+| `fleet agent start --machine ibx` (create, tmux install, clone, worktree, tmux layout, launch) | ✓ 15 s end to end |
+| Panes | `fleet-spike-1:1.0` shell, `:1.1` agent (with `base-index 1`, panes 0-based) |
+| `fleet machine doctor` | tmux, git, opencode present |
+| SSH with a fleet-requested certificate + strict gateway CA (`known_hosts @cert-authority`) | ✓ ~2.5 s per command incl. connect |
+| Machine location | Dallas, Texas (Latitude.sh) — ~190 ms from Sydney; prefer mosh for typing |
+| `pause` → `ls` shows paused → attach path resumes | ✓ 3.4 s pause; tmux session survived (memory kept) |
+| `idle 10m` on Free | refused with a clear `spec_not_allowed` (Free is fixed at 30 min) |
+| `keep 1h` / `release` (activity lease) | ✓ |
+| `url 4000` | ✓ private token link |
+| Unique names | starting `fleet-spike-1` on the laptop is refused, naming the machine |
+| `worktree gc` | leaves the remote task alone |
+| `machine rm --yes` | deletes the machine and closes its registry task |
+
+Found and fixed during the run: `POST /v1/machines/{id}/connections` requires an
+`Idempotency-Key` (the docs only mention lifecycle calls); fleet now sends one on every
+non-GET call except `exec`.
+
+Not yet checked live: the opencode agent itself on the machine (needs model credentials as
+InstaBox secrets), the Plannotator page through `url`, idle pause after 30 min with the TUI
+open, `services:dev` at 8 GiB, `creds sync`.

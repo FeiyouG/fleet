@@ -33,6 +33,10 @@ pub const FILES: &[(&str, &str)] = &[
         include_str!("../../../../config/default/tasks/explain.md"),
     ),
     (
+        "machines/mod.lua",
+        include_str!("../../../../config/default/machines/mod.lua"),
+    ),
+    (
         "keys/mod.lua",
         include_str!("../../../../config/default/keys/mod.lua"),
     ),

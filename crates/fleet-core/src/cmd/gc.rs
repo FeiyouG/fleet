@@ -86,7 +86,7 @@ pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
     }
 
     // Registry: tasks whose worktree is gone; rename links whose agent is gone.
-    if let Ok(tasks) = Registry::open().and_then(|r| r.open_tasks()) {
+    if let Ok(tasks) = Registry::open().and_then(|r| r.local_tasks()) {
         for t in tasks {
             if covered(
                 &p,

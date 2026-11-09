@@ -3,6 +3,7 @@
 pub mod agent_hook;
 pub mod close;
 pub mod gc;
+pub mod machine;
 pub mod project;
 pub mod prompt;
 pub mod rename;

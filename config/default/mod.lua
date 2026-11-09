@@ -7,6 +7,7 @@ return {
   defaults = require("defaults"),
   agents   = require("agents"),
   tasks    = require("tasks"),
+  machines = require("machines"),
   keys     = require("keys"),
   projects = {},                    -- your init.lua lists them (fleet project add appends)
 }

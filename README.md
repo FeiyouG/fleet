@@ -161,6 +161,42 @@ prompt. Claude Code gets the system part through `--append-system-prompt`; openc
 Codex get it prepended to the first message. A skill outside the harness's own skill folders
 is symlinked into them so the agent can load it by name.
 
+### Machines (laptop and cloud)
+
+A **machine profile** says where a task runs: `machines.<name> = { provider = …, … }`, picked
+like agents (`--machine` → project task → task → project defaults → `defaults.machine`). Two
+providers are built in: `local` (this computer; the shipped `laptop` profile and default) and
+`instabox` ([InstaBox](https://instabox.sh) cloud machines, over its HTTP API — no CLI needed).
+
+```lua
+machines = {
+  ibx = {
+    provider = "instabox",                 -- API key from $INSTABOX_API_KEY (api_key_env)
+    snapshot = "fleet-monid-services",     -- or template = "agent-browser"
+    size = { vcpus = 4, mem_mib = 8192 },
+    per_task = true,                       -- one machine per agent (default); false = shared
+    idle_min = 30, max_run_min = -1,       -- paid plans only; leave out on the free plan
+    secrets = { "GITLAB_TOKEN" },          -- InstaBox Org Secrets (proxied; names only)
+    files = { [".local/share/opencode/auth.json"] = "OPENCODE_AUTH" },
+  },
+},
+tasks = { review = { machine = "ibx" } },
+```
+
+On a cloud machine, a start creates (or reuses) the machine, installs tmux if missing, sets
+git credentials to read `GITLAB_TOKEN` / `GITHUB_TOKEN`, clones the project over HTTPS into
+`workdir` (default `/data/home/src`), then makes the same worktree, tmux layout and agent as
+on the laptop. tmux is required on every machine. Agent names are unique across all machines.
+InstaBox pauses an idle machine itself (memory kept, so tmux and the agent survive); attaching
+or `fleet machine shell` wakes it. Fleet never pauses or stops a machine on its own.
+
+`fleet machine ls | create PROFILE | pause | resume | stop | start | rm | keep M [1h] | release |
+idle M 10m|off | max-run M 4h|off | shell M [--print] [-- CMD…] | doctor M | url M PORT`.
+Attach uses the system `ssh` (or `mosh`) with a short-lived certificate fleet requests for its
+own key in `~/.local/share/fleet/instabox/`, and checks the gateway's host CA strictly.
+Re-reviews on a cloud machine and the TUI's machine views are not built yet
+(`openspec/changes/add-remote-machines/tasks.md`).
+
 ### The opencode plugin (`fleet setup`)
 
 opencode's database never records a pending permission prompt ("allow this bash command?"), so without help such an agent looks like `WORKING`. `fleet setup` installs a ~60-line plugin into `~/.config/opencode/plugins/fleet.ts` that writes `~/.local/share/fleet/agents/<pid>.json` on permission/session events. With it, fleet shows `🔒 WAIT:perm` plus the prompt text, and knows each process's exact session. Sessions started before the install keep the old behaviour until restarted (`fleet setup --check` counts them). `fleet setup --remove` uninstalls.
@@ -195,6 +231,7 @@ fleet worktree list | worktree gc [--yes]                   (dry run first)
 fleet worktree close TARGET [--force] [--yes] [--json]      (alias: fleet close; TARGET = task, folder, branch, session or path)
 fleet project list | project add [PATH] [--name N] [--reviews S] [--worktrees DIR] [--base B]
 fleet tmux list
+fleet machine ls | pause | resume | stop | start | rm | keep | release | idle | max-run | shell | doctor | url   (and --machine P on start/task/review)
 fleet setup [--remove|--check] | config [--init|--default|--effective|--check] | keys [--project P]
 ```
 

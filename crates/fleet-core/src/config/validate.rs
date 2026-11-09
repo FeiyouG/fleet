@@ -103,6 +103,37 @@ pub fn check(cfg: &Config) -> Issues {
         }
     }
 
+    // machines: a built-in provider each; defaults.machine (global and per project) resolves.
+    let providers = crate::machines::PROVIDERS;
+    for (name, m) in &cfg.machines {
+        match &m.provider {
+            None => i.fatal.push(format!(
+                "machines.{name}: `provider` is required (one of {})",
+                providers.join(", ")
+            )),
+            Some(p) if !providers.contains(&p.as_str()) => i.fatal.push(format!(
+                "machines.{name}: unknown provider \"{p}\" (known: {})",
+                providers.join(", ")
+            )),
+            _ => {}
+        }
+    }
+    let machine_where = std::iter::once(("defaults.machine".to_string(), None)).chain(
+        cfg.projects
+            .iter()
+            .map(|p| (format!("projects.{}.defaults.machine", p.name), Some(p))),
+    );
+    for (where_, project) in machine_where {
+        let d = cfg.defaults_for(project);
+        if cfg.machine(&d.machine).is_none() {
+            i.fatal.push(format!(
+                "{where_}: machine \"{}\" is not defined (machines: {})",
+                d.machine,
+                cfg.machines.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+
     // projects: unique names, existing repos.
     let mut seen = BTreeMap::new();
     for p in &cfg.projects {
@@ -223,10 +254,12 @@ const TOP: &[&str] = &[
     "tasks",
     "keys",
     "projects",
+    "machines",
     "agent_args",
 ];
 const DEFAULTS: &[&str] = &[
     "agent",
+    "machine",
     "mode",
     "left_pane",
     "nvim_pane",
@@ -243,12 +276,29 @@ const TASK: &[&str] = &[
     "on",
     "enabled",
     "agent",
+    "machine",
     "mode",
     "model",
     "skills",
     "instructions",
     "prompt",
     "label",
+];
+const MACHINE: &[&str] = &[
+    "provider",
+    "api_key_env",
+    "api_url",
+    "template",
+    "snapshot",
+    "size",
+    "per_task",
+    "idle_min",
+    "max_run_min",
+    "secrets",
+    "files",
+    "env",
+    "workdir",
+    "mosh",
 ];
 const PROJECT: &[&str] = &[
     "name",
@@ -288,6 +338,11 @@ pub fn unknown_keys(v: &Value) -> Vec<String> {
     if let Value::Object(tasks) = &v["tasks"] {
         for (n, t) in tasks {
             obj(t, &format!("tasks.{n}."), TASK, &mut out);
+        }
+    }
+    if let Value::Object(machines) = &v["machines"] {
+        for (n, m) in machines {
+            obj(m, &format!("machines.{n}."), MACHINE, &mut out);
         }
     }
     if let Value::Array(projects) = &v["projects"] {

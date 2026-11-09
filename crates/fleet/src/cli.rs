@@ -50,6 +50,9 @@ enum Cmd {
     /// tmux: list sessions/windows/panes with what runs in them
     #[command(subcommand)]
     Tmux(TmuxCmd),
+    /// Machines (laptop, cloud): list, pause, resume, keep awake, shell, …
+    #[command(subcommand)]
+    Machine(MachineCmd),
     /// Alias of `agent start`
     Start(StartArgs),
     /// Alias of `worktree close`
@@ -171,6 +174,10 @@ struct StartArgs {
     /// Leave the left pane a bare shell even when defaults.left_pane is set
     #[arg(long, conflicts_with = "left_pane")]
     no_left_pane: bool,
+    /// Machine profile to run on (a name from `machines`; default: the task's, else
+    /// defaults.machine)
+    #[arg(long)]
+    machine: Option<String>,
     /// Do not attach after starting
     #[arg(long)]
     no_attach: bool,
@@ -199,6 +206,9 @@ struct TaskArgs {
     skills: Vec<PathBuf>,
     #[arg(long, conflicts_with = "skills")]
     no_skills: bool,
+    /// Machine profile to run on (default: the task's, else defaults.machine)
+    #[arg(long)]
+    machine: Option<String>,
     #[arg(long)]
     no_attach: bool,
 }
@@ -229,6 +239,9 @@ enum ReviewCmd {
         skills: Vec<PathBuf>,
         #[arg(long, conflicts_with = "skills")]
         no_skills: bool,
+        /// Machine profile to run on (default: the task's, else defaults.machine)
+        #[arg(long)]
+        machine: Option<String>,
         #[arg(long)]
         no_attach: bool,
     },
@@ -304,6 +317,241 @@ enum TmuxCmd {
         /// `session`, `session:win` or `session:win.pane`
         target: String,
     },
+}
+
+#[derive(Subcommand)]
+enum MachineCmd {
+    /// List the machines of every machine profile (never wakes a paused machine)
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a machine from a profile (task starts do this for you)
+    Create {
+        profile: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Pause: memory kept, compute billing stops
+    Pause { machine: String },
+    /// Resume (or wake) a paused machine
+    Resume { machine: String },
+    /// Stop: processes end, the disk is kept
+    Stop { machine: String },
+    /// Start a stopped machine
+    Start { machine: String },
+    /// Delete a machine and everything on it
+    Rm {
+        machine: String,
+        /// Do not ask (required without a terminal)
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Keep a machine awake for a while (e.g. a silent background job)
+    Keep {
+        machine: String,
+        /// e.g. 30m, 1h (InstaBox renews at most 1h at a time)
+        #[arg(default_value = "1h")]
+        duration: String,
+    },
+    /// Release a `keep`
+    Release { machine: String },
+    /// Pause after this much idle time (e.g. 10m), or `off`
+    Idle { machine: String, duration: String },
+    /// Pause after this much continuous running (e.g. 4h), or `off`
+    MaxRun { machine: String, duration: String },
+    /// Open a shell on a machine (wakes it), or run a command there with a terminal
+    Shell {
+        machine: String,
+        /// Print the command instead of running it (for scripts and other terminals)
+        #[arg(long)]
+        print: bool,
+        /// Command to run instead of a login shell
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+    /// Check a machine has tmux, git and the harness
+    Doctor {
+        machine: String,
+        #[arg(long, default_value = "opencode")]
+        harness: String,
+    },
+    /// A private link to a port on a machine (e.g. the plan review page)
+    Url { machine: String, port: u16 },
+}
+
+async fn machine(m: MachineCmd, cfg: Config) -> Result<()> {
+    use fleet_core::cmd::machine as mc;
+    use fleet_core::machines::remote;
+    let one = |s: &str| -> Vec<String> { vec![s.to_string()] };
+    match m {
+        MachineCmd::Ls { json } => {
+            let (rows, warnings) = mc::list(&cfg).await;
+            if json {
+                print_json(&rows)?;
+            } else {
+                println!(
+                    "{:<24} {:<9} {:<10} {:<9} {:<5} {:<6} {:<7} TASKS",
+                    "MACHINE", "PROVIDER", "PROFILE", "STATE", "SIZE", "IDLE", "MAXRUN"
+                );
+                for l in &rows {
+                    let r = &l.row;
+                    println!(
+                        "{:<24} {:<9} {:<10} {:<9} {:<5} {:<6} {:<7} {}",
+                        r.name,
+                        r.provider,
+                        l.profile,
+                        r.state.label(),
+                        r.size.map(|s| s.label()).unwrap_or_else(|| "—".into()),
+                        mc::fmt_duration(r.idle_after),
+                        mc::fmt_duration(r.max_run),
+                        l.tasks.join(",")
+                    );
+                }
+            }
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+            Ok(())
+        }
+        MachineCmd::Create { profile, name } => {
+            let r = mc::create(&cfg, &profile, name.as_deref()).await?;
+            println!("created {} ({}, {})", r.name, r.id, r.state.label());
+            Ok(())
+        }
+        MachineCmd::Pause { machine } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            a.pause(&r.id).await?;
+            println!("paused {}", r.name);
+            Ok(())
+        }
+        MachineCmd::Resume { machine } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            a.resume(&r.id).await?;
+            println!("resumed {}", r.name);
+            Ok(())
+        }
+        MachineCmd::Stop { machine } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            a.stop(&r.id).await?;
+            println!("stopped {}", r.name);
+            Ok(())
+        }
+        MachineCmd::Start { machine } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            a.start(&r.id).await?;
+            println!("started {}", r.name);
+            Ok(())
+        }
+        MachineCmd::Rm { machine, yes } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            let tasks: Vec<String> = fleet_core::registry::Registry::open()
+                .and_then(|reg| reg.open_tasks())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| t.machine_id == r.id)
+                .map(|t| t.slug)
+                .collect();
+            if !tasks.is_empty() {
+                eprintln!(
+                    "{} hosts open tasks: {} (their work is lost unless pushed)",
+                    r.name,
+                    tasks.join(", ")
+                );
+            }
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    bail!("refusing to delete {} without --yes", r.name);
+                }
+                eprint!("delete {} and everything on it? [y/N] ", r.name);
+                std::io::stderr().flush().ok();
+                let mut s = String::new();
+                std::io::stdin().read_line(&mut s)?;
+                if !matches!(s.trim(), "y" | "Y" | "yes") {
+                    bail!("not deleted");
+                }
+            }
+            a.destroy(&r.id).await?;
+            if let Ok(reg) = fleet_core::registry::Registry::open() {
+                for t in &tasks {
+                    reg.close(t).ok();
+                }
+            }
+            println!("deleted {}", r.name);
+            Ok(())
+        }
+        MachineCmd::Keep { machine, duration } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            let d = mc::parse_duration(&duration)?.context("keep: give a duration, e.g. 1h")?;
+            a.keepalive(&r.id, "fleet-keep", d).await?;
+            println!("keeping {} awake for {}", r.name, mc::fmt_duration(Some(d)));
+            Ok(())
+        }
+        MachineCmd::Release { machine } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            a.release(&r.id, "fleet-keep").await?;
+            println!("released {}", r.name);
+            Ok(())
+        }
+        MachineCmd::Idle { machine, duration } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            let d = mc::parse_duration(&duration)?;
+            a.set_idle(&r.id, d).await?;
+            println!("{}: pauses after {} idle", r.name, mc::fmt_duration(d));
+            Ok(())
+        }
+        MachineCmd::MaxRun { machine, duration } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            let d = mc::parse_duration(&duration)?;
+            a.set_max_run(&r.id, d).await?;
+            println!("{}: max run {}", r.name, mc::fmt_duration(d));
+            Ok(())
+        }
+        MachineCmd::Shell {
+            machine,
+            print,
+            cmd,
+        } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            let run = if !cmd.is_empty() {
+                cmd
+            } else if r.provider == "local" {
+                one(&std::env::var("SHELL").unwrap_or_else(|_| "sh".into()))
+            } else {
+                vec![]
+            };
+            let tty = a.tty_command(&r.id, &run).await?;
+            if print {
+                println!("{}", shell_words::join(&tty));
+                return Ok(());
+            }
+            remote::open_tty(&tty, &r.name).await
+        }
+        MachineCmd::Doctor { machine, harness } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            let on = remote::On {
+                adapter: a.as_ref(),
+                id: r.id.clone(),
+            };
+            let checks = remote::doctor(&on, &harness).await?;
+            let mut missing = vec![];
+            for (tool, ok) in &checks {
+                println!("{} {tool}", if *ok { "✓" } else { "✕" });
+                if !ok {
+                    missing.push(tool.clone());
+                }
+            }
+            if !missing.is_empty() {
+                bail!("{} is missing {}", r.name, missing.join(", "));
+            }
+            Ok(())
+        }
+        MachineCmd::Url { machine, port } => {
+            let (_, a, r) = mc::find(&cfg, &machine).await?;
+            println!("{}", a.port_url(&r.id, port).await?);
+            Ok(())
+        }
+    }
 }
 
 /// `--skill PATH…` / `--no-skills` -> the task's skills override.
@@ -434,6 +682,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                             repo: repo_name,
                             agent: t.agent,
                             skills: skills_opt(t.skills, t.no_skills),
+                            machine: t.machine,
                             attach: !t.no_attach,
                         },
                         &progress(),
@@ -459,6 +708,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                         base: None,
                         left_pane: None,
                         no_left_pane: false,
+                        machine: t.machine,
                         no_attach: t.no_attach,
                     };
                     agent(AgentCmd::Start(args), cfg, project).await
@@ -521,6 +771,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                 agent,
                 skills,
                 no_skills,
+                machine,
                 no_attach,
             } => {
                 let engine = Engine::new(cfg).merged_lookups(false);
@@ -533,6 +784,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
                         repo,
                         agent,
                         skills: skills_opt(skills, no_skills),
+                        machine,
                         attach: !no_attach,
                     },
                     &progress(),
@@ -636,6 +888,7 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             WorktreeCmd::Close(args) => close_cmd(args, cfg, project).await,
         },
         Cmd::Close(args) => close_cmd(args, cfg, project).await,
+        Cmd::Machine(m) => machine(m, cfg).await,
         Cmd::Tmux(TmuxCmd::Focus { target }) => fleet_core::tmux::focus(&target).await,
         Cmd::Tmux(TmuxCmd::List { json }) => {
             let f = snapshot(&cfg).await;
@@ -1016,17 +1269,19 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
                     } else {
                         args.left_pane.map(Some)
                     },
+                    machine: args.machine,
                     attach: !args.no_attach,
                 },
                 &progress(),
             )
             .await?;
             println!(
-                "started {} ({}) on {} at {} (tmux {}, port {})",
+                "started {} ({}) on {} at {} on {} (tmux {}, port {})",
                 out.slug,
                 out.agent,
                 out.branch,
                 out.path.display(),
+                out.machine,
                 out.tmux_session,
                 out.port
             );

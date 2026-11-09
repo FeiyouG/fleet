@@ -6,6 +6,7 @@ pub mod agents;
 pub mod cmd;
 pub mod config;
 pub mod join;
+pub mod machines;
 pub mod model;
 pub mod procs;
 pub mod registry;

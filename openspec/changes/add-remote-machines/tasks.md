@@ -6,29 +6,29 @@
 
 ## 1. Machine interface + `local` adapter
 
-- [ ] 1.1 `machines/interfaces`: `MachineAdapter`, `MachineSpec`, `MachineRow`, `MachineState`, `ExecOut`, `Unsupported`
-- [ ] 1.2 `machines/adapters/local`: exec = local process, tty = argv unchanged, list = `laptop`
-- [ ] 1.3 `adapter_for(provider, cfg)`; tests
+- [x] 1.1 `machines/interfaces`: `MachineAdapter`, `MachineSpec`, `MachineRow`, `MachineState`, `ExecOut`, `Unsupported`
+- [x] 1.2 `machines/adapters/local`: exec = local process, tty = argv unchanged, list = `laptop`
+- [x] 1.3 `adapter_for(provider, cfg)`; tests
 
 ## 2. Session + Worktree through a machine
 
-- [ ] 2.1 tmux calls take a machine (`Session`); `<slug>:1.1` behind one helper
-- [ ] 2.2 git worktree calls take a machine (`Worktree`); rename symlink via the machine
-- [ ] 2.3 `RowKey` carries the machine id; existing tests pass on `local`
+- [~] 2.1 tmux calls take a machine: start/review run tmux through the machine (`machines::remote::On`); other callers (send, close, rename, TUI) still local-only
+- [~] 2.2 git worktree calls take a machine: start/review on a machine; rename/close of remote tasks not yet
+- [~] 2.3 Existing tests pass on `local`; gc/close/discovery skip remote tasks (`Registry::local_tasks`); `RowKey` machine id pending (TUI)
 
 ## 3. Config + registry
 
-- [ ] 3.1 `machines.<name>` profiles; shipped `laptop`; `defaults.machine`; `tasks.*.machine`
-- [ ] 3.2 Resolution order like agents; `--machine` flag; validate unknown providers/profiles
-- [ ] 3.3 Registry `Task.machine`, `Task.machine_id` (serde default for old rows)
-- [ ] 3.4 Unique agent names across the registry
+- [x] 3.1 `machines.<name>` profiles; shipped `laptop`; `defaults.machine`; `tasks.*.machine`
+- [x] 3.2 Resolution order like agents; `--machine` flag; validate unknown providers/profiles
+- [x] 3.3 Registry `Task.machine`, `Task.machine_id` (serde default for old rows)
+- [x] 3.4 Unique agent names across the registry
 
 ## 4. InstaBox adapter (HTTP)
 
-- [ ] 4.1 Client: auth, idempotency keys, error codes, retry on `retryable`, operation polling
-- [ ] 4.2 create/list/get/destroy, exec, pause/resume, keepalive (lease), set_idle, publish (metadata), port_url
-- [ ] 4.3 tty_command via SSH certificate from `/connections` (fleet key pair, cached cert)
-- [ ] 4.4 Mocked-HTTP tests
+- [x] 4.1 Client: auth, idempotency keys, error codes, retry on `retryable`, operation polling
+- [x] 4.2 create/list/get/destroy, exec, pause/resume, keepalive (lease), set_idle, publish (metadata), port_url
+- [x] 4.3 tty_command via SSH certificate from `/connections` (fleet key pair, cached cert)
+- [x] 4.4 Mocked-HTTP tests
 
 ## 5. Snapshot builder
 
@@ -45,14 +45,14 @@
 - [ ] 7.2 State vocabulary (one icon/colour per meaning); Nerd Font in README
 - [ ] 7.3 Machine scope `]m`/`[m`, `filter.machine`; adaptive levels by scope only
 - [ ] 7.4 Leader menus (attach/plan/diff on agents; machine controls)
-- [ ] 7.5 `fleet machine ls|pause|resume|stop|start|rm|keep|release|idle|max-run|shell|snapshot|doctor`
+- [x] 7.5 `fleet machine ls|pause|resume|stop|start|rm|keep|release|idle|max-run|shell|snapshot|doctor`
 
 ## 8. Secrets
 
-- [ ] 8.1 Profile `secrets`/`files` passed at create
+- [x] 8.1 Profile `secrets`/`files` passed at create
 - [ ] 8.2 `fleet creds sync` (refresh tokens stripped)
 
 ## 9. Live spike + docs
 
-- [ ] 9.1 Spike on InstaBox (one machine, `fleet-spike-*`, cleaned up); results into design.md
+- [~] 9.1 Spike on InstaBox (one machine, `fleet-spike-*`, cleaned up); results into design.md — machine lifecycle, start, ssh, pause/resume done; agent/plan/idle/docker pending
 - [ ] 9.2 `docs/machines.md`; archive the change
