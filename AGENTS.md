@@ -26,4 +26,13 @@ command goes to the user's server. `TMUX_TMPDIR=/tmp/x tmux kill-server` therefo
 ## Conventions
 
 - Conventional commits: `feat(core): …`, `fix(tui): …`, `docs: …`.
-- Changes to behaviour update README.md (user-facing) and DESIGN.md (decisions, append a section).
+- Changes to behaviour update README.md (user-facing) and the OpenSpec specs.
+
+## OpenSpec
+
+- `openspec/specs/**` is the source of truth for behaviour; read the relevant spec before the
+  code. Proposed changes live in `openspec/changes/<name>/` (proposal, design, specs delta,
+  tasks) and are archived into `openspec/specs/` once merged.
+- New behaviour starts as a change (`openspec new change <name>`); keep its `tasks.md` in sync
+  with the work and run `openspec validate --all --strict` before committing.
+- `DESIGN.md` is the history of decisions made before OpenSpec; don't append to it.
