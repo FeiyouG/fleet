@@ -51,6 +51,8 @@ pub struct App {
     pub choices: HashMap<ChoicesKey, (Instant, std::result::Result<Choices, String>)>,
     /// Keys being loaded right now (no duplicate discovery while one runs).
     choices_loading: HashSet<ChoicesKey>,
+    /// Machines already shown once (new ones start unfolded).
+    seen_machines: HashSet<String>,
 }
 
 /// `(adapter name, directory)`: what a mode/model list depends on.
@@ -127,6 +129,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
         tx,
         choices: HashMap::new(),
         choices_loading: HashSet::new(),
+        seen_machines: HashSet::new(),
     };
     app.popup = startup_popup;
 
@@ -152,7 +155,7 @@ pub async fn run(cfg: Config, project: Option<String>) -> Result<()> {
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.fleet = f; app.loading = false; }
+                    Some(Msg::Snapshot(f)) => { app.notifier.observe(&f); app.unfold_new_machines(&f); app.fleet = f; app.loading = false; }
                     Some(Msg::Status(s, err)) => app.set_status(s, err),
                     Some(Msg::ClosePlan(p)) => { app.status_line = None; app.popup = Some(Popup::close(p)); }
                     Some(Msg::GcPlan(p)) => { app.status_line = None; app.popup = Some(Popup::gc(p)); }
@@ -346,7 +349,7 @@ impl App {
             PageUp => st.up(10),
             PageDown => st.down(10, count),
             Tab1 => self.tab = Tab::Agents,
-            Tab2 => self.tab = Tab::Tmux,
+            Tab2 => self.tab = Tab::Machines,
             Tab3 => self.tab = Tab::Worktrees,
             Tab4 => self.tab = Tab::Reviews,
             NextTab => self.tab = self.tab.next(),
@@ -373,6 +376,7 @@ impl App {
                     self.selected_url()
                 };
                 match url {
+                    Some(u) if u.starts_with("remote:") => self.open_remote_plan(&u, false),
                     Some(u) => {
                         util::open_url(&u)?;
                         self.set_status(format!("opened {u}"), false)
@@ -387,6 +391,7 @@ impl App {
                     self.selected_url()
                 };
                 match url {
+                    Some(u) if u.starts_with("remote:") => self.open_remote_plan(&u, true),
                     Some(u) => {
                         util::copy_to_clipboard(&u)?;
                         self.set_status(format!("copied {u}"), false)
@@ -395,10 +400,25 @@ impl App {
                 }
             }
             GotoAgents | ReviewGotoAgents => self.goto(Tab::Agents),
-            GotoTmux => self.goto(Tab::Tmux),
+            GotoMachines => self.goto(Tab::Machines),
             GotoWorktree | ReviewGotoWorktrees => self.goto(Tab::Worktrees),
             GotoReview => self.goto(Tab::Reviews),
             AgentAttach => self.attach_selected().await?,
+            AgentDiff => self.diff_selected(),
+            MachineNext => self.cycle_machine(1),
+            MachinePrev => self.cycle_machine(-1),
+            FilterMachine => match tabs::selected(self) {
+                Some(n) => {
+                    let name = match &n.data {
+                        tabs::NodeData::Machine(m) => m.row.name.clone(),
+                        _ => tabs::machine_of(self, n.machine().as_deref()).1,
+                    };
+                    self.set_machine_scope(tabs::MachineScope::Machine(name))
+                }
+                None => self.set_status("no machine on this row".into(), true),
+            },
+            MachineShell | MachinePause | MachineResume | MachineKeep | MachineIdle
+            | MachineStopStart | MachineDelete => self.machine_action(a),
             Task(name) => self.run_task(&name).await?,
             FindNext => self.find(1),
             FindPrev => self.find(-1),
@@ -577,7 +597,18 @@ impl App {
             } => {
                 let target = self.selected_send_target();
                 let engine = self.engine.clone();
+                let cfg = self.cfg.clone();
                 match target {
+                    Some(row) if row.machine.is_some() => self.spawn("send", async move {
+                        let t = cmd::remote_task::find_by_pane(
+                            row.pane_target.as_deref().unwrap_or(""),
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("no fleet task for this remote agent"))?;
+                        let r = cmd::remote_task::reach(&cfg, t)?;
+                        cmd::remote_task::send(&r, &text, mode.as_deref(), model.as_deref())
+                            .await?;
+                        Ok(format!("sent to {name}"))
+                    }),
                     Some(row) => self.spawn("send", async move {
                         let a = engine.agent_adapter(&row.adapter).ok_or_else(|| {
                             anyhow::anyhow!("agent `{}` is not enabled", row.adapter)
@@ -608,9 +639,39 @@ impl App {
             }
             Stop(name) => {
                 let f = self.fleet.clone();
+                let cfg = self.cfg.clone();
                 self.spawn("stop", async move {
-                    cmd::send::stop(&f, &name).await?;
+                    cmd::send::stop(&cfg, &f, &name).await?;
                     Ok(format!("stopped {name}"))
+                });
+            }
+            CloseRemote(slug) => {
+                let cfg = self.cfg.clone();
+                let engine = self.engine.clone();
+                self.spawn("close", async move {
+                    let t = cmd::remote_task::find(&slug)?
+                        .ok_or_else(|| anyhow::anyhow!("{slug} is not an open remote task"))?;
+                    let r = cmd::remote_task::reach(&cfg, t)?;
+                    cmd::remote_task::close(&r, false, &cmd::quiet()).await?;
+                    engine.refresh_machines().await;
+                    Ok(format!("closed {slug}"))
+                });
+            }
+            DeleteMachine(name) => {
+                let cfg = self.cfg.clone();
+                let engine = self.engine.clone();
+                self.spawn("delete", async move {
+                    let (_, ad, r) = cmd::machine::find(&cfg, &name).await?;
+                    ad.destroy(&r.id).await?;
+                    if let Ok(reg) = fleet_core::registry::Registry::open() {
+                        for t in reg.open_tasks().unwrap_or_default() {
+                            if t.machine_id == r.id {
+                                reg.close(&t.slug).ok();
+                            }
+                        }
+                    }
+                    engine.refresh_machines().await;
+                    Ok(format!("deleted {name}"))
                 });
             }
             KillTmux(s) => self.spawn("kill", async move {
@@ -664,6 +725,16 @@ impl App {
         let Some(n) = tabs::selected(self) else {
             return;
         };
+        if let Some(t) = self.remote_task_of(&n) {
+            self.popup = Some(Popup::confirm(
+                format!(
+                    "Close {} on its cloud machine? Refused if files are uncommitted or commits unpushed.",
+                    t.slug
+                ),
+                popups::PopupCmd::CloseRemote(t.slug),
+            ));
+            return;
+        }
         if let tabs::NodeData::Review(v) = &n.data {
             if v.worktrees.len() > 1 {
                 self.set_status(
@@ -781,6 +852,264 @@ impl App {
         });
     }
 
+    /// The open remote task behind a row (an agent, worktree or session on a cloud machine).
+    fn remote_task_of(&self, n: &tabs::Node) -> Option<fleet_core::registry::Task> {
+        n.machine()?;
+        let session = match &n.data {
+            tabs::NodeData::Session { name, .. } => Some(name.clone()),
+            _ => n
+                .pane_target()
+                .map(|t| t.split(':').next().unwrap_or(&t).to_string())
+                .or_else(|| n.worktree().map(|w| w.name.clone())),
+        }?;
+        cmd::remote_task::find_by_pane(&session).ok().flatten()
+    }
+
+    /// Compute a terminal command in the background, then run it: in a new tmux window when
+    /// fleet runs inside tmux (the TUI stays), else with the TUI suspended.
+    fn run_tty<F>(&self, label: &'static str, fut: F)
+    where
+        F: std::future::Future<Output = Result<Vec<String>>> + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Msg::Status(format!("{label}…"), false));
+            let cmd = match fut.await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Msg::Status(format!("{label}: {e:#}"), true));
+                    return;
+                }
+            };
+            if tmux::inside_tmux() {
+                match fleet_core::machines::remote::open_tty(&cmd, label).await {
+                    Ok(()) => {
+                        let _ =
+                            tx.send(Msg::Status(format!("{label}: opened a tmux window"), false));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Status(format!("{label}: {e:#}"), true));
+                    }
+                }
+            } else {
+                let _ = tx.send(Msg::Suspend(Box::new(move || {
+                    let st = std::process::Command::new(&cmd[0])
+                        .args(&cmd[1..])
+                        .status()?;
+                    if !st.success() {
+                        anyhow::bail!("{} exited with {st}", cmd[0]);
+                    }
+                    Ok(())
+                })));
+            }
+        });
+    }
+
+    /// `remote:PORT` (a plan on a cloud machine) -> a private link, opened or copied.
+    fn open_remote_plan(&mut self, url: &str, copy: bool) {
+        let Some(port) = url
+            .strip_prefix("remote:")
+            .and_then(|p| p.parse::<u16>().ok())
+        else {
+            return;
+        };
+        let Some(t) = tabs::selected(self).and_then(|n| self.remote_task_of(&n)) else {
+            self.set_status("no fleet task for this remote plan".into(), true);
+            return;
+        };
+        let cfg = self.cfg.clone();
+        self.spawn("plan", async move {
+            let r = cmd::remote_task::reach(&cfg, t)?;
+            let u = cmd::remote_task::plan_url(&r, port).await?;
+            if copy {
+                util::copy_to_clipboard(&u)?;
+                Ok("copied the plan link".into())
+            } else {
+                util::open_url(&u)?;
+                Ok("opened the plan".into())
+            }
+        });
+    }
+
+    /// `Space d`: nvim diff against the base, in the task's tmux session on its machine.
+    fn diff_selected(&mut self) {
+        let Some(n) = tabs::selected(self) else {
+            return;
+        };
+        let name = n.name();
+        let cfg = self.cfg.clone();
+        if let Some(t) = self.remote_task_of(&n) {
+            let base = cfg
+                .project(&t.repo)
+                .map(|p| p.base.clone())
+                .unwrap_or_else(|| "main".into());
+            self.run_tty("diff", async move {
+                let r = cmd::remote_task::reach(&cfg, t)?;
+                r.adapter.resume(&r.task.machine_id).await.ok();
+                let path = r.task.path.to_string_lossy().into_owned();
+                let c = format!(
+                    "nvim -c 'DiffviewOpen origin/{base}' || git diff origin/{base} | less -R"
+                );
+                r.on()
+                    .run(
+                        &[
+                            "tmux",
+                            "new-window",
+                            "-t",
+                            &r.task.tmux_session,
+                            "-n",
+                            "diff",
+                            "-c",
+                            &path,
+                            &c,
+                        ],
+                        None,
+                    )
+                    .await?;
+                r.adapter
+                    .tty_command(
+                        &r.task.machine_id,
+                        &[
+                            "tmux".into(),
+                            "attach".into(),
+                            "-t".into(),
+                            r.task.tmux_session.clone(),
+                        ],
+                    )
+                    .await
+            });
+            return;
+        }
+        let _ = self.tx.send(Msg::Suspend(Box::new(move || {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cmd::send::diff(&cfg, &name))
+        })));
+    }
+
+    /// Machine-row actions (`Space` on a Machines row).
+    fn machine_action(&mut self, a: Action) {
+        let Some(m) = tabs::selected(self).and_then(|n| match n.data {
+            tabs::NodeData::Machine(m) => Some(m),
+            _ => None,
+        }) else {
+            self.set_status("select a machine row (Machines tab)".into(), true);
+            return;
+        };
+        let name = m.row.name.clone();
+        let cfg = self.cfg.clone();
+        let engine = self.engine.clone();
+        match a {
+            Action::MachineShell => {
+                let local = m.row.provider == "local";
+                self.run_tty("shell", async move {
+                    let (_, ad, r) = cmd::machine::find(&cfg, &name).await?;
+                    let sh = if local {
+                        vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".into())]
+                    } else {
+                        vec![]
+                    };
+                    ad.tty_command(&r.id, &sh).await
+                });
+            }
+            Action::MachineDelete => {
+                self.popup = Some(Popup::confirm(
+                    format!(
+                        "Delete machine {name} and everything on it? Tasks on it: {}",
+                        if m.tasks.is_empty() {
+                            "none".to_string()
+                        } else {
+                            m.tasks.join(", ")
+                        }
+                    ),
+                    popups::PopupCmd::DeleteMachine(name),
+                ));
+            }
+            _ => {
+                let idle_next = match m.row.idle_after.map(|d| d.as_secs() / 60) {
+                    Some(10) => Some(std::time::Duration::from_secs(1800)),
+                    Some(30) => None,
+                    _ => Some(std::time::Duration::from_secs(600)),
+                };
+                let running = m.row.state.is_running();
+                self.spawn("machine", async move {
+                    let (_, ad, r) = cmd::machine::find(&cfg, &name).await?;
+                    let msg = match a {
+                        Action::MachinePause => {
+                            ad.pause(&r.id).await?;
+                            format!("paused {name}")
+                        }
+                        Action::MachineResume => {
+                            ad.resume(&r.id).await?;
+                            format!("resumed {name}")
+                        }
+                        Action::MachineKeep => {
+                            ad.keepalive(&r.id, "fleet-keep", std::time::Duration::from_secs(3600))
+                                .await?;
+                            format!("keeping {name} awake for 1h")
+                        }
+                        Action::MachineIdle => {
+                            ad.set_idle(&r.id, idle_next).await?;
+                            format!(
+                                "{name}: idle pause {}",
+                                idle_next
+                                    .map(|d| format!("{}m", d.as_secs() / 60))
+                                    .unwrap_or_else(|| "off".into())
+                            )
+                        }
+                        Action::MachineStopStart if running => {
+                            ad.stop(&r.id).await?;
+                            format!("stopped {name}")
+                        }
+                        Action::MachineStopStart => {
+                            ad.start(&r.id).await?;
+                            format!("started {name}")
+                        }
+                        _ => String::new(),
+                    };
+                    engine.refresh_machines().await;
+                    Ok(msg)
+                });
+            }
+        }
+    }
+
+    /// Machines start unfolded (their sessions show) the first time they appear.
+    fn unfold_new_machines(&mut self, f: &Fleet) {
+        for m in &f.machines {
+            if self.seen_machines.insert(m.row.name.clone()) {
+                self.tabs
+                    .machines
+                    .unfolded
+                    .insert(tabs::RowKey::Machine(m.row.name.clone()));
+            }
+        }
+    }
+
+    /// `] m` / `[ m`: all → each provider in use → all.
+    fn cycle_machine(&mut self, dir: i32) {
+        let mut scopes = vec![tabs::MachineScope::All];
+        for m in &self.fleet.machines {
+            let p = tabs::MachineScope::Provider(m.row.provider.clone());
+            if !scopes.contains(&p) {
+                scopes.push(p);
+            }
+        }
+        let cur = scopes
+            .iter()
+            .position(|s| *s == self.tabs.machine)
+            .unwrap_or(0) as i32;
+        let next = (cur + dir).rem_euclid(scopes.len() as i32) as usize;
+        self.set_machine_scope(scopes[next].clone());
+    }
+
+    pub fn set_machine_scope(&mut self, s: tabs::MachineScope) {
+        self.tabs.machine = s;
+        for t in Tab::ALL {
+            self.tabs.state_mut(t).selected = 0;
+        }
+        self.set_status(format!("machine: {}", self.tabs.machine.label()), false);
+    }
+
     /// `p` / `P`: project1 → project2 → … → all.
     fn cycle_project(&mut self, dir: i32) {
         let names: Vec<Option<String>> = self
@@ -826,7 +1155,8 @@ impl App {
                 return Ok(());
             };
             match &n.data {
-                tabs::NodeData::Project { .. } => {
+                tabs::NodeData::Machine(_) => self.act(Action::MachineShell).await,
+                tabs::NodeData::Project { .. } | tabs::NodeData::Provider { .. } => {
                     if n.unfolded {
                         tabs::collapse(self)
                     } else {
@@ -868,6 +1198,22 @@ impl App {
     }
 
     async fn attach_selected(&mut self) -> Result<()> {
+        if let Some(n) = tabs::selected(self) {
+            if let Some(t) = self.remote_task_of(&n) {
+                let cfg = self.cfg.clone();
+                let session = t.tmux_session.clone();
+                self.run_tty("attach", async move {
+                    let r = cmd::remote_task::reach(&cfg, t)?;
+                    r.adapter
+                        .tty_command(
+                            &r.task.machine_id,
+                            &["tmux".into(), "attach".into(), "-t".into(), session],
+                        )
+                        .await
+                });
+                return Ok(());
+            }
+        }
         let Some(target) = tabs::selected_pane_target(self) else {
             self.set_status("no tmux pane on this row".into(), true);
             return Ok(());
@@ -902,6 +1248,7 @@ impl App {
             Some(tabs::NodeData::Worktree(_)) => RowKind::Worktree,
             Some(tabs::NodeData::Review(_)) => RowKind::Review,
             Some(tabs::NodeData::Session { .. }) | Some(tabs::NodeData::Pane(_)) => RowKind::Tmux,
+            Some(tabs::NodeData::Machine(_)) => RowKind::Machine,
             _ => RowKind::Other,
         }
     }

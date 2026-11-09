@@ -45,7 +45,7 @@ pub enum Action {
     Expand,
     Sort,
     GotoAgents,
-    GotoTmux,
+    GotoMachines,
     GotoWorktree,
     GotoReview,
     ProjectNext,
@@ -74,6 +74,17 @@ pub enum Action {
     ReviewFilter,
     TmuxKill,
     TmuxRename,
+    AgentDiff,
+    MachineNext,
+    MachinePrev,
+    FilterMachine,
+    MachineShell,
+    MachinePause,
+    MachineResume,
+    MachineKeep,
+    MachineIdle,
+    MachineStopStart,
+    MachineDelete,
     /// A task from config (`tasks.<name>`), started on the selected row.
     Task(String),
 }
@@ -85,6 +96,7 @@ pub enum RowKind {
     Worktree,
     Review,
     Tmux,
+    Machine,
     /// A project section or nothing.
     Other,
 }
@@ -98,6 +110,7 @@ enum Scope {
     Worktree,
     Review,
     Tmux,
+    Machine,
     /// Under the leader on every row.
     Any,
 }
@@ -111,6 +124,7 @@ impl Scope {
             Scope::Worktree => matches!(k, RowKind::Worktree | RowKind::Agent),
             Scope::Review => k == RowKind::Review,
             Scope::Tmux => k == RowKind::Tmux,
+            Scope::Machine => k == RowKind::Machine,
         }
     }
 }
@@ -147,7 +161,7 @@ impl Action {
         Action::Expand,
         Action::Sort,
         Action::GotoAgents,
-        Action::GotoTmux,
+        Action::GotoMachines,
         Action::GotoWorktree,
         Action::GotoReview,
         Action::ProjectNext,
@@ -175,6 +189,17 @@ impl Action {
         Action::ReviewFilter,
         Action::TmuxKill,
         Action::TmuxRename,
+        Action::AgentDiff,
+        Action::MachineNext,
+        Action::MachinePrev,
+        Action::FilterMachine,
+        Action::MachineShell,
+        Action::MachinePause,
+        Action::MachineResume,
+        Action::MachineKeep,
+        Action::MachineIdle,
+        Action::MachineStopStart,
+        Action::MachineDelete,
     ];
 
     /// `(config name, label, scope)`. No default chord: the shipped config carries them.
@@ -198,7 +223,7 @@ impl Action {
             Action::PageUp => ("page.up", "page up", Global),
             Action::PageDown => ("page.down", "page down", Global),
             Action::Tab1 => ("tab.agents", "Agents tab", Global),
-            Action::Tab2 => ("tab.tmux", "Tmux tab", Global),
+            Action::Tab2 => ("tab.machines", "Machines tab", Global),
             Action::Tab3 => ("tab.worktrees", "Worktrees tab", Global),
             Action::Tab4 => ("tab.reviews", "Reviews tab", Global),
             Action::NextTab => ("tab.next", "next tab", Global),
@@ -210,7 +235,7 @@ impl Action {
             Action::Expand => ("expand", "expand", Global),
             Action::Sort => ("sort", "cycle sort", Global),
             Action::GotoAgents => ("goto.agents", "this row in Agents", Global),
-            Action::GotoTmux => ("goto.tmux", "this row in Tmux", Global),
+            Action::GotoMachines => ("goto.machines", "this row in Machines", Global),
             Action::GotoWorktree => ("goto.worktree", "this row in Worktrees", Global),
             Action::GotoReview => ("goto.review", "this row in Reviews", Global),
             Action::ProjectNext => ("project.next", "next project (… → all)", Global),
@@ -246,6 +271,21 @@ impl Action {
             ),
             Action::TmuxKill => ("tmux.kill", "kill session (confirm)", Tmux),
             Action::TmuxRename => ("tmux.rename", "rename session", Tmux),
+            Action::AgentDiff => ("agent.diff", "diff vs base in nvim (its machine)", Agent),
+            Action::MachineNext => (
+                "machine.next",
+                "next machine scope (all → providers)",
+                Global,
+            ),
+            Action::MachinePrev => ("machine.prev", "previous machine scope", Global),
+            Action::FilterMachine => ("filter.machine", "scope to this row's machine", Global),
+            Action::MachineShell => ("machine.shell", "shell on the machine (wakes it)", Machine),
+            Action::MachinePause => ("machine.pause", "pause (memory kept)", Machine),
+            Action::MachineResume => ("machine.resume", "resume / wake", Machine),
+            Action::MachineKeep => ("machine.keep", "keep awake 1h", Machine),
+            Action::MachineIdle => ("machine.idle", "idle pause: 10m → 30m → off", Machine),
+            Action::MachineStopStart => ("machine.stop", "stop / start", Machine),
+            Action::MachineDelete => ("machine.delete", "delete machine (confirm)", Machine),
             Action::Task(_) => ("task", "task", Any),
         }
     }
@@ -582,7 +622,7 @@ impl Keymap {
                     // Most specific scope wins: an agent row prefers agent actions over
                     // worktree ones that share the key.
                     let rank = |s: &Scope| match s {
-                        Scope::Agent | Scope::Review | Scope::Tmux => 0,
+                        Scope::Agent | Scope::Review | Scope::Tmux | Scope::Machine => 0,
                         Scope::Worktree => 1,
                         Scope::Any => 2,
                         Scope::Global => 3,

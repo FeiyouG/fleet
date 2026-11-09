@@ -2,7 +2,8 @@
 //! node, and the selected node is what `Enter`, `o`, the detail panel, etc. act on.
 
 use fleet_core::model::{
-    Activity, AgentRow, PaneRow, PaneView, ReviewRow, ReviewView, WorktreeRow, WorktreeView,
+    Activity, AgentRow, MachineView, PaneRow, PaneView, ReviewRow, ReviewView, WorktreeRow,
+    WorktreeView,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ pub enum RowKey {
     Session(String),
     Pane(String),
     Review(String, u64),
+    Provider(String),
+    Machine(String),
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,8 @@ pub enum NodeData {
     },
     Worktree(WorktreeView),
     Session {
+        /// The machine it is on; `None` = this computer.
+        machine: Option<String>,
         name: String,
         attached: bool,
         panes: Vec<PaneView>,
@@ -43,6 +48,12 @@ pub enum NodeData {
     },
     Pane(PaneView),
     Review(ReviewView),
+    /// A machine provider section (`local`, `instabox`).
+    Provider {
+        name: String,
+        summary: String,
+    },
+    Machine(MachineView),
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +170,14 @@ pub fn hay(d: &NodeData) -> String {
                 .and_then(|a| a.title.clone())
                 .unwrap_or_default()
         ),
+        NodeData::Provider { name, summary } => format!("{name} {summary}"),
+        NodeData::Machine(m) => format!(
+            "{} {} {} {}",
+            m.row.name,
+            m.row.provider,
+            m.row.state.label(),
+            m.tasks.join(" ")
+        ),
         NodeData::Review(v) => format!(
             "{} {} {} {} {} {}",
             v.review.display_id,
@@ -241,7 +260,19 @@ impl Node {
             NodeData::Session { name, .. } => Some(name.clone()),
             NodeData::Pane(p) => Some(p.pane.target()),
             NodeData::Review(v) => v.agents.first().and_then(|a| a.pane_target.clone()),
-            NodeData::Project { .. } => None,
+            NodeData::Project { .. } | NodeData::Provider { .. } | NodeData::Machine(_) => None,
+        }
+    }
+
+    /// The machine the row is on (`None` = this computer, or no machine).
+    pub fn machine(&self) -> Option<String> {
+        match &self.data {
+            NodeData::Agent { agent, .. } => agent.machine.clone(),
+            NodeData::Worktree(v) => v.worktree.machine.clone(),
+            NodeData::Session { machine, .. } => machine.clone(),
+            NodeData::Pane(p) => p.pane.machine.clone(),
+            NodeData::Machine(m) if m.row.provider != "local" => Some(m.row.name.clone()),
+            _ => None,
         }
     }
 
@@ -258,7 +289,7 @@ impl Node {
             }
             NodeData::Pane(p) => p.agent.iter().collect(),
             NodeData::Review(v) => v.agents.iter().collect(),
-            NodeData::Project { .. } => vec![],
+            NodeData::Project { .. } | NodeData::Provider { .. } | NodeData::Machine(_) => vec![],
         }
     }
 
@@ -278,7 +309,7 @@ impl Node {
             NodeData::Session { worktree, .. } => worktree.as_ref(),
             NodeData::Pane(p) => p.worktree.as_ref(),
             NodeData::Review(v) => v.worktrees.first(),
-            NodeData::Project { .. } => None,
+            NodeData::Project { .. } | NodeData::Provider { .. } | NodeData::Machine(_) => None,
         }
     }
 
@@ -300,6 +331,8 @@ impl Node {
                 .first()
                 .map(|w| w.name.clone())
                 .unwrap_or_else(|| v.review.display_id.clone()),
+            NodeData::Provider { name, .. } => name.clone(),
+            NodeData::Machine(m) => m.row.name.clone(),
         }
     }
 }

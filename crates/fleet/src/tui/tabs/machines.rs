@@ -171,7 +171,7 @@ pub fn build(app: &App) -> Vec<TreeNode> {
                     TreeNode::new(
                         RowKey::Provider(p.clone()),
                         NodeData::Provider {
-                            summary: format!("{n} machine(s) · {running} running"),
+                            summary: format!("{running}/{n} running"),
                             name: p,
                         },
                         mine,
@@ -263,13 +263,13 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, nodes: &[Node], selected: 
                 panes,
                 worktree,
                 urgent,
-                ..
+                agents,
             } => {
                 let frozen = super::paused(app, machine.as_deref());
                 let state = match urgent {
                     Some(a) => Line::from(vec![
                         Span::styled(
-                            if frozen { "⏸" } else { "" },
+                            if frozen { "⏸ " } else { "" },
                             meaning_style(util::Meaning::Paused),
                         ),
                         Span::styled(
@@ -287,12 +287,19 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, nodes: &[Node], selected: 
                     Cell::from(tree_label(n, &format!("{} {name}", icon::SESSION))),
                     Cell::from(state),
                     Cell::from(Span::styled(
-                        if machine.is_some() {
-                            "remote".to_string()
-                        } else if *attached {
-                            format!("attached · {} panes", panes.len())
-                        } else {
-                            format!("detached · {} panes", panes.len())
+                        {
+                            let who = match agents {
+                                0 => String::new(),
+                                1 => " · 1 agent".into(),
+                                n => format!(" · {n} agents"),
+                            };
+                            if machine.is_some() {
+                                format!("remote{who}")
+                            } else if *attached {
+                                format!("attached · {} panes{who}", panes.len())
+                            } else {
+                                format!("detached · {} panes{who}", panes.len())
+                            }
                         },
                         dim(),
                     )),

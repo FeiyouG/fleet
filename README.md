@@ -6,29 +6,27 @@ sessions in tmux, one worktree each, GitLab merge requests, Plannotator plan
 reviews in the browser.
 
 ```
- fleet [1 Overview] 2 Tmux  3 Worktrees  4 Reviews    22 worktrees · 25 agents · 7 need you · 0 failed · 0 ready · reviews 6s ago
- OVERALL    NAME                       BRANCH                             AGENT                  TMUX                        REVIEW
-▸NEEDS YOU  monid-services             main =                             build ⏳ WAIT:plan +3  monid-services:2.0 ○        —
- NEEDS YOU  monid-services-admin-users update/admin-users-paging ↕5/4 *   build ❓ WAIT:question monid-services-admin-us… ○  !537 open – 👍0 💬5 ✘3
- NEEDS YOU  firecrawl-monitor          feat/firecrawl-monitor =           plan  ⏳ WAIT:plan     22:1.1 ○                    !482 open – 👍1 💬0
- WORKING    monid-signup-credit-codes  feat/monid-signup-credit-… = *     build ● WORKING        monid-signup-credit-att… ●  !534 open – 👍0 💬15 ✘5
- IDLE       sfs-content-type           fix/sfs-content-type =             build ○ IDLE           monid-sfs-content-type:… ○  !530 open – 👍0 💬13 ✘4
- DEAD       wt-head                    (detached)                         —     NONE             —                           —
+ fleet [1 Agents] 2 Machines  3 Worktrees  4 Reviews   project: all  machine: all ▸ 25 agents · 7 need you · 4 working · 14 idle
+ AGENT              STATE         TITLE                         TASK              WHERE                          WORKTREE                REVIEW
+▸▾ monid-services                 18 agents · 5 need you · 3 working
+   ↳ opencode build ◆ WAIT:plan   Admin users paging            admin-users       󰌢 laptop › admin-users ○       admin-users ↕5/4 *      !537 open – 👍0 💬5 ✘3
+   ↳ opencode plan  ? WAIT:quest… Firecrawl monitor             firecrawl-monitor 󰅟 ibx-firecrawl › firecr… ○   firecrawl-monitor =     !482 open – 👍1 💬0
+   ↳ opencode build ⏸● WORKING    Signup credit codes           signup-credits    󰅟 ibx-signup › signup-cr… ○   signup-credits = *      !534 open – 👍0 💬15 ✘5
 ```
-
 What it answers, without opening anything:
 
 - which agent is **waiting for me** (a plan to approve, a question, a permission prompt), and the Plannotator URL to reopen it — even after the tab was closed;
 - which worktree is **unsynced / dirty**, and which MR it belongs to;
 - which open MR is **approved / failed / has unresolved threads**, and whether I have a local worktree and agent on it;
-- which tmux session hosts which agent, and how to jump there.
+- which machine (this laptop or a cloud machine) and tmux session hosts which agent, and how to jump there.
 
 It also starts work: one command creates branch + worktree + tmux session + agent, and one command starts a review agent for a teammate's MR.
 
 ## Install
 
 Requires Rust (stable), `tmux`, `git`, at least one coding agent CLI (`opencode`, `claude` or
-`codex`), and `glab` / `gh` logged in for the forges you use.
+`codex`), `glab` / `gh` logged in for the forges you use, and a
+[Nerd Font](https://www.nerdfonts.com) in the terminal (the TUI's type icons).
 
 ```bash
 cargo install --git https://github.com/FeiyouG/fleet fleet --locked
@@ -194,12 +192,18 @@ or `fleet machine shell` wakes it. Fleet never pauses or stops a machine on its 
 idle M 10m|off | max-run M 4h|off | shell M [--print] [-- CMD…] | doctor M | url M PORT`.
 Attach uses the system `ssh` (or `mosh`) with a short-lived certificate fleet requests for its
 own key in `~/.local/share/fleet/instabox/`, and checks the gateway's host CA strictly.
-Re-reviews on a cloud machine and the TUI's machine views are not built yet
-(`openspec/changes/add-remote-machines/tasks.md`).
+Re-reviews, `fleet agent attach|send|stop|diff|rename` and `fleet close` work on cloud tasks
+too. Each machine publishes its agents' state into its InstaBox metadata, so the TUI shows remote
+agents without waking a paused machine (their state is shown frozen, `⏸`).
+
+`fleet machine snapshot PROFILE` builds the profile's snapshot (tmux, fleet, the repo clone,
+the agent config, `setup` commands). `fleet creds sync [--profile P] [--watch]` copies the
+laptop's model credentials into InstaBox secrets with refresh tokens stripped: only the laptop
+refreshes OAuth tokens.
 
 ### The opencode plugin (`fleet setup`)
 
-opencode's database never records a pending permission prompt ("allow this bash command?"), so without help such an agent looks like `WORKING`. `fleet setup` installs a ~60-line plugin into `~/.config/opencode/plugins/fleet.ts` that writes `~/.local/share/fleet/agents/<pid>.json` on permission/session events. With it, fleet shows `🔒 WAIT:perm` plus the prompt text, and knows each process's exact session. Sessions started before the install keep the old behaviour until restarted (`fleet setup --check` counts them). `fleet setup --remove` uninstalls.
+opencode's database never records a pending permission prompt ("allow this bash command?"), so without help such an agent looks like `WORKING`. `fleet setup` installs a ~60-line plugin into `~/.config/opencode/plugins/fleet.ts` that writes `~/.local/share/fleet/agents/<pid>.json` on permission/session events. With it, fleet shows `! WAIT:perm` plus the prompt text, and knows each process's exact session. Sessions started before the install keep the old behaviour until restarted (`fleet setup --check` counts them). `fleet setup --remove` uninstalls.
 
 The plugin also opens a small control endpoint on `127.0.0.1` (random port, random bearer token, both in the state file, mode 0600). `fleet agent send` uses it: every message goes through opencode's session API into the session you last worked in, so a plain message and one with `--mode`/`--model` always land in the same session. A plain message keeps the session's agent and model; an override applies to that one turn (the TUI's own selector is unchanged; a toast says so). This works for any opencode process with the plugin, including ones you started by hand. opencode agents without it get tmux keystrokes and can't switch mode or model.
 
@@ -231,7 +235,9 @@ fleet worktree list | worktree gc [--yes]                   (dry run first)
 fleet worktree close TARGET [--force] [--yes] [--json]      (alias: fleet close; TARGET = task, folder, branch, session or path)
 fleet project list | project add [PATH] [--name N] [--reviews S] [--worktrees DIR] [--base B]
 fleet tmux list
-fleet machine ls | pause | resume | stop | start | rm | keep | release | idle | max-run | shell | doctor | url   (and --machine P on start/task/review)
+fleet machine ls | create | pause | resume | stop | start | rm | keep | release | idle | max-run | shell | snapshot | doctor | url   (and --machine P on start/task/review)
+fleet agent diff NAME                  nvim diff against the base, on the task's machine
+fleet creds sync [--profile P] [--watch]
 fleet setup [--remove|--check] | config [--init|--default|--effective|--check] | keys [--project P]
 ```
 
@@ -312,12 +318,24 @@ bind-key f run-shell 'tmux has-session -t fleet: 2>/dev/null || tmux new-session
 
 ## TUI
 
-Four tabs: **Agents** (flat, one row per running agent, default), **Tmux** (session → panes),
-**Worktrees** (project section → worktree → agents), **Reviews** (project section → MR/PR → local
-worktrees → agents). Every tab is a tree: `j/k` walk every visible node, `l`/`h` unfold/fold the
+Four tabs: **Agents** (project section → agent, default), **Machines** (provider → machine →
+tmux session → panes), **Worktrees** (project section → worktree), **Reviews** (project section →
+MR/PR → agents, plus local worktrees with no agent). A level hides only when the scope pins it
+(a project scope hides project sections; a machine scope hides providers and machines), never
+because of the data. Every tab is a tree: `j/k` walk every visible node, `l`/`h` unfold/fold the
 selected parent or step into/out of it, `z o`/`z c` all. `Enter` acts on the selected node: attach
-for an agent/pane/session/worktree, shell for a worktree with no agent, unfold a review with local
-worktrees, start a review agent for one without. The detail panel describes the selected node.
+for an agent/pane/session/worktree (on its machine, waking it if paused), a shell for a machine or
+a worktree with no agent, unfold a review with local worktrees, start a review agent for one
+without. The detail panel describes the selected node.
+
+**State:** one icon and one colour per meaning in every tab: `●` running/working (cyan), `◌` in
+progress (dim cyan), `◆` plan / `?` question / `!` permission = needs you (yellow), `○` idle
+(grey), `⏸` paused (blue; an agent on a paused machine shows `⏸` then its last state, dimmed),
+`■` stopped/gone, `✕` failed (red), `✓` done/good (green). Type icons (laptop, cloud, terminal,
+branch, pull request) need a [Nerd Font](https://www.nerdfonts.com) in the terminal.
+
+**Machines:** `]m`/`[m` cycle the machine scope `all → each provider → all`; `M` pins the
+selected row's machine. The header shows both scopes: `project: … machine: …`.
 
 **Projects:** `p`/`P` cycle `project1 → project2 → all`; under `all`, Worktrees and Reviews get one
 foldable section per project plus "outside projects". `:project [name|all]` and `--project` set it.
@@ -336,13 +354,15 @@ tasks menu. Every key below comes from the config (`fleet keys`, `fleet keys --p
 | `o`, `y` | open / yank (copy) the plan URL if waiting, else the review URL |
 | `i` | detail panel |
 | `[p` / `]p` | previous / next project scope |
+| `[m` / `]m`, `M` | previous / next machine scope · pin this row's machine |
 | `r`, `R`, `S` | refresh now / refresh reviews / cycle sort |
 | `:` | run any `fleet …` subcommand, or `:project X` |
-| `g a/t/w/v` | this row in Agents / Tmux / Worktrees / Reviews |
-| `Space` … agent row | `a` attach · `m` message · `s` stop · `n` rename · `p` open plan · `y` copy plan |
+| `g a/m/w/v` | this row in Agents / Machines / Worktrees / Reviews |
+| `Space` … agent row | `a` attach · `m` message · `s` stop · `n` rename · `p` open plan · `y` copy plan · `d` diff (any machine) |
 | `Space` … worktree row (and agent rows) | `S` shell · `x` close task · `u`/`U` push -u / pull --ff-only · `o` open review |
 | `Space` … review row | `r` review / re-review · `o` open · `y` copy · `w` worktrees · `a` agents · `f` filter preset |
-| `Space` … tmux row | `x` kill session · `n` rename |
+| `Space` … session row | `x` kill session · `n` rename |
+| `Space` … machine row | `S` shell · `z` pause · `r` resume · `k` keep awake 1h · `i` idle pause 10m → 30m → off · `s` stop/start · `D` delete |
 | `Space` … any row | `g` gc · `c` columns · `t` tasks → each task's `key` (`s` start, `r` review, `e` explain, yours) |
 
 `?` shows the effective map. A key value that is a chord (`"a s"`) or a modified key (`C-n`) is

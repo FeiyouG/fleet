@@ -30,47 +30,126 @@ pub fn ago(t: Option<DateTime<Utc>>) -> String {
     }
 }
 
+/// One meaning, one style, in every tab (spec: tui-machines, "One state vocabulary").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Meaning {
+    /// running / working `●`
+    Running,
+    /// in progress `◌`
+    Progress,
+    /// needs you `◆ ? !`
+    NeedsYou,
+    /// idle `○`
+    Idle,
+    /// paused `⏸`
+    Paused,
+    /// stopped / gone `■`
+    Stopped,
+    /// failed `✕`
+    Failed,
+    /// done / good `✓`
+    Good,
+    /// nothing to say
+    Plain,
+}
+
+pub fn meaning_style(m: Meaning) -> Style {
+    let s = Style::default();
+    match m {
+        Meaning::Running => s.fg(Color::Cyan),
+        Meaning::Progress => s.fg(Color::Cyan).add_modifier(Modifier::DIM),
+        Meaning::NeedsYou => s.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Meaning::Idle => s.fg(Color::DarkGray),
+        Meaning::Paused => s.fg(Color::Blue),
+        Meaning::Stopped => s.fg(Color::DarkGray).add_modifier(Modifier::DIM),
+        Meaning::Failed => s.fg(Color::Red).add_modifier(Modifier::BOLD),
+        Meaning::Good => s.fg(Color::Green).add_modifier(Modifier::BOLD),
+        Meaning::Plain => s,
+    }
+}
+
 pub fn overall_style(o: Overall) -> Style {
-    match o {
-        Overall::NeedsYou => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        Overall::Failed => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Overall::Ready => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        Overall::Merged => Style::default().fg(Color::Blue),
-        Overall::Working => Style::default(),
-        Overall::Idle => Style::default().fg(Color::DarkGray),
-        Overall::Dead => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
+    meaning_style(match o {
+        Overall::NeedsYou => Meaning::NeedsYou,
+        Overall::Failed => Meaning::Failed,
+        Overall::Ready | Overall::Merged => Meaning::Good,
+        Overall::Working => Meaning::Running,
+        Overall::Idle => Meaning::Idle,
+        Overall::Dead => Meaning::Stopped,
+    })
+}
+
+pub fn activity_meaning(a: Activity) -> Meaning {
+    match a {
+        Activity::WaitPlan | Activity::WaitQuestion | Activity::WaitPermission => Meaning::NeedsYou,
+        Activity::Working => Meaning::Running,
+        Activity::Idle => Meaning::Idle,
+        Activity::None => Meaning::Stopped,
     }
 }
 
 pub fn activity_style(a: Activity) -> Style {
-    match a {
-        Activity::WaitPlan | Activity::WaitQuestion | Activity::WaitPermission => {
-            Style::default().fg(Color::Yellow)
-        }
-        Activity::Working => Style::default().fg(Color::Cyan),
-        Activity::Idle => Style::default().fg(Color::DarkGray),
-        Activity::None => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    }
+    meaning_style(activity_meaning(a))
 }
 
 pub fn review_style(s: ReviewStatus) -> Style {
+    meaning_style(match s {
+        ReviewStatus::Approved | ReviewStatus::Mergeable | ReviewStatus::Merged => Meaning::Good,
+        ReviewStatus::CiFailed | ReviewStatus::Conflicts => Meaning::Failed,
+        ReviewStatus::Draft => Meaning::Idle,
+        ReviewStatus::Closed => Meaning::Stopped,
+        ReviewStatus::Open => Meaning::Plain,
+    })
+}
+
+/// A machine's state: glyph, label and meaning.
+pub fn machine_state(s: &fleet_core::machines::MachineState) -> (&'static str, String, Meaning) {
+    use fleet_core::machines::{MachineState as M, PausedBy};
     match s {
-        ReviewStatus::Approved | ReviewStatus::Mergeable => Style::default().fg(Color::Green),
-        ReviewStatus::CiFailed | ReviewStatus::Conflicts => Style::default().fg(Color::Red),
-        ReviewStatus::Draft => Style::default().fg(Color::DarkGray),
-        ReviewStatus::Merged => Style::default().fg(Color::Blue),
-        ReviewStatus::Closed => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-        ReviewStatus::Open => Style::default(),
+        M::Running => ("●", "running".into(), Meaning::Running),
+        M::Starting => ("◌", "starting".into(), Meaning::Progress),
+        M::Paused { by } => (
+            "⏸",
+            match by {
+                PausedBy::Idle => "paused (idle)".into(),
+                PausedBy::MaxRun => "paused (run cap)".into(),
+                PausedBy::User => "paused".into(),
+            },
+            Meaning::Paused,
+        ),
+        M::Stopped => ("■", "stopped".into(), Meaning::Stopped),
+        M::Cooldown { until } => (
+            "⏸",
+            format!(
+                "until {}",
+                until.with_timezone(&chrono::Local).format("%H:%M")
+            ),
+            Meaning::Paused,
+        ),
+        M::Error { .. } => ("✕", "error".into(), Meaning::Failed),
+        M::Gone => ("■", "gone".into(), Meaning::Stopped),
+    }
+}
+
+/// Type icons (Nerd Font, required; README › Install).
+pub mod icon {
+    /// nf-md-laptop
+    pub const LAPTOP: &str = "\u{f0322}";
+    /// nf-md-cloud_outline
+    pub const CLOUD: &str = "\u{f0163}";
+    /// nf-cod-terminal
+    pub const SESSION: &str = "\u{ea85}";
+    /// nf-dev-git_branch
+    pub const BRANCH: &str = "\u{e725}";
+    /// nf-oct-git_pull_request
+    pub const REVIEW: &str = "\u{f407}";
+    /// The icon of a machine on `provider`.
+    pub fn machine(provider: &str) -> &'static str {
+        if provider == "local" {
+            LAPTOP
+        } else {
+            CLOUD
+        }
     }
 }
 

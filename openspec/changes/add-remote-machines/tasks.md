@@ -32,25 +32,25 @@
 
 ## 5. Snapshot builder
 
-- [ ] 5.1 `fleet machine snapshot <profile>`: tmux, fleet, repo clone, connectors, docker images, opencode config, `fleet setup`
+- [x] 5.1 `fleet machine snapshot <profile>`: tmux, fleet, repo clone, connectors, docker images, opencode config, `fleet setup` — connectors and docker images come from the profile's `setup` commands
 
 ## 6. Remote state
 
-- [ ] 6.1 In-machine `agent-hook` publishes state changes to metadata
-- [ ] 6.2 Laptop snapshot merges remote rows from `list()`; paused machines never woken
+- [x] 6.1 In-machine publisher (`fleet machine publish`, polled every `publish_secs`, slower while all agents wait) writes state changes to metadata — a poll loop instead of an `agent-hook`, so agents without the fleet plugin are covered too
+- [x] 6.2 Laptop snapshot merges remote rows from `list()`; paused machines never woken
 
 ## 7. TUI + CLI
 
-- [ ] 7.1 Tabs Agents · Machines · Worktrees · Reviews; columns per spec
-- [ ] 7.2 State vocabulary (one icon/colour per meaning); Nerd Font in README
-- [ ] 7.3 Machine scope `]m`/`[m`, `filter.machine`; adaptive levels by scope only
-- [ ] 7.4 Leader menus (attach/plan/diff on agents; machine controls)
+- [x] 7.1 Tabs Agents · Machines · Worktrees · Reviews; columns per spec
+- [x] 7.2 State vocabulary (one icon/colour per meaning); Nerd Font in README
+- [x] 7.3 Machine scope `]m`/`[m`, `filter.machine`; adaptive levels by scope only
+- [x] 7.4 Leader menus (attach/plan/diff on agents; machine controls)
 - [x] 7.5 `fleet machine ls|pause|resume|stop|start|rm|keep|release|idle|max-run|shell|snapshot|doctor`
 
 ## 8. Secrets
 
 - [x] 8.1 Profile `secrets`/`files` passed at create
-- [ ] 8.2 `fleet creds sync` (refresh tokens stripped)
+- [x] 8.2 `fleet creds sync` (refresh tokens stripped)
 
 ## 9. Live spike + docs
 

@@ -1,6 +1,6 @@
 pub mod agents;
+pub mod machines;
 pub mod reviews;
-pub mod tmux;
 pub mod tree;
 pub mod worktrees;
 
@@ -17,17 +17,17 @@ pub use tree::{Node, NodeData, RowKey, TreeNode};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Agents,
-    Tmux,
+    Machines,
     Worktrees,
     Reviews,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Agents, Tab::Tmux, Tab::Worktrees, Tab::Reviews];
+    pub const ALL: [Tab; 4] = [Tab::Agents, Tab::Machines, Tab::Worktrees, Tab::Reviews];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Agents => "Agents",
-            Tab::Tmux => "Tmux",
+            Tab::Machines => "Machines",
             Tab::Worktrees => "Worktrees",
             Tab::Reviews => "Reviews",
         }
@@ -64,19 +64,92 @@ impl TabState {
 #[derive(Debug, Clone, Default)]
 pub struct TabStates {
     pub agents: TabState,
-    pub tmux: TabState,
+    pub machines: TabState,
     pub worktrees: TabState,
     pub reviews: TabState,
     pub show_paths: bool,
     /// Project scope (`None` = all).
     pub project: Option<String>,
+    /// Machine scope.
+    pub machine: MachineScope,
+}
+
+/// Which machines the tabs show (spec: tui-machines, "Machine scope"). Cycled with
+/// `machine.next` / `machine.prev` through all → each provider → all; `filter.machine` pins
+/// the selected row's machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MachineScope {
+    #[default]
+    All,
+    Provider(String),
+    Machine(String),
+}
+
+impl MachineScope {
+    pub fn label(&self) -> String {
+        match self {
+            MachineScope::All => "all".into(),
+            MachineScope::Provider(p) => p.clone(),
+            MachineScope::Machine(m) => m.clone(),
+        }
+    }
+}
+
+/// The local machine's name (`laptop` unless the profile says otherwise).
+pub fn local_name(app: &App) -> String {
+    app.fleet
+        .machines
+        .iter()
+        .find(|m| m.row.provider == "local")
+        .map(|m| m.row.name.clone())
+        .unwrap_or_else(|| "laptop".into())
+}
+
+/// `(provider, name)` of a row's machine (`None` = this computer).
+pub fn machine_of(app: &App, machine: Option<&str>) -> (String, String) {
+    match machine {
+        None => ("local".into(), local_name(app)),
+        Some(n) => (
+            app.fleet
+                .machines
+                .iter()
+                .find(|m| m.row.name == n)
+                .map(|m| m.row.provider.clone())
+                .unwrap_or_else(|| "?".into()),
+            n.to_string(),
+        ),
+    }
+}
+
+/// Is a row on `machine` inside the machine scope?
+pub fn in_machine_scope(app: &App, machine: Option<&str>) -> bool {
+    let (provider, name) = machine_of(app, machine);
+    match &app.tabs.machine {
+        MachineScope::All => true,
+        MachineScope::Provider(p) => *p == provider,
+        MachineScope::Machine(m) => *m == name,
+    }
+}
+
+/// The machine a row is on, when it is paused (its agents are frozen).
+pub fn paused(app: &App, machine: Option<&str>) -> bool {
+    let Some(n) = machine else { return false };
+    app.fleet.machines.iter().any(|m| {
+        m.row.name == n
+            && matches!(
+                m.row.state,
+                fleet_core::machines::MachineState::Paused { .. }
+                    | fleet_core::machines::MachineState::Cooldown { .. }
+                    | fleet_core::machines::MachineState::Stopped
+            )
+    })
 }
 
 impl TabStates {
     pub fn state_mut(&mut self, t: Tab) -> &mut TabState {
         match t {
             Tab::Agents => &mut self.agents,
-            Tab::Tmux => &mut self.tmux,
+            Tab::Machines => &mut self.machines,
             Tab::Worktrees => &mut self.worktrees,
             Tab::Reviews => &mut self.reviews,
         }
@@ -84,7 +157,7 @@ impl TabStates {
     pub fn state(&self, t: Tab) -> &TabState {
         match t {
             Tab::Agents => &self.agents,
-            Tab::Tmux => &self.tmux,
+            Tab::Machines => &self.machines,
             Tab::Worktrees => &self.worktrees,
             Tab::Reviews => &self.reviews,
         }
@@ -98,6 +171,15 @@ impl TabStates {
         self.worktrees
             .unfolded
             .insert(RowKey::Project(OUTSIDE.into()));
+        for n in names {
+            self.agents.unfolded.insert(RowKey::Project(n.clone()));
+        }
+        self.agents.unfolded.insert(RowKey::Project(OUTSIDE.into()));
+        for p in fleet_core::machines::PROVIDERS {
+            self.machines
+                .unfolded
+                .insert(RowKey::Provider(p.to_string()));
+        }
     }
 }
 
@@ -110,7 +192,7 @@ pub fn nodes(app: &App) -> Vec<Node> {
     let st = app.tabs.state(app.tab);
     let tree = match app.tab {
         Tab::Agents => agents::build(app),
-        Tab::Tmux => tmux::build(app),
+        Tab::Machines => machines::build(app),
         Tab::Worktrees => worktrees::build(app),
         Tab::Reviews => reviews::build(app),
     };
@@ -178,7 +260,7 @@ pub fn unfold_all(app: &mut App) {
     }
     let tree = match tab {
         Tab::Agents => agents::build(app),
-        Tab::Tmux => tmux::build(app),
+        Tab::Machines => machines::build(app),
         Tab::Worktrees => worktrees::build(app),
         Tab::Reviews => reviews::build(app),
     };
@@ -214,6 +296,7 @@ pub fn selected_keys(app: &App) -> Vec<RowKey> {
 /// Select the first node (unfolding ancestors) that relates to any of `keys`.
 pub fn select_by_keys(app: &mut App, keys: &[RowKey]) {
     let tab = app.tab;
+    let before = app.tabs.state(tab).unfolded.clone();
     unfold_all(app);
     let ns = nodes(app);
     let related = |n: &Node| -> bool {
@@ -256,7 +339,8 @@ pub fn select_by_keys(app: &mut App, keys: &[RowKey]) {
         let st = app.tabs.state_mut(tab);
         st.selected = ns2.iter().position(|n| n.key == ns[i].key).unwrap_or(0);
     } else {
-        app.tabs.state_mut(tab).unfolded.clear();
+        // Nothing related here: leave the tab as the user left it.
+        app.tabs.state_mut(tab).unfolded = before;
     }
 }
 
@@ -315,7 +399,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .min(ns.len().saturating_sub(1));
     match app.tab {
         Tab::Agents => agents::draw(f, chunks[1], app, &ns, sel),
-        Tab::Tmux => tmux::draw(f, chunks[1], app, &ns, sel),
+        Tab::Machines => machines::draw(f, chunks[1], app, &ns, sel),
         Tab::Worktrees => worktrees::draw(f, chunks[1], app, &ns, sel),
         Tab::Reviews => reviews::draw(f, chunks[1], app, &ns, sel),
     }
@@ -540,6 +624,71 @@ pub fn detail(app: &App, n: &Node) -> Text<'static> {
                 }
             }
         }
+        NodeData::Provider { name, summary } => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} {name} ", util::icon::machine(name)),
+                    util::accent(),
+                ),
+                Span::raw(summary.clone()),
+            ]));
+            let profiles: Vec<String> = app
+                .cfg
+                .machine_profiles()
+                .into_iter()
+                .filter(|p| p.provider == *name)
+                .map(|p| p.name)
+                .collect();
+            lines.push(Line::from(Span::styled(
+                format!("   profiles: {}", profiles.join(", ")),
+                dim(),
+            )));
+        }
+        NodeData::Machine(m) => {
+            let r = &m.row;
+            let (glyph, label, meaning) = util::machine_state(&r.state);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} {} ", util::icon::machine(&r.provider), r.name),
+                    util::accent(),
+                ),
+                Span::styled(format!("{glyph} {label}"), util::meaning_style(meaning)),
+                Span::raw(format!(
+                    " · {} · profile {} · id {}",
+                    r.provider, m.profile, r.id
+                )),
+            ]));
+            let fmt = |d: Option<std::time::Duration>| {
+                d.map(|d| format!("{}m", d.as_secs() / 60))
+                    .unwrap_or_else(|| "off".into())
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "   size {} · idle pause {} · max run {} · cost {} · OOM kills {} · tasks {}",
+                    r.size.map(|s| s.label()).unwrap_or_else(|| "—".into()),
+                    fmt(r.idle_after),
+                    fmt(r.max_run),
+                    r.cost_usd
+                        .map(|c| format!("${c:.2}"))
+                        .unwrap_or_else(|| "—".into()),
+                    r.oom_kills
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                    if m.tasks.is_empty() {
+                        "none".into()
+                    } else {
+                        m.tasks.join(", ")
+                    }
+                ),
+                dim(),
+            )));
+            if let fleet_core::machines::MachineState::Error { reason } = &r.state {
+                lines.push(Line::from(Span::styled(
+                    format!("   error: {reason}"),
+                    util::meaning_style(util::Meaning::Failed),
+                )));
+            }
+        }
         NodeData::Review(v) => {
             let r = &v.review;
             lines.push(Line::from(vec![
@@ -653,8 +802,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     }
     spans.push(Span::styled(
         format!(
-            "  project: {} ▸ ",
-            app.tabs.project.as_deref().unwrap_or("all")
+            "  project: {}  machine: {} ▸ ",
+            app.tabs.project.as_deref().unwrap_or("all"),
+            app.tabs.machine.label()
         ),
         Style::default().fg(Color::Cyan),
     ));
@@ -671,24 +821,25 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 ns.len().saturating_sub(waiting + working)
             )
         }
-        Tab::Tmux => {
-            let sessions = tmux::build(app);
-            let attached = sessions
+        Tab::Machines => {
+            let ms: Vec<_> = app
+                .fleet
+                .machines
                 .iter()
-                .filter(|n| matches!(&n.data, NodeData::Session { attached: true, .. }))
-                .count();
-            let oc: usize = sessions
-                .iter()
-                .map(|n| match &n.data {
-                    NodeData::Session { agents, .. } => *agents,
-                    _ => 0,
-                })
-                .sum();
+                .filter(|m| in_machine_scope(app, machines::row_machine(m).as_deref()))
+                .collect();
+            let running = ms.iter().filter(|m| m.row.state.is_running()).count();
+            let costs: Vec<f64> = ms.iter().filter_map(|m| m.row.cost_usd).collect();
+            let cost = if costs.is_empty() {
+                "no cost data".to_string()
+            } else {
+                format!("${:.2} this month", costs.iter().sum::<f64>().max(0.0))
+            };
             format!(
-                "{} sessions · {} attached · {} agents",
-                sessions.len(),
-                attached,
-                oc
+                "{} machines · {} running · {} paused/stopped · {cost}",
+                ms.len(),
+                running,
+                ms.len() - running
             )
         }
         Tab::Worktrees => {
@@ -799,11 +950,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("c", "copy"),
                 ("a m", "message"),
             ],
-            Tab::Tmux => &[
-                ("Enter", "attach"),
+            Tab::Machines => &[
+                ("Enter", "attach / shell"),
                 ("l/h", "unfold/fold"),
-                ("K", "kill"),
-                ("n", "rename"),
+                ("] m", "machine scope"),
+                ("Space", "pause · resume · keep · …"),
             ],
             Tab::Worktrees => &[
                 ("Enter", "attach / shell"),
@@ -885,7 +1036,7 @@ pub fn tree_label(n: &Node, name: &str) -> Line<'static> {
     ])
 }
 
-/// Compact agent cell used by every tab: `plan  ⏳ WAIT:plan`.
+/// Compact agent cell used by every tab: `plan  ◆ WAIT:plan`.
 pub fn agent_cell(a: &fleet_core::model::AgentRow) -> ratatui::widgets::Cell<'static> {
     ratatui::widgets::Cell::from(Line::from(vec![
         Span::styled(format!("{:<5} ", a.mode.as_deref().unwrap_or("?")), dim()),
@@ -921,39 +1072,125 @@ pub fn review_cell(r: Option<&ReviewRow>) -> ratatui::widgets::Cell<'static> {
     }
 }
 
-/// Pane cell: `monid-lev8:1.1 ●`.
-pub fn pane_cell(target: Option<&str>, attached: bool) -> ratatui::widgets::Cell<'static> {
+/// `<icon> <machine>` (laptop or cloud type icon). Blue while the machine is paused.
+pub fn machine_spans(app: &App, machine: Option<&str>) -> Vec<Span<'static>> {
+    let (provider, name) = machine_of(app, machine);
+    let style = if paused(app, machine) {
+        util::meaning_style(util::Meaning::Paused)
+    } else {
+        util::accent()
+    };
+    vec![Span::styled(
+        format!(
+            "{} {}",
+            util::icon::machine(&provider),
+            util::trunc(&name, 16)
+        ),
+        style,
+    )]
+}
+
+pub fn machine_cell(app: &App, machine: Option<&str>) -> ratatui::widgets::Cell<'static> {
+    ratatui::widgets::Cell::from(Line::from(machine_spans(app, machine)))
+}
+
+/// WHERE: `<icon> <machine> › <session>`, then `●` attached / `○` detached.
+pub fn where_cell(
+    app: &App,
+    machine: Option<&str>,
+    target: Option<&str>,
+    attached: bool,
+) -> ratatui::widgets::Cell<'static> {
     use ratatui::widgets::Cell;
+    let mut spans = machine_spans(app, machine);
     match target {
-        None => Cell::from(Span::styled("—", dim())),
-        Some(t) => Cell::from(Line::from(vec![
-            Span::raw(util::trunc(t, 24)),
-            Span::styled(
+        None => spans.push(Span::styled(" › —", dim())),
+        Some(t) => {
+            let session = t.split(':').next().unwrap_or(t);
+            spans.push(Span::styled(" › ", dim()));
+            spans.push(Span::raw(util::trunc(session, 18)));
+            spans.push(Span::styled(
                 if attached { " ●" } else { " ○" },
                 if attached {
                     Style::default().fg(Color::Green)
                 } else {
                     dim()
                 },
+            ));
+        }
+    }
+    Cell::from(Line::from(spans))
+}
+
+/// An agent's STATE: `◆ WAIT:plan`; on a paused machine `⏸` (blue) then the last-known
+/// state dimmed (`⏸◆ WAIT:plan`).
+pub fn state_spans(app: &App, a: &fleet_core::model::AgentRow) -> Vec<Span<'static>> {
+    let text = format!("{} {}", a.activity.glyph(), a.activity.label());
+    if paused(app, a.machine.as_deref()) {
+        vec![
+            Span::styled("⏸", util::meaning_style(util::Meaning::Paused)),
+            Span::styled(
+                text,
+                util::activity_style(a.activity).add_modifier(Modifier::DIM),
             ),
-        ])),
+        ]
+    } else {
+        vec![Span::styled(text, util::activity_style(a.activity))]
     }
 }
 
-/// Branch + sync cell.
-pub fn branch_cell(w: &WorktreeRow, width: usize) -> ratatui::widgets::Cell<'static> {
-    use ratatui::widgets::Cell;
-    match &w.branch {
-        Some(b) => Cell::from(Line::from(vec![
-            Span::raw(util::trunc(b, width)),
-            Span::styled(
-                format!(" {}{}", w.sync_glyph(), if w.dirty { " *" } else { "" }),
-                dim(),
-            ),
-        ])),
-        None => Cell::from(Span::styled(
-            format!("(detached){}", if w.dirty { " *" } else { "" }),
-            dim(),
-        )),
+pub fn state_cell(app: &App, a: &fleet_core::model::AgentRow) -> ratatui::widgets::Cell<'static> {
+    ratatui::widgets::Cell::from(Line::from(state_spans(app, a)))
+}
+
+/// The fleet task an agent belongs to: the open task whose tmux session hosts its pane, else
+/// whose worktree contains its directory (on the same machine).
+pub fn task_of(app: &App, a: &fleet_core::model::AgentRow) -> Option<String> {
+    let session = a
+        .pane_target
+        .as_deref()
+        .map(|t| t.split(':').next().unwrap_or(t));
+    let same_machine = |t: &fleet_core::model::TaskBrief| match &a.machine {
+        None => !app
+            .fleet
+            .machines
+            .iter()
+            .any(|m| m.row.id == t.machine_id && m.row.provider != "local"),
+        Some(n) => app
+            .fleet
+            .machines
+            .iter()
+            .any(|m| m.row.id == t.machine_id && m.row.name == *n),
+    };
+    let tasks = || app.fleet.tasks.iter().filter(|t| same_machine(t));
+    tasks()
+        .find(|t| Some(t.tmux_session.as_str()) == session)
+        .or_else(|| tasks().find(|t| a.cwd.starts_with(&t.path)))
+        .map(|t| t.slug.clone())
+}
+
+/// A worktree's STATE in the shared vocabulary: `◆ NEEDS YOU`, `✓ READY`, `● WORKING`, …
+pub fn overall_cell(
+    o: Overall,
+    gc: &fleet_core::model::GcVerdict,
+) -> ratatui::widgets::Cell<'static> {
+    let glyph = match o {
+        Overall::NeedsYou => "◆",
+        Overall::Failed => "✕",
+        Overall::Ready | Overall::Merged => "✓",
+        Overall::Working => "●",
+        Overall::Idle => "○",
+        Overall::Dead => "■",
+    };
+    let mut spans = vec![Span::styled(
+        format!("{glyph} {}", o.label()),
+        util::overall_style(o),
+    )];
+    if let fleet_core::model::GcVerdict::Yes(r) = gc {
+        spans.push(Span::styled(
+            format!(" · gc: {r}"),
+            Style::default().fg(Color::Yellow),
+        ));
     }
+    ratatui::widgets::Cell::from(Line::from(spans))
 }
