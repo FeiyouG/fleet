@@ -8,6 +8,7 @@
 pub mod adapters;
 pub mod interfaces;
 pub mod remote;
+pub mod state;
 
 pub use adapters::{adapter_for, instabox, local, PROVIDERS};
 pub use interfaces::*;

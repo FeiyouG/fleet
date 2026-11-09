@@ -414,6 +414,7 @@ pub async fn resolve(
     target: &str,
     scope: Option<&str>,
 ) -> Result<Resolved> {
+    let fleet = &fleet.local_only();
     let tasks = Registry::open()
         .and_then(|r| r.local_tasks())
         .unwrap_or_default();
@@ -678,6 +679,7 @@ const LIMIT: usize = 20;
 /// Read everything about the resolved target: git, registry, forge (merged review), the
 /// snapshot (agents, panes), and which pane/agent hosts this process.
 pub async fn gather(r: &Resolved, fleet: &Fleet) -> Result<Facts> {
+    let fleet = &fleet.local_only();
     let repo = &r.project.repo;
     let entries = git::porcelain(repo).await?;
     let idx = r
@@ -1279,6 +1281,7 @@ mod tests {
 
     fn agent(pid: u32, pane: Option<&str>) -> AgentRow {
         AgentRow {
+            machine: None,
             adapter: "opencode".into(),
             pid,
             cwd: "/w/feat-x".into(),
@@ -1748,6 +1751,7 @@ mod tests {
     fn fleet_with(wts: &[(&str, &str, &str)], panes: &[(&str, &str)]) -> Fleet {
         use crate::model::*;
         let row = |repo: &str, path: &str, branch: &str| WorktreeRow {
+            machine: None,
             repo: repo.into(),
             path: path.into(),
             name: Path::new(path)
@@ -1782,6 +1786,7 @@ mod tests {
                 .iter()
                 .map(|(s, path)| PaneView {
                     pane: PaneRow {
+                        machine: None,
                         session: (*s).into(),
                         window: 1,
                         window_name: "z".into(),

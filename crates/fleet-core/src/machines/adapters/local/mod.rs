@@ -30,6 +30,7 @@ impl Local {
             idle_after: None,
             max_run: None,
             oom_kills: None,
+            cost_usd: None,
             metadata: BTreeMap::new(),
             created_at: None,
         }

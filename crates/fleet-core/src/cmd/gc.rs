@@ -24,6 +24,7 @@ pub struct GcPlan {
 }
 
 pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
+    let fleet = &fleet.local_only();
     let mut p = GcPlan::default();
     let opts = CloseOpts { force: false };
 
@@ -141,6 +142,7 @@ pub async fn plan(fleet: &Fleet, cfg: &Config) -> GcPlan {
 /// only when its steps are unchanged, so an agent started (or a file changed) while the dry
 /// run was on screen skips that item instead of being killed with it.
 pub async fn apply(plan: &GcPlan, fresh: &Fleet, cfg: &Config, log: &Progress) -> Vec<TxnReport> {
+    let fresh = &fresh.local_only();
     let now = self::plan(fresh, cfg).await;
     let mut out = vec![];
     for t in &plan.txns {

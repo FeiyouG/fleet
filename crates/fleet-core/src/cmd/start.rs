@@ -318,6 +318,13 @@ async fn start_remote(
         layout.repo.display()
     ));
     remote::prepare(&on, &layout, &origin).await?;
+    match remote::configure_fleet(&on, &task.machine, &layout, &repo.name, &task.agent).await {
+        Ok(true) => log("agent state: published by fleet on the machine"),
+        Ok(false) => log(
+            "agent state: unknown on the laptop (no fleet on the machine, or no publish_key); build a snapshot with `fleet machine snapshot`",
+        ),
+        Err(e) => log(&format!("agent state: could not configure fleet on the machine: {e:#}")),
+    }
     let path = layout.worktree(&slug);
     if on.has_session(&slug).await {
         bail!("tmux session `{slug}` already exists on {}", m.name);

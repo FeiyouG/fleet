@@ -299,6 +299,11 @@ const MACHINE: &[&str] = &[
     "env",
     "workdir",
     "mosh",
+    "publish_key",
+    "publish_secs",
+    "fleet_source",
+    "fleet_ref",
+    "setup",
 ];
 const PROJECT: &[&str] = &[
     "name",

@@ -110,6 +110,9 @@ pub struct MachineRow {
     pub max_run: Option<Duration>,
     /// Out-of-memory kills since creation, when the provider reports them.
     pub oom_kills: Option<u32>,
+    /// Compute cost this month (list price, USD), when the provider reports it.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
     /// String labels kept by the provider (fleet stores the profile and agent state here).
     pub metadata: BTreeMap<String, String>,
     pub created_at: Option<DateTime<Utc>>,
@@ -142,6 +145,9 @@ pub struct MachineSpec {
     pub secrets: Vec<String>,
     /// Direct secrets delivered as files: home-relative path -> secret name.
     pub files: BTreeMap<String, String>,
+    /// Direct secrets delivered as environment variables: variable -> secret name.
+    #[serde(default)]
+    pub env_secrets: BTreeMap<String, String>,
     /// Plain environment variables for every login shell.
     pub env: BTreeMap<String, String>,
     /// Extra metadata (merged with the profile key).
@@ -225,6 +231,18 @@ pub trait MachineAdapter: Send + Sync {
     /// A link to `port` in the machine that only you can open.
     async fn port_url(&self, _id: &str, _port: u16) -> Result<String> {
         unsupported(self.provider(), "port url")
+    }
+    /// Write `bytes` to the absolute `path` in the machine (parents created).
+    async fn write_file(&self, _id: &str, _path: &str, _bytes: Vec<u8>) -> Result<()> {
+        unsupported(self.provider(), "write file")
+    }
+    /// Save the machine as a reusable snapshot named `name`; returns its id once ready.
+    async fn snapshot(&self, _id: &str, _name: &str) -> Result<String> {
+        unsupported(self.provider(), "snapshot")
+    }
+    /// Store a secret value with the provider (delivered to machines as a file or variable).
+    async fn put_secret(&self, _name: &str, _value: &str) -> Result<()> {
+        unsupported(self.provider(), "secret")
     }
     /// Merge `kv` into the machine's metadata; an empty value removes that key. Other keys
     /// are kept.

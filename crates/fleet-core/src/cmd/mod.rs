@@ -6,6 +6,7 @@ pub mod gc;
 pub mod machine;
 pub mod project;
 pub mod prompt;
+pub mod remote_task;
 pub mod rename;
 pub mod review;
 pub mod send;

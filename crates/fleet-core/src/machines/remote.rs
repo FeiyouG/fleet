@@ -184,6 +184,98 @@ mkdir -p {wt}
     Ok(())
 }
 
+/// What the in-machine fleet needs to know about itself (`~/.config/fleet/machine.json`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MachineFile {
+    pub id: String,
+    pub provider: String,
+    pub api_url: Option<String>,
+    pub api_key_env: String,
+    pub workdir: String,
+    pub publish_secs: u64,
+}
+
+impl MachineFile {
+    pub fn path() -> PathBuf {
+        crate::config::config_dir().join("machine.json")
+    }
+    pub fn load() -> Result<Self> {
+        let p = Self::path();
+        let s = std::fs::read_to_string(&p)
+            .with_context(|| format!("{} (not a fleet machine?)", p.display()))?;
+        Ok(serde_json::from_str(&s)?)
+    }
+}
+
+/// Give the machine its own fleet config (the agent and project of this task, merged with
+/// what earlier tasks added) and start the state publisher when fleet is installed there
+/// and the machine holds a provider key. Returns whether the publisher runs.
+pub async fn configure_fleet(
+    on: &On<'_>,
+    cfg: &MachineConfig,
+    layout: &Layout,
+    project: &str,
+    agent: &crate::config::ResolvedAgent,
+) -> Result<bool> {
+    let key_env = cfg
+        .api_key_env
+        .clone()
+        .unwrap_or_else(|| "INSTABOX_API_KEY".into());
+    let mf = MachineFile {
+        id: on.id.clone(),
+        provider: cfg.provider.clone(),
+        api_url: cfg.api_url.clone(),
+        api_key_env: key_env.clone(),
+        workdir: layout.workdir.to_string_lossy().into_owned(),
+        publish_secs: cfg.publish_secs,
+    };
+    let lua_str = |s: &str| format!("{s:?}");
+    let agent_line = format!(
+        "[{}] = {{ harness = {}, bin = {} }},\n",
+        lua_str(&agent.name),
+        lua_str(&agent.harness),
+        lua_str(&agent.bin)
+    );
+    let project_line = format!(
+        "{{ name = {}, repo = {}, worktrees = {} }},\n",
+        lua_str(project),
+        lua_str(&layout.repo.to_string_lossy()),
+        lua_str(&layout.workdir.join("wt").to_string_lossy())
+    );
+    let q = |s: &str| shell_words::quote(s).into_owned();
+    let script = format!(
+        r#"set -e
+d="${{XDG_CONFIG_HOME:-$HOME/.config}}/fleet"
+mkdir -p "$d/agents" "$d/projects"
+printf %s {agent_line} > "$d/agents/{agent_file}.lua"
+printf %s {project_line} > "$d/projects/{project_file}.lua"
+printf %s {machine_json} > "$d/machine.json"
+first=$(ls "$d/agents" | head -1 | sed 's/\.lua$//')
+{{ echo "return {{"; echo "  agents = {{"; cat "$d"/agents/*.lua; echo "  }},";
+   echo "  defaults = {{ agent = \"$first\" }},"; echo "  projects = {{"; cat "$d"/projects/*.lua; echo "  }},"; echo "}}"; }} > "$d/init.lua"
+if command -v fleet >/dev/null 2>&1 && [ -n "${{{key_env}:-}}" ]; then
+  pgrep -f 'fleet machine publish' >/dev/null 2>&1 || {{ mkdir -p ~/.local/share/fleet; nohup fleet machine publish >~/.local/share/fleet/publish.log 2>&1 </dev/null & }}
+  echo publishing
+fi
+"#,
+        agent_line = q(&agent_line),
+        project_line = q(&project_line),
+        machine_json = q(&serde_json::to_string(&mf)?),
+        agent_file = if crate::slug::is_valid(&agent.name) {
+            agent.name.as_str()
+        } else {
+            "agent"
+        },
+        project_file = if crate::slug::is_valid(project) {
+            project
+        } else {
+            "project"
+        },
+    );
+    let out = on.bash(&script).await?;
+    Ok(out.contains("publishing"))
+}
+
 /// What `fleet machine doctor` checks: (tool, present).
 pub async fn doctor(on: &On<'_>, harness: &str) -> Result<Vec<(String, bool)>> {
     let mut out = vec![];
@@ -239,6 +331,18 @@ pub fn spec_for(cfg: &MachineConfig, name: &str) -> MachineSpec {
         max_run_min: cfg.max_run_min,
         secrets: cfg.secrets.clone(),
         files: cfg.files.clone(),
+        env_secrets: cfg
+            .publish_key
+            .iter()
+            .map(|k| {
+                (
+                    cfg.api_key_env
+                        .clone()
+                        .unwrap_or_else(|| "INSTABOX_API_KEY".into()),
+                    k.clone(),
+                )
+            })
+            .collect(),
         env: cfg.env.clone(),
         metadata: Default::default(),
     }
@@ -335,6 +439,11 @@ mod tests {
             env: Default::default(),
             workdir: None,
             mosh: false,
+            publish_key: None,
+            publish_secs: 10,
+            fleet_source: String::new(),
+            fleet_ref: String::new(),
+            setup: vec![],
         };
         let l = Layout::new(&cfg, "monid-services");
         assert_eq!(l.repo, PathBuf::from("/data/home/src/monid-services"));

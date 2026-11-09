@@ -131,6 +131,16 @@ impl MachineAdapter for InstaBox {
                 _ => break,
             }
         }
+        // Cost this month, best effort (a key without the usage scope just shows none).
+        if let Ok(u) = self.api.get("/v1/usage/machines?limit=500").await {
+            for m in u["machines"].as_array().into_iter().flatten() {
+                if let (Some(id), Some(c)) = (m["id"].as_str(), m["computeUSD"].as_f64()) {
+                    if let Some(r) = out.iter_mut().find(|r| r.id == id) {
+                        r.cost_usd = Some(c);
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -307,6 +317,71 @@ impl MachineAdapter for InstaBox {
             .ok_or_else(|| anyhow::anyhow!("instabox: no URL for port {port} on {}", m.name))
     }
 
+    async fn write_file(&self, id: &str, path: &str, bytes: Vec<u8>) -> Result<()> {
+        let m = self.resolve(id).await?;
+        let q = format!(
+            "/v1/machines/{}/files?path={}&parents=true",
+            m.id,
+            urlencode(path)
+        );
+        self.api.put_bytes(&q, bytes).await.map(|_| ())
+    }
+
+    async fn snapshot(&self, id: &str, name: &str) -> Result<String> {
+        let m = self.resolve(id).await?;
+        let snap = self
+            .api
+            .call(
+                Method::POST,
+                &format!("/v1/machines/{}/snapshots", m.id),
+                Some(json!({ "name": name })),
+                Opts {
+                    idempotent: true,
+                    ..Opts::default()
+                },
+            )
+            .await?;
+        let sid = snap["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("instabox: snapshot answer without an id"))?
+            .to_string();
+        let started = std::time::Instant::now();
+        let mut cur = snap;
+        loop {
+            match cur["state"].as_str().unwrap_or("ready") {
+                "ready" => return Ok(sid),
+                "failed" => bail!(
+                    "instabox snapshot {sid} failed: {}",
+                    cur["error"]["message"]
+                        .as_str()
+                        .unwrap_or("no reason given")
+                ),
+                _ => {}
+            }
+            if started.elapsed() > Duration::from_secs(1800) {
+                bail!("instabox snapshot {sid} not ready after 30 minutes");
+            }
+            tokio::time::sleep(self.api.poll.max(Duration::from_millis(5))).await;
+            cur = self.api.get(&format!("/v1/snapshots/{sid}")).await?;
+        }
+    }
+
+    async fn put_secret(&self, name: &str, value: &str) -> Result<()> {
+        let orgs = self.api.get("/v1/orgs").await?;
+        let org = orgs["orgs"][0]["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("instabox: the API key reaches no workspace"))?;
+        self.api
+            .call(
+                Method::PUT,
+                &format!("/v1/orgs/{org}/secrets/{name}"),
+                Some(json!({ "value": value, "delivery": "env" })),
+                Opts::default(),
+            )
+            .await
+            .map(|_| ())
+    }
+
     async fn publish(&self, id: &str, kv: &BTreeMap<String, String>) -> Result<()> {
         let m = self.resolve(id).await?;
         let mut meta = m.metadata.clone();
@@ -359,12 +434,17 @@ fn create_body(spec: &MachineSpec) -> Value {
     if !spec.secrets.is_empty() {
         b.insert("secrets".into(), json!(spec.secrets));
     }
-    if !spec.files.is_empty() {
-        let ds: Vec<Value> = spec
+    if !spec.files.is_empty() || !spec.env_secrets.is_empty() {
+        let mut ds: Vec<Value> = spec
             .files
             .iter()
             .map(|(path, secret)| json!({ "secret": secret, "file": path }))
             .collect();
+        ds.extend(
+            spec.env_secrets
+                .iter()
+                .map(|(var, secret)| json!({ "secret": secret, "env": var })),
+        );
         b.insert("directSecrets".into(), Value::Array(ds));
     }
     if !spec.env.is_empty() {
@@ -378,6 +458,17 @@ fn create_body(spec: &MachineSpec) -> Value {
         b.insert("metadata".into(), json!(meta));
     }
     Value::Object(b)
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn ts(v: &Value) -> Option<DateTime<Utc>> {
@@ -452,6 +543,7 @@ pub fn to_row(v: &Value) -> MachineRow {
             .filter(|m| *m >= 0)
             .map(|m| Duration::from_secs(m as u64 * 60)),
         oom_kills: v["oomKills"].as_u64().map(|n| n as u32),
+        cost_usd: None,
         metadata,
         created_at: ts(&v["createdAt"]),
     }

@@ -111,6 +111,7 @@ async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow 
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut row = WorktreeRow {
+            machine: None,
             repo: repo.name.clone(),
             is_main: path == *main_path,
             path: path.clone(),

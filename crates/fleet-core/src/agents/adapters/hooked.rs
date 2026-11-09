@@ -61,6 +61,7 @@ pub fn row(
             other => other.to_string(),
         });
     AgentRow {
+        machine: None,
         adapter: adapter.into(),
         pid,
         cwd,

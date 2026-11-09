@@ -281,6 +281,17 @@ pub struct MachineDef {
     pub workdir: Option<String>,
     /// Attach with mosh instead of ssh when the provider supports it.
     pub mosh: Option<bool>,
+    /// Provider secret holding an API key the machine may use to publish its agents' state
+    /// (delivered as `api_key_env` inside the machine). Unset = no remote state.
+    pub publish_key: Option<String>,
+    /// Seconds between in-machine state checks while an agent works (×6 while all wait).
+    pub publish_secs: Option<u64>,
+    /// Where `fleet machine snapshot` installs fleet from (git URL) and which ref.
+    pub fleet_source: Option<String>,
+    pub fleet_ref: Option<String>,
+    /// Extra shell commands `fleet machine snapshot` runs before saving (e.g. image pulls).
+    #[serde(default, deserialize_with = "lua_string_list_opt")]
+    pub setup: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +318,11 @@ pub struct MachineConfig {
     pub env: BTreeMap<String, String>,
     pub workdir: Option<String>,
     pub mosh: bool,
+    pub publish_key: Option<String>,
+    pub publish_secs: u64,
+    pub fleet_source: String,
+    pub fleet_ref: String,
+    pub setup: Vec<String>,
 }
 
 fn default_machine() -> String {
@@ -689,6 +705,14 @@ impl Config {
             env: m.env.clone().unwrap_or_default(),
             workdir: m.workdir.clone(),
             mosh: m.mosh.unwrap_or(false),
+            publish_key: m.publish_key.clone(),
+            publish_secs: m.publish_secs.unwrap_or(10).max(2),
+            fleet_source: m
+                .fleet_source
+                .clone()
+                .unwrap_or_else(|| "https://github.com/FeiyouG/fleet".into()),
+            fleet_ref: m.fleet_ref.clone().unwrap_or_else(|| "main".into()),
+            setup: m.setup.clone().unwrap_or_default(),
             provider,
         })
     }

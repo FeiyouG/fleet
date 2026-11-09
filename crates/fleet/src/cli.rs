@@ -53,6 +53,9 @@ enum Cmd {
     /// Machines (laptop, cloud): list, pause, resume, keep awake, shell, …
     #[command(subcommand)]
     Machine(MachineCmd),
+    /// Credentials for cloud machines
+    #[command(subcommand)]
+    Creds(CredsCmd),
     /// Alias of `agent start`
     Start(StartArgs),
     /// Alias of `worktree close`
@@ -132,6 +135,9 @@ enum AgentCmd {
     Rename { old: String, new: String },
     /// Kill the agent pane (keeps the worktree)
     Stop { name: String },
+    /// Open nvim's diff of the task against its base in a new window of its tmux session
+    /// (on its machine), then attach
+    Diff { name: String },
 }
 
 #[derive(Args, Clone)]
@@ -378,9 +384,40 @@ enum MachineCmd {
     },
     /// A private link to a port on a machine (e.g. the plan review page)
     Url { machine: String, port: u16 },
+    /// Build a reusable snapshot for a profile: tmux, fleet, the project's clone, your
+    /// opencode config (no logins), `fleet setup`, the profile's `setup` commands
+    Snapshot {
+        profile: String,
+        /// Project to clone into the snapshot (default: the cwd's project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Snapshot name (default: fleet-<profile>-<project>)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Inside a machine: publish its agents' state to the provider (started by fleet)
+    #[command(hide = true)]
+    Publish {
+        #[arg(long)]
+        once: bool,
+    },
 }
 
-async fn machine(m: MachineCmd, cfg: Config) -> Result<()> {
+#[derive(Subcommand)]
+enum CredsCmd {
+    /// Push each cloud profile's `files` (login files) as provider secrets, refresh tokens
+    /// removed; unchanged files are skipped
+    Sync {
+        /// Only this machine profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Keep running, syncing every N seconds
+        #[arg(long, value_name = "SECS")]
+        watch: Option<u64>,
+    },
+}
+
+async fn machine(m: MachineCmd, cfg: Config, project: Option<String>) -> Result<()> {
     use fleet_core::cmd::machine as mc;
     use fleet_core::machines::remote;
     let one = |s: &str| -> Vec<String> { vec![s.to_string()] };
@@ -546,6 +583,21 @@ async fn machine(m: MachineCmd, cfg: Config) -> Result<()> {
             }
             Ok(())
         }
+        MachineCmd::Snapshot {
+            profile,
+            project: p,
+            name,
+        } => {
+            let p = p
+                .or(project)
+                .or_else(|| cwd_repo(&cfg))
+                .context("pass --project <name>")?;
+            let name = name.unwrap_or_else(|| format!("fleet-{profile}-{p}"));
+            let id = mc::build_snapshot(&cfg, &profile, &p, &name, &progress()).await?;
+            println!("snapshot {name} ({id}) is ready; use it with machines.{profile}.snapshot = \"{name}\"");
+            Ok(())
+        }
+        MachineCmd::Publish { once } => mc::publish_loop(once).await,
         MachineCmd::Url { machine, port } => {
             let (_, a, r) = mc::find(&cfg, &machine).await?;
             println!("{}", a.port_url(&r.id, port).await?);
@@ -888,7 +940,20 @@ async fn dispatch(cli: Cli, cfg: Config) -> Result<()> {
             WorktreeCmd::Close(args) => close_cmd(args, cfg, project).await,
         },
         Cmd::Close(args) => close_cmd(args, cfg, project).await,
-        Cmd::Machine(m) => machine(m, cfg).await,
+        Cmd::Machine(m) => machine(m, cfg, project).await,
+        Cmd::Creds(CredsCmd::Sync { profile, watch }) => loop {
+            for (secret, pushed) in
+                fleet_core::cmd::machine::creds_sync(&cfg, profile.as_deref()).await?
+            {
+                if pushed || watch.is_none() {
+                    println!("{secret}: {}", if pushed { "pushed" } else { "unchanged" });
+                }
+            }
+            match watch {
+                Some(s) => tokio::time::sleep(std::time::Duration::from_secs(s.max(30))).await,
+                None => return Ok(()),
+            }
+        },
         Cmd::Tmux(TmuxCmd::Focus { target }) => fleet_core::tmux::focus(&target).await,
         Cmd::Tmux(TmuxCmd::List { json }) => {
             let f = snapshot(&cfg).await;
@@ -1145,6 +1210,37 @@ fn confirm(q: &str) -> Result<bool> {
 }
 
 async fn close_cmd(a: CloseArgs, cfg: Config, project: Option<String>) -> Result<()> {
+    // A task on a cloud machine closes through its machine.
+    if let Some(t) = fleet_core::cmd::remote_task::find(&a.target)? {
+        let r = fleet_core::cmd::remote_task::reach(&cfg, t)?;
+        let what = if r.profile.per_task {
+            format!(
+                "delete machine {} with task {}",
+                r.task.machine_id, r.task.slug
+            )
+        } else {
+            format!(
+                "remove task {} (session, worktree, branch) from machine {}",
+                r.task.slug, r.task.machine_id
+            )
+        };
+        if !a.yes {
+            if !std::io::stdin().is_terminal() {
+                println!("would {what} (dry run; --yes to do it)");
+                return Ok(());
+            }
+            eprint!("{what}? [y/N] ");
+            std::io::stderr().flush().ok();
+            let mut s = String::new();
+            std::io::stdin().read_line(&mut s)?;
+            if !matches!(s.trim(), "y" | "Y" | "yes") {
+                bail!("not closed");
+            }
+        }
+        fleet_core::cmd::remote_task::close(&r, a.force, &progress()).await?;
+        println!("closed {}", r.task.slug);
+        return Ok(());
+    }
     // close asks the forge about its one branch itself; no per-worktree lookups needed.
     let engine = Engine::new(cfg.clone()).merged_lookups(false);
     let f = engine.snapshot(true).await;
@@ -1360,7 +1456,7 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
             }
             Ok(())
         }
-        AgentCmd::Attach { name } => send::attach(&snapshot(&cfg).await, &name).await,
+        AgentCmd::Attach { name } => send::attach(&cfg, &snapshot(&cfg).await, &name).await,
         AgentCmd::Send {
             name,
             text,
@@ -1426,7 +1522,8 @@ async fn agent(a: AgentCmd, cfg: Config, project: Option<String>) -> Result<()> 
             );
             Ok(())
         }
-        AgentCmd::Stop { name } => send::stop(&snapshot(&cfg).await, &name).await,
+        AgentCmd::Diff { name } => send::diff(&cfg, &name).await,
+        AgentCmd::Stop { name } => send::stop(&cfg, &snapshot(&cfg).await, &name).await,
     }
 }
 

@@ -26,6 +26,17 @@ struct ReviewCache {
     last_error: Option<String>,
 }
 
+/// Machines from every provider, refreshed at most every [`REMOTE_TTL`] (a provider list is
+/// an HTTP call; it never wakes a machine).
+#[derive(Default)]
+struct RemoteCache {
+    at: Option<Instant>,
+    machines: Vec<crate::model::MachineView>,
+    warnings: Vec<String>,
+}
+
+const REMOTE_TTL: Duration = Duration::from_secs(10);
+
 /// `(source, branch)` -> when looked up, and the merged review found (if any).
 type MergedCache = HashMap<(String, String), (Instant, Option<ReviewRow>)>;
 
@@ -35,6 +46,7 @@ pub struct Engine {
     review_adapters: Vec<Box<dyn ReviewAdapter>>,
     reviews: Arc<Mutex<ReviewCache>>,
     merged: Arc<Mutex<MergedCache>>,
+    remote: Arc<Mutex<RemoteCache>>,
     /// Look up a merged review per worktree branch (one forge call each, cached for
     /// `review_ttl_secs`). On for the TUI (in the background) and for the one-shot commands
     /// that show gc verdicts (`worktree list`, `worktree gc`); off for the rest of the CLI,
@@ -68,6 +80,7 @@ impl Engine {
                 last_error: None,
             })),
             merged: Arc::new(Mutex::new(HashMap::new())),
+            remote: Arc::new(Mutex::new(RemoteCache::default())),
             merged_lookups: true,
         }
     }
@@ -211,8 +224,26 @@ impl Engine {
         };
         let reviews_f = self.reviews_cached(wait_for_reviews);
 
-        let (panes, (worktrees, wt_errs), (agents, ag_errs), (reviews, fetched_at, rv_err)) =
-            tokio::join!(panes_f, worktrees_f, agents_f, reviews_f);
+        let (
+            panes,
+            (mut worktrees, wt_errs),
+            (mut agents, ag_errs),
+            (reviews, fetched_at, rv_err),
+            (machines, remote_tasks, rm_errs),
+        ) = tokio::join!(
+            panes_f,
+            worktrees_f,
+            agents_f,
+            reviews_f,
+            self.remote_cached()
+        );
+        // Remote tasks become ordinary rows tagged with their machine.
+        let rows: Vec<crate::machines::MachineRow> =
+            machines.iter().map(|m| m.row.clone()).collect();
+        let (r_agents, r_worktrees) = crate::machines::state::remote_rows(&remote_tasks, &rows);
+        agents.extend(r_agents);
+        worktrees.extend(r_worktrees);
+        warnings.extend(rm_errs);
 
         let panes = match panes {
             Ok(p) => p,
@@ -260,8 +291,52 @@ impl Engine {
             repo_sources,
         });
         fleet.reviews_fetched_at = fetched_at;
+        fleet.machines = machines;
+        fleet.tasks = Registry::open()
+            .and_then(|r| r.open_tasks())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| crate::model::TaskBrief {
+                slug: t.slug,
+                preset: t.task,
+                machine: t.machine,
+                machine_id: t.machine_id,
+                path: t.path,
+                tmux_session: t.tmux_session,
+            })
+            .collect();
         fleet.warnings = warnings;
         fleet
+    }
+
+    /// Machines of every profile (cached [`REMOTE_TTL`]) and the open remote tasks. Cloud
+    /// providers are listed only when a cloud profile is configured.
+    async fn remote_cached(
+        &self,
+    ) -> (
+        Vec<crate::model::MachineView>,
+        Vec<crate::registry::Task>,
+        Vec<String>,
+    ) {
+        let tasks: Vec<crate::registry::Task> = Registry::open()
+            .and_then(|r| r.open_tasks())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.is_remote())
+            .collect();
+        let mut c = self.remote.lock().await;
+        if c.at.map(|t| t.elapsed() > REMOTE_TTL).unwrap_or(true) {
+            let (m, w) = crate::cmd::machine::list(&self.config).await;
+            c.machines = m;
+            c.warnings = w;
+            c.at = Some(Instant::now());
+        }
+        (c.machines.clone(), tasks, c.warnings.clone())
+    }
+
+    /// Forget the cached machine list (after a machine action), so the next snapshot asks.
+    pub async fn refresh_machines(&self) {
+        self.remote.lock().await.at = None;
     }
 
     /// Returns the cached reviews, kicking off a background refresh when stale. With

@@ -112,12 +112,26 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         .with_context(|| format!("unknown harness `{}`", task.agent.harness))?;
 
     let existing = reg.find_review(&source, id)?;
-    if let Some(t) = existing.as_ref().filter(|t| t.is_remote()) {
-        bail!(
-            "{} already runs on machine {}; re-reviews on cloud machines are not supported yet: message the agent, or close the task and start again",
-            t.slug,
-            t.machine_id
+    if let Some(t) = existing.clone().filter(|t| t.is_remote()) {
+        let old_sha = t.head_sha.clone().unwrap_or_default();
+        let text = format!(
+            "Re-review {}: new commits since {} (now at {}). Diff only what changed, verify your own threads, then plan.",
+            review.display_id,
+            &old_sha[..old_sha.len().min(8)],
+            &review.head_sha[..review.head_sha.len().min(8)]
         );
+        let slug = t.slug.clone();
+        let r = super::remote_task::reach(cfg, t)?;
+        super::remote_task::rereview(&r, &adapter.fetch_refspec(id), &text, log).await?;
+        reg.set_head(&slug, &review.head_sha)?;
+        if opts.attach {
+            super::remote_task::attach(&r).await?;
+        }
+        return Ok(ReviewOutcome::ReReviewed {
+            slug,
+            old_sha,
+            new_sha: review.head_sha,
+        });
     }
     if existing.is_none() && task.machine.provider != "local" {
         return start_remote(
@@ -166,6 +180,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
             .flat_map(|r| r.agents.clone())
             .find(|a| a.cwd == crate::procs::canon(&task.path) && a.adapter == task.agent)
             .unwrap_or_else(|| crate::model::AgentRow {
+                machine: None,
                 adapter: task.agent.clone(),
                 pid: 0,
                 cwd: task.path.clone(),
@@ -319,6 +334,13 @@ async fn start_remote(
         layout.repo.display()
     ));
     remote::prepare(&on, &layout, &origin).await?;
+    match remote::configure_fleet(&on, &task.machine, &layout, &repo.name, &task.agent).await {
+        Ok(true) => log("agent state: published by fleet on the machine"),
+        Ok(false) => log(
+            "agent state: unknown on the laptop (no fleet on the machine, or no publish_key); build a snapshot with `fleet machine snapshot`",
+        ),
+        Err(e) => log(&format!("agent state: could not configure fleet on the machine: {e:#}")),
+    }
     let refspec = forge.fetch_refspec(id);
     log(&format!("fetch origin {refspec} on {}", m.name));
     on.fetch(&layout.repo, "origin", &refspec).await?;

@@ -28,6 +28,13 @@ pub async fn rename(cfg: &Config, old: &str, new: &str, log: &Progress) -> Resul
     let task = reg
         .get(old)?
         .with_context(|| format!("`{old}` is not a fleet-started task (see `fleet agent list`)"))?;
+    if reg.get(new)?.is_some() {
+        bail!("`{new}` is already an open task");
+    }
+    if task.is_remote() {
+        let r = super::remote_task::reach(cfg, task)?;
+        return super::remote_task::rename(&r, new, log).await;
+    }
     let repo = cfg
         .project(&task.repo)
         .with_context(|| format!("repo `{}` not in config", task.repo))?;

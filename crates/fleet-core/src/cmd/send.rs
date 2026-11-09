@@ -62,8 +62,20 @@ pub async fn send(
     msg: &SendMsg,
     log: &Progress,
 ) -> Result<()> {
+    if let Some(t) = super::remote_task::find(name)? {
+        let r = super::remote_task::reach(&engine.config, t)?;
+        return super::remote_task::send(&r, &msg.text, msg.mode.as_deref(), msg.model.as_deref())
+            .await;
+    }
     let row = find_row(fleet, name).with_context(|| format!("no agent/worktree named `{name}`"))?;
     let agent = first_agent(row).with_context(|| format!("`{name}` has no running agent"))?;
+    if agent.machine.is_some() {
+        let t = super::remote_task::find_by_pane(agent.pane_target.as_deref().unwrap_or(""))?
+            .with_context(|| format!("`{name}` runs on a machine fleet has no task for"))?;
+        let r = super::remote_task::reach(&engine.config, t)?;
+        return super::remote_task::send(&r, &msg.text, msg.mode.as_deref(), msg.model.as_deref())
+            .await;
+    }
     let adapter = engine
         .agent_adapter(&agent.adapter)
         .with_context(|| format!("agent `{}` is not enabled", agent.adapter))?;
@@ -71,7 +83,10 @@ pub async fn send(
     adapter.send(&agent, msg).await
 }
 
-pub async fn attach(fleet: &Fleet, name: &str) -> Result<()> {
+pub async fn attach(cfg: &crate::config::Config, fleet: &Fleet, name: &str) -> Result<()> {
+    if let Some(t) = super::remote_task::find(name)? {
+        return super::remote_task::attach(&super::remote_task::reach(cfg, t)?).await;
+    }
     let row = find_row(fleet, name).with_context(|| format!("no agent/worktree named `{name}`"))?;
     let pane = row
         .primary_pane()
@@ -79,8 +94,45 @@ pub async fn attach(fleet: &Fleet, name: &str) -> Result<()> {
     tmux::attach(&pane.target()).await
 }
 
+/// `fleet agent diff NAME`: nvim's diff against the task's base, in a new window of its tmux
+/// session on its machine, then attach. Nothing is pulled to the laptop.
+pub async fn diff(cfg: &crate::config::Config, name: &str) -> Result<()> {
+    let task = crate::registry::Registry::open()?
+        .get(name)?
+        .with_context(|| format!("`{name}` is not an open task"))?;
+    let base = cfg
+        .project(&task.repo)
+        .map(|p| p.base.clone())
+        .unwrap_or_else(|| "main".into());
+    if task.is_remote() {
+        let r = super::remote_task::reach(cfg, task)?;
+        return super::remote_task::diff(&r, &base).await;
+    }
+    let cmd = format!("nvim -c 'DiffviewOpen origin/{base}' || git diff origin/{base} | less -R");
+    let st = tokio::process::Command::new("tmux")
+        .args([
+            "new-window",
+            "-t",
+            &task.tmux_session,
+            "-n",
+            "diff",
+            "-c",
+            &task.path.to_string_lossy(),
+            &cmd,
+        ])
+        .status()
+        .await?;
+    if !st.success() {
+        anyhow::bail!("tmux new-window in {} failed", task.tmux_session);
+    }
+    tmux::attach(&task.tmux_session).await
+}
+
 /// Stop the row's (first) agent: kill its pane, and wait until the process has exited.
-pub async fn stop(fleet: &Fleet, name: &str) -> Result<()> {
+pub async fn stop(cfg: &crate::config::Config, fleet: &Fleet, name: &str) -> Result<()> {
+    if let Some(t) = super::remote_task::find(name)? {
+        return super::remote_task::stop(&super::remote_task::reach(cfg, t)?).await;
+    }
     let row = find_row(fleet, name).with_context(|| format!("no agent/worktree named `{name}`"))?;
     let agent = first_agent(row).with_context(|| format!("`{name}` has no running agent"))?;
     super::txn::stop_pid(agent.pid, agent.pane_target.as_deref()).await

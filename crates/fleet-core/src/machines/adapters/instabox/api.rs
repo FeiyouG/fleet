@@ -87,6 +87,27 @@ impl Api {
         self.call(Method::GET, path, None, Opts::default()).await
     }
 
+    /// `PUT` raw bytes (file uploads).
+    pub async fn put_bytes(&self, path: &str, bytes: Vec<u8>) -> Result<Value> {
+        let key = self.key()?;
+        let url = format!("{}{path}", self.base);
+        let resp = self
+            .http
+            .put(&url)
+            .header("X-API-Key", &key)
+            .header("Content-Type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .with_context(|| format!("instabox PUT {path}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if (200..300).contains(&status) {
+            return Ok(serde_json::from_str(&text).unwrap_or(Value::Null));
+        }
+        Err(parse_error(status, &text).into())
+    }
+
     pub async fn call(
         &self,
         method: Method,

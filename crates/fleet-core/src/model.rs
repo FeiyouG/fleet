@@ -11,6 +11,9 @@ use std::path::PathBuf;
 /// One tmux pane. `pid` is the pane's shell pid (ancestor of whatever runs in it).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneRow {
+    /// The machine it is on; `None` = this computer.
+    #[serde(default)]
+    pub machine: Option<String>,
     pub session: String,
     pub window: u32,
     pub window_name: String,
@@ -68,14 +71,16 @@ impl Activity {
             Activity::None => "NONE",
         }
     }
+    /// The shared state vocabulary (spec: tui-machines, "One state vocabulary"): one glyph
+    /// per meaning, the same in every tab.
     pub fn glyph(self) -> &'static str {
         match self {
-            Activity::WaitPlan => "⏳",
-            Activity::WaitQuestion => "❓",
-            Activity::WaitPermission => "🔒",
+            Activity::WaitPlan => "◆",
+            Activity::WaitQuestion => "?",
+            Activity::WaitPermission => "!",
             Activity::Working => "●",
             Activity::Idle => "○",
-            Activity::None => "—",
+            Activity::None => "■",
         }
     }
 }
@@ -83,6 +88,9 @@ impl Activity {
 /// One running agent process (opencode today).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRow {
+    /// The machine it runs on; `None` = this computer.
+    #[serde(default)]
+    pub machine: Option<String>,
     pub adapter: String,
     pub pid: u32,
     /// Canonicalised working directory of the process.
@@ -212,6 +220,9 @@ pub enum Sync {
 /// One git worktree (the main clone included).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeRow {
+    /// The machine it is on; `None` = this computer.
+    #[serde(default)]
+    pub machine: Option<String>,
     pub repo: String,
     pub path: PathBuf,
     /// Folder name.
@@ -369,6 +380,29 @@ impl GcVerdict {
     }
 }
 
+/// A registry task, as the views need it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskBrief {
+    pub slug: String,
+    /// The task preset it was started with (`start`, `review`, …).
+    pub preset: Option<String>,
+    /// Machine profile and the machine's id.
+    pub machine: String,
+    pub machine_id: String,
+    pub path: PathBuf,
+    pub tmux_session: String,
+}
+
+/// A machine with the profile that reaches it and the open tasks on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineView {
+    pub profile: String,
+    #[serde(flatten)]
+    pub row: crate::machines::MachineRow,
+    /// Slugs of the open tasks on it.
+    pub tasks: Vec<String>,
+}
+
 /// The whole snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Fleet {
@@ -378,11 +412,37 @@ pub struct Fleet {
     pub panes: Vec<PaneView>,
     pub worktrees: Vec<WorktreeView>,
     pub reviews: Vec<ReviewView>,
+    /// Every machine of every machine profile (the laptop first).
+    #[serde(default)]
+    pub machines: Vec<MachineView>,
+    /// Open fleet tasks (registry), for the task preset and machine of each agent.
+    #[serde(default)]
+    pub tasks: Vec<TaskBrief>,
     /// Non-fatal collector problems, shown in the status line.
     pub warnings: Vec<String>,
 }
 
 impl Fleet {
+    /// Only what is on this computer: the view gc and close plan from (a remote task is
+    /// closed through its machine, never by local path logic).
+    pub fn local_only(&self) -> Fleet {
+        let mut f = self.clone();
+        f.overview.retain(|r| {
+            r.worktree
+                .as_ref()
+                .map(|w| w.machine.is_none())
+                .unwrap_or(true)
+                && r.agents.iter().all(|a| a.machine.is_none())
+        });
+        f.worktrees.retain(|w| w.worktree.machine.is_none());
+        f.panes.retain(|p| p.pane.machine.is_none());
+        for r in &mut f.reviews {
+            r.worktrees.retain(|w| w.machine.is_none());
+            r.agents.retain(|a| a.machine.is_none());
+        }
+        f
+    }
+
     pub fn counts(&self) -> Counts {
         let mut c = Counts::default();
         for r in &self.overview {

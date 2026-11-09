@@ -44,6 +44,7 @@ pub fn parse_panes(s: &str) -> Vec<PaneRow> {
                 return None;
             }
             Some(PaneRow {
+                machine: None,
                 pid: f[0].parse().ok()?,
                 session: f[1].to_string(),
                 window: f[2].parse().ok()?,
