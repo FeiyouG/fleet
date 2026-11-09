@@ -47,7 +47,9 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Defaults {
-    /// The agent new tasks use unless the task or project says otherwise.
+    /// The agent new tasks use unless the task or project says otherwise. Not shipped: the
+    /// user's file must set it (a missing or unknown value is a warning until a task starts).
+    #[serde(default)]
     pub agent: String,
     /// `plan` | `build` | `yolo`, or a harness-specific mode (an opencode agent name).
     pub mode: String,
@@ -611,10 +613,19 @@ impl Config {
         let on = On::parse(&on_s)
             .with_context(|| format!("task `{name}`: on = \"{on_s}\" (use project or review)"))?;
         let agent_name = pick(|t| t.agent.clone()).unwrap_or_else(|| d.agent.clone());
+        if agent_name.is_empty() {
+            bail!(
+                "no agent configured: add to ~/.config/fleet/init.lua\n  agents = {{ opencode = {{ harness = \"opencode\" }} }},\n  defaults = {{ agent = \"opencode\" }},\n(see README › Getting started)"
+            );
+        }
         let agent = self.agent(&agent_name, project).with_context(|| {
             format!(
                 "task `{name}`: agent `{agent_name}` is not defined (agents: {})",
-                self.agent_names(project).join(", ")
+                if self.agents.is_empty() {
+                    "none".to_string()
+                } else {
+                    self.agent_names(project).join(", ")
+                }
             )
         })?;
         let mut skills = agent.skills.clone();
@@ -651,6 +662,28 @@ impl Config {
         })
     }
 
+    /// A task's key and label without resolving its agent (menus list tasks even when the
+    /// agent is missing, greyed with the reason).
+    pub fn task_key_label(
+        &self,
+        name: &str,
+        project: Option<&Project>,
+    ) -> Option<(Option<String>, String, bool)> {
+        let g = self.tasks.get(name);
+        let p = project.and_then(|p| p.tasks.get(name));
+        if g.is_none() && p.is_none() {
+            return None;
+        }
+        let pick = |f: fn(&TaskDef) -> Option<String>| p.and_then(f).or_else(|| g.and_then(f));
+        Some((
+            pick(|t| t.key.clone()).filter(|k| !k.is_empty()),
+            pick(|t| t.label.clone()).unwrap_or_else(|| name.to_string()),
+            p.and_then(|t| t.enabled)
+                .or_else(|| g.and_then(|t| t.enabled))
+                .unwrap_or(true),
+        ))
+    }
+
     /// Every task for the project, `Err` kept for the ones that do not resolve (menus grey
     /// them out with the reason).
     pub fn tasks_for(&self, project: Option<&Project>) -> Vec<(String, Result<ResolvedTask>)> {
@@ -675,13 +708,16 @@ impl Config {
 local home = os.getenv("HOME")
 
 return {
-  -- defaults = { agent = "opencode", mode = "plan" },   -- see `fleet config --default`
-
-  -- agents: your named configurations of a harness (opencode | claude | codex)
+  -- 1. Your agents: a name of your choice -> which harness (opencode | claude | codex) and,
+  --    optionally, a model in that harness's own naming. Keep only the ones you have installed.
   agents = {
-    opencode = { model = "anthropic/claude-opus-5-5" },  -- in the harness's own naming
-    -- fast = { harness = "opencode", model = "anthropic/claude-sonnet-4-5" },
+    opencode = { harness = "opencode" },                      -- e.g. model = "anthropic/claude-opus-5-5"
+    -- claude = { harness = "claude" },                       -- e.g. model = "opus"
+    -- codex  = { harness = "codex" },                        -- e.g. model = "gpt-5.4"
   },
+
+  -- 2. Which agent new tasks use (one of the names above) and the mode they start in.
+  defaults = { agent = "opencode", mode = "plan" },          -- plan | build | yolo
 
   -- tasks: presets for starting an agent (start, review, explain ship by default).
   -- Keep them in tasks/mod.lua next to their prompt files: tasks = require("tasks"),
@@ -798,24 +834,46 @@ mod tests {
         }
     }
 
+    /// The first thing a new user pastes (README › Getting started).
+    const FIRST_CONFIG: &str = r#"return {
+        agents = { opencode = { harness = "opencode" } },
+        defaults = { agent = "opencode" },
+    }"#;
+
     #[test]
-    fn no_user_file_boots_with_shipped_defaults() {
+    fn no_user_file_boots_but_warns_about_the_missing_agent() {
         let c = Config::shipped().unwrap();
-        assert_eq!(c.defaults.agent, "opencode");
+        assert_eq!(c.defaults.agent, "");
         assert_eq!(c.defaults.mode, "plan");
         assert!(c.defaults.system.contains("{slug}"));
-        assert_eq!(c.enabled_agents().len(), 3);
-        let t = c.task("review", None).unwrap();
-        assert_eq!(t.on, On::Review);
-        assert_eq!(t.key.as_deref(), Some("r"));
-        assert!(t.instructions.unwrap().contains("root cause"));
-        assert_eq!(c.task("explain", None).unwrap().mode, "plan");
-        assert_eq!(c.keys["leader"], "Space");
+        assert!(c.enabled_agents().is_empty());
         assert!(
-            c.warnings.iter().all(|w| !w.contains("unknown")),
+            c.warnings.iter().any(|w| w.contains("no agent")),
             "{:?}",
             c.warnings
         );
+        let e = c.task("start", None).unwrap_err().to_string();
+        assert!(
+            e.contains("no agent configured") && e.contains("harness"),
+            "{e}"
+        );
+        assert_eq!(c.keys["leader"], "Space");
+    }
+
+    #[test]
+    fn first_config_works() {
+        let c = Config::from_lua(FIRST_CONFIG, "init.lua").unwrap();
+        assert!(
+            c.warnings.iter().all(|w| !w.contains("no agent")),
+            "{:?}",
+            c.warnings
+        );
+        let t = c.task("review", None).unwrap();
+        assert_eq!(t.on, On::Review);
+        assert_eq!(t.key.as_deref(), Some("r"));
+        assert_eq!(t.agent.name, "opencode");
+        assert!(t.instructions.unwrap().contains("root cause"));
+        assert_eq!(c.task("explain", None).unwrap().mode, "plan");
     }
 
     #[test]
@@ -823,7 +881,7 @@ mod tests {
         let src = r#"
             local home = os.getenv("HOME")
             return {
-              defaults = { mode = "build" },
+              defaults = { agent = "opencode", mode = "build" },
               agents = { opencode = { model = "anthropic/claude-opus-5-5" },
                          fast = { harness = "opencode", model = "anthropic/claude-sonnet-4-5" } },
               tasks = { start = { skills = { "/tmp/does-not-exist/SKILL.md" } },
@@ -868,7 +926,8 @@ mod tests {
     #[test]
     fn project_overrides_every_section() {
         let c = Config::from_lua(
-            r#"return { projects = { { name = "svc", repo = "/r",
+            r#"return { defaults = { agent = "opencode" }, agents = { opencode = {}, claude = {} },
+               projects = { { name = "svc", repo = "/r",
                  defaults = { agent = "claude", mode = "build", system = "Project rules." },
                  agents = { claude = { model = "opus" } },
                  tasks = { review = { skills = { "/s/SKILL.md" } }, release = { key = "R" } },
@@ -901,7 +960,7 @@ mod tests {
     #[test]
     fn agent_system_and_skills_accumulate() {
         let c = Config::from_lua(
-            r#"return { agents = { opencode = { skills = { "/a/SKILL.md" }, system = "Prefer small commits." } },
+            r#"return { defaults = { agent = "opencode" }, agents = { opencode = { skills = { "/a/SKILL.md" }, system = "Prefer small commits." } },
                         tasks = { start = { skills = { "/a/SKILL.md", "/b/SKILL.md" } } } }"#,
             "t",
         )
@@ -917,12 +976,25 @@ mod tests {
     #[test]
     fn fatal_problems() {
         let err = |src: &str| Config::from_lua(src, "t").unwrap_err().to_string();
-        assert!(err(r#"return { defaults = { agent = "nope" } }"#).contains("defaults.agent"));
+        let base = r#"agents = { opencode = { harness = "opencode" } }, defaults = { agent = "opencode" },"#;
+        assert!(
+            err(r#"return { agents = { opencode = {} }, defaults = { agent = "nope" } }"#)
+                .contains("defaults.agent")
+        );
         assert!(err(r#"return { agents = { x = { harness = "aider" } } }"#).contains("harness"));
         assert!(err(r#"return { agents = { x = { enabled = true } } }"#).contains("harness"));
-        assert!(err(r#"return { tasks = { t = { on = "branch" } } }"#).contains("on ="));
-        assert!(err(r#"return { tasks = { t = { agent = "ghost" } } }"#).contains("ghost"));
-        assert!(err(r#"return { tasks = { t = { key = "s" } } }"#).contains("key"));
+        assert!(err(&format!(
+            "return {{ {base} tasks = {{ t = {{ on = \"branch\" }} }} }}"
+        ))
+        .contains("on ="));
+        assert!(err(&format!(
+            "return {{ {base} tasks = {{ t = {{ agent = \"ghost\" }} }} }}"
+        ))
+        .contains("ghost"));
+        assert!(err(&format!(
+            "return {{ {base} tasks = {{ t = {{ key = \"s\" }} }} }}"
+        ))
+        .contains("key"));
         assert!(err(
             r#"return { projects = { { name = "a", repo = "/x" }, { name = "a", repo = "/y" } } }"#
         )
@@ -934,7 +1006,7 @@ mod tests {
     #[test]
     fn warnings_not_errors() {
         let c = Config::from_lua(
-            r#"return { defualts = { mode = "build" }, agents = { codex = { sandbox = "workspace-write" } },
+            r#"return { defualts = { mode = "build" }, defaults = { agent = "codex" }, agents = { codex = { sandbox = "workspace-write" } },
                         tasks = { start = { skilz = {} } } }"#,
             "t",
         )
@@ -949,7 +1021,7 @@ mod tests {
     #[test]
     fn legacy_shapes_still_parse() {
         let c = Config::from_lua(
-            r#"return { defaults = { nvim_pane = true }, agent_args = { "--x" },
+            r#"return { defaults = { agent = "opencode", nvim_pane = true }, agent_args = { "--x" },
                         agents = { opencode = { enabled = true, args = {} } } }"#,
             "t",
         )
@@ -965,9 +1037,13 @@ mod tests {
         let c = Config::from_lua(&src, "ex").unwrap();
         assert_eq!(c.projects.len(), 1);
         assert_eq!(c.projects[0].name, "svc");
-        assert_eq!(
-            c.agent("opencode", None).unwrap().model.as_deref(),
-            Some("anthropic/claude-opus-5-5")
+        let a = c.agent("opencode", None).unwrap();
+        assert_eq!(a.harness, "opencode");
+        assert_eq!(c.defaults.agent, "opencode");
+        assert!(
+            c.warnings.iter().all(|w| !w.contains("no agent")),
+            "{:?}",
+            c.warnings
         );
     }
 

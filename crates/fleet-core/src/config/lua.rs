@@ -241,9 +241,9 @@ mod tests {
     #[test]
     fn shipped_tree_evaluates() {
         let v = eval(&Tree::Embedded(super::super::shipped::FILES), "mod.lua").unwrap();
-        assert_eq!(v["defaults"]["agent"], "opencode");
+        assert!(v["defaults"]["agent"].is_null());
         assert!(v["defaults"]["system"].as_str().unwrap().contains("{slug}"));
-        assert_eq!(v["agents"]["opencode"]["harness"], "opencode");
+        assert!(v["agents"].as_object().unwrap().is_empty());
         assert!(v["tasks"]["review"]["instructions"]
             .as_str()
             .unwrap()

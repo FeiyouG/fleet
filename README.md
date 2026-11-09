@@ -27,15 +27,57 @@ It also starts work: one command creates branch + worktree + tmux session + agen
 
 ## Install
 
-Requires Rust (stable), `tmux`, `git`, `opencode`, and `glab` / `gh` logged in for the forges you use.
+Requires Rust (stable), `tmux`, `git`, at least one coding agent CLI (`opencode`, `claude` or
+`codex`), and `glab` / `gh` logged in for the forges you use.
 
 ```bash
-cargo install --path crates/fleet --locked
-cd ~/Projects/my-repo && fleet config --init   # writes ~/.config/fleet/init.lua with this repo as a project
-fleet project add ~/Projects/other-repo        # appends another project (reviews source from `origin`)
-fleet setup                                    # installs the opencode plugin that reports permission prompts
-fleet                                          # the TUI
+cargo install --git https://github.com/FeiyouG/fleet fleet --locked
 ```
+
+## Getting started
+
+fleet ships every default except two things only you know: **which agent CLI you have** and
+**which repos you work in**. Create `~/.config/fleet/init.lua` with this (keep the agents you
+actually have installed):
+
+```lua
+-- ~/.config/fleet/init.lua
+local home = os.getenv("HOME")
+
+return {
+  -- 1. Your agents: a name of your choice -> which harness it runs on, and optionally a model
+  --    in that harness's own naming. Define at least one.
+  agents = {
+    opencode = { harness = "opencode" },              -- e.g. model = "anthropic/claude-opus-5-5"
+    -- claude = { harness = "claude" },               -- if you use Claude Code; e.g. model = "opus"
+    -- codex  = { harness = "codex" },                -- if you use Codex;       e.g. model = "gpt-5.4"
+  },
+
+  -- 2. Which agent new tasks use (one of the names above) and the mode they start in.
+  defaults = { agent = "opencode", mode = "plan" },   -- plan (read-only) | build | yolo (no prompts)
+
+  -- 3. Your repos. `fleet project add <path>` appends one for you (reviews from `origin`).
+  projects = {
+    { name = "my-repo",
+      repo = home .. "/Projects/my-repo",
+      worktrees = home .. "/Projects/my-repo-worktrees",  -- where fleet puts new task worktrees
+      reviews = "github:owner/my-repo",                   -- or "gitlab:group/project"; omit = no reviews
+      base = "main" },
+  },
+}
+```
+
+Then:
+
+```bash
+fleet config --check   # validates it: fatal problems stop fleet, warnings are listed
+fleet setup            # installs the hook/plugin for each agent you defined (permission prompts)
+fleet                  # the TUI; Space opens the menu for the selected row, Space t the tasks
+```
+
+`fleet config --init` writes this file for you with the current repo as the first project.
+Everything else — tasks, keys, prompts, modes — has a shipped default you can see with
+`fleet config --default` and override piece by piece (next section).
 
 ### Config: `~/.config/fleet/init.lua`
 

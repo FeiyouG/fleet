@@ -149,7 +149,11 @@ mod tests {
 
     #[test]
     fn system_layout_for_start_and_review() {
-        let cfg = Config::default();
+        let cfg = Config::from_lua(
+            r#"return { agents = { opencode = { harness = "opencode" } }, defaults = { agent = "opencode" } }"#,
+            "t",
+        )
+        .unwrap();
         let start = cfg.task("start", None).unwrap();
         let mut f = facts();
         f.slug = "wip-ab12".into();

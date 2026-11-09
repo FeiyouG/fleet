@@ -21,9 +21,11 @@ pub fn check(cfg: &Config) -> Issues {
     let mut i = Issues::default();
     let known = crate::agents::KNOWN;
 
+    // No agents / no default agent: fleet still opens (you can add projects and look around),
+    // but nothing can be started. Starting a task says exactly what to add.
     if cfg.agents.is_empty() {
-        i.fatal.push(format!(
-            "`agents` is empty: define at least one, e.g. agents = {{ opencode = {{ harness = \"opencode\" }} }} (harnesses: {})",
+        i.warnings.push(format!(
+            "no agent configured: add agents = {{ opencode = {{ harness = \"opencode\" }} }} and defaults = {{ agent = \"opencode\" }} to init.lua (harnesses: {}; see README › Getting started)",
             known.join(", ")
         ));
     }
@@ -75,7 +77,14 @@ pub fn check(cfg: &Config) -> Issues {
             )),
         }
     };
-    if let Some(e) = check_default_agent("defaults.agent", &cfg.defaults, None) {
+    if cfg.defaults.agent.is_empty() {
+        if !cfg.agents.is_empty() {
+            i.fatal.push(format!(
+                "defaults.agent is not set; pick one of your agents: defaults = {{ agent = \"{}\" }}",
+                cfg.agents.keys().next().unwrap()
+            ));
+        }
+    } else if let Some(e) = check_default_agent("defaults.agent", &cfg.defaults, None) {
         i.fatal.push(e);
     }
     if crate::agents::Mode::parse(&cfg.defaults.mode).is_none() {
@@ -83,11 +92,13 @@ pub fn check(cfg: &Config) -> Issues {
             .push("defaults.mode is empty; use plan, build, yolo or a harness mode name".into());
     }
     for p in &cfg.projects {
-        if let Some(e) = check_default_agent(
-            &format!("projects.{}.defaults.agent", p.name),
-            &cfg.defaults_for(Some(p)),
-            Some(p),
-        ) {
+        let d = cfg.defaults_for(Some(p));
+        if d.agent.is_empty() {
+            continue;
+        }
+        if let Some(e) =
+            check_default_agent(&format!("projects.{}.defaults.agent", p.name), &d, Some(p))
+        {
             i.fatal.push(e);
         }
     }
@@ -120,6 +131,9 @@ pub fn check(cfg: &Config) -> Issues {
         let mut by_key: BTreeMap<String, String> = BTreeMap::new();
         for (name, r) in cfg.tasks_for(scope) {
             match r {
+                Err(e) if cfg.agents.is_empty() => {
+                    let _ = (name, e); // already one warning for the whole config
+                }
                 Err(e) => i.fatal.push(format!("tasks.{name}{where_}: {e:#}")),
                 Ok(t) => {
                     debug_assert!(matches!(t.on, On::Project | On::Review));

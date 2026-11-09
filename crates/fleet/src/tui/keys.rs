@@ -456,30 +456,35 @@ impl Keymap {
             }
         }
 
+        // Tasks are listed from their definitions (key, label); one that cannot start on this
+        // config (no agent yet, unknown agent) stays in the menu greyed with the reason.
         let mut tasks: Vec<(Key, String, String, Option<String>)> = vec![];
         for (name, r) in cfg.tasks_for(project) {
-            match r {
-                Ok(t) => {
-                    if !t.enabled {
-                        continue;
-                    }
-                    let Some(k) = t.key.as_deref().and_then(Key::parse) else {
-                        continue;
-                    };
-                    if let Some((_, other, _, _)) = tasks.iter().find(|(kk, _, _, _)| *kk == k) {
-                        errors.push(format!(
-                            "[tasks] `{other}` and `{name}` both use key {}",
-                            k.display()
-                        ));
-                        continue;
-                    }
-                    tasks.push((k, name, t.label.clone(), None));
-                }
-                Err(e) => {
-                    // Shown greyed in the menu under an auto key? No key known: list in errors.
-                    errors.push(format!("[tasks] {name}: {e:#}"));
-                }
+            let Some((key_s, label, enabled)) = cfg.task_key_label(&name, project) else {
+                continue;
+            };
+            if !enabled {
+                continue;
             }
+            let Some(k) = key_s.as_deref().and_then(Key::parse) else {
+                continue;
+            };
+            if let Some((_, other, _, _)) = tasks.iter().find(|(kk, _, _, _)| *kk == k) {
+                errors.push(format!(
+                    "[tasks] `{other}` and `{name}` both use key {}",
+                    k.display()
+                ));
+                continue;
+            }
+            let disabled = r.err().map(|e| {
+                let m = format!("{e:#}");
+                m.lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(':')
+                    .to_string()
+            });
+            tasks.push((k, name, label, disabled));
         }
 
         let extra = vec![
@@ -706,9 +711,17 @@ mod tests {
         Key::parse(s).unwrap()
     }
 
+    fn with_agent(extra: &str) -> Config {
+        Config::from_lua(
+            &format!(r#"return {{ agents = {{ opencode = {{ harness = "opencode" }} }}, defaults = {{ agent = "opencode" }}, {extra} }}"#),
+            "t",
+        )
+        .unwrap()
+    }
+
     #[test]
     fn shipped_layout_resolves() {
-        let cfg = Config::default();
+        let cfg = with_agent("");
         let km = Keymap::from_config(&cfg, None);
         assert!(km.overrides_errors.is_empty(), "{:?}", km.overrides_errors);
         // global chords
@@ -793,15 +806,11 @@ mod tests {
 
     #[test]
     fn overrides_and_project_tasks() {
-        let cfg = Config::from_lua(
-            r#"return {
-                keys = { ["agent.stop"] = "K", ["tab.reviews"] = "C-r" },
+        let cfg = with_agent(
+            r#"keys = { ["agent.stop"] = "K", ["tab.reviews"] = "C-r" },
                 tasks = { bugfix = { key = "b" } },
-                projects = { { name = "p", repo = "/r", tasks = { release = { key = "R" } }, keys = { leader = "," } } },
-            }"#,
-            "t",
-        )
-        .unwrap();
+                projects = { { name = "p", repo = "/r", tasks = { release = { key = "R" } }, keys = { leader = "," } } }"#,
+        );
         let km = Keymap::from_config(&cfg, None);
         assert!(km.overrides_errors.is_empty(), "{:?}", km.overrides_errors);
         // an uppercase single key is still "plain" and stays under the leader
@@ -836,12 +845,13 @@ mod tests {
     #[test]
     fn clashes_are_reported() {
         let cfg = Config::from_lua(
-            r#"return { keys = { ["agent.attach"] = "s" }, tasks = { b1 = { key = "b" }, b2 = { key = "b" } } }"#,
+            r#"return { agents = { opencode = { harness = "opencode" } }, defaults = { agent = "opencode" },
+                        keys = { ["agent.attach"] = "s" }, tasks = { b1 = { key = "b" }, b2 = { key = "b" } } }"#,
             "t",
         );
         // two tasks on one key is fatal at config load
         assert!(cfg.is_err());
-        let cfg = Config::from_lua(r#"return { keys = { ["agent.attach"] = "s" } }"#, "t").unwrap();
+        let cfg = with_agent(r#"keys = { ["agent.attach"] = "s" }"#);
         let km = Keymap::from_config(&cfg, None);
         assert!(
             km.overrides_errors

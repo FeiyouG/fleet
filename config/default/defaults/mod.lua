@@ -1,5 +1,5 @@
 return {
-  agent = "opencode",               -- the agent (see agents/) new tasks use unless the task or project says otherwise
+  agent = nil,                      -- REQUIRED in your init.lua: the agent (agents.<name>) new tasks use
   mode = "plan",                    -- plan (read-only) | build (edits; the harness asks before risky steps) | yolo (no prompts)
   left_pane = nil,                  -- command typed into the LEFT shell pane of a new task; nil = bare shell
   notify = true,                    -- macOS banner when an agent starts waiting for you / fails / is ready
