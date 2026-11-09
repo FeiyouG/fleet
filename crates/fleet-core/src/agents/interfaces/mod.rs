@@ -23,8 +23,11 @@ use std::path::{Path, PathBuf};
 pub enum Mode {
     /// Read-only: plan / ask before changing anything.
     Plan,
-    /// May edit files and run commands (its own permission prompts still apply).
+    /// May edit files and run commands; the harness still asks before risky steps.
     Build,
+    /// "You only live once": no confirmation prompts at all, full access. Each harness maps
+    /// it to its own switch (claude `bypassPermissions`, codex `danger-full-access`).
+    Yolo,
     /// Another mode the adapter itself offers (opencode: any primary agent).
     Custom(String),
 }
@@ -35,6 +38,7 @@ impl Mode {
             "" => None,
             "plan" => Some(Mode::Plan),
             "build" => Some(Mode::Build),
+            "yolo" => Some(Mode::Yolo),
             other => Some(Mode::Custom(other.to_string())),
         }
     }
@@ -42,9 +46,12 @@ impl Mode {
         match self {
             Mode::Plan => "plan",
             Mode::Build => "build",
+            Mode::Yolo => "yolo",
             Mode::Custom(s) => s,
         }
     }
+    /// The three modes every harness has.
+    pub const STANDARD: [Mode; 3] = [Mode::Plan, Mode::Build, Mode::Yolo];
 }
 
 /// What `launch` needs to build the command line that goes into the tmux pane.
@@ -55,9 +62,19 @@ pub struct LaunchSpec {
     /// Model in the adapter's own naming (opencode `provider/model`, claude `opus`, …).
     /// `None` = the adapter's configured `model`, else the CLI's own default.
     pub model: Option<String>,
+    /// fleet's system text (see `cmd::prompt::system`). Harnesses with a system channel
+    /// (claude `--append-system-prompt`) send it there; the others prepend it to `prompt`.
+    pub system: String,
     pub prompt: String,
     /// A free loopback port the adapter may use if it has an HTTP API (opencode `--port`).
     pub port: u16,
+}
+
+impl LaunchSpec {
+    /// System text + prompt as one message, for harnesses without a system channel.
+    pub fn combined(&self) -> String {
+        crate::cmd::prompt::combined(&self.system, &self.prompt)
+    }
 }
 
 /// How long an adapter's discovered [`Choices`] stay fresh (new credentials or a new agent
@@ -86,7 +103,7 @@ impl Choices {
     /// fleet's two modes and no model list: what an adapter offers when its CLI can't say more.
     pub fn plan_build() -> Self {
         Self {
-            agents: [Mode::Plan, Mode::Build]
+            agents: Mode::STANDARD
                 .iter()
                 .map(|m| AgentChoice {
                     name: m.as_str().into(),
@@ -236,6 +253,17 @@ pub trait AgentAdapter: Send + Sync {
     /// What `fleet setup` installs so this adapter reports permission prompts.
     fn hook_install(&self) -> Option<HookInstall>;
 
+    /// Folders this harness scans for skills (`<dir>/<name>/SKILL.md`). The first is where
+    /// fleet links skills that live elsewhere.
+    fn skill_dirs(&self) -> Vec<PathBuf>;
+
+    /// Make `skill` (an absolute `SKILL.md` path) loadable by this harness and return the
+    /// name the agent will use for it: when its folder is not already under one of
+    /// `skill_dirs()`, link that folder into the first one (idempotent).
+    fn prepare_skill(&self, skill: &Path) -> Result<String> {
+        prepare_skill_in(&self.skill_dirs(), skill)
+    }
+
     /// Does this process name belong to the adapter?
     fn owns_process(&self, name: &str) -> bool {
         self.process_names().contains(&name)
@@ -243,24 +271,21 @@ pub trait AgentAdapter: Send + Sync {
 }
 
 /// Build the enabled adapters from config.
-pub fn adapters(
-    cfg: &crate::config::AgentsConfig,
-    legacy_args: &[String],
-) -> Vec<Box<dyn AgentAdapter>> {
-    cfg.enabled()
-        .into_iter()
-        .filter_map(|n| {
-            let mut c: AgentConfig = cfg.get(n);
-            if n == "opencode" && c.args.is_empty() {
-                c.args = legacy_args.to_vec();
-            }
-            adapter_for(n, c)
-        })
+/// One adapter per distinct harness among the enabled agents. Discovery is per harness (two
+/// agents on the same harness would otherwise list every process twice); launches carry the
+/// chosen agent's own bin/args/model in the `LaunchSpec`.
+pub fn adapters(cfg: &crate::config::Config) -> Vec<Box<dyn AgentAdapter>> {
+    let mut seen = std::collections::BTreeSet::new();
+    cfg.enabled_agents()
+        .iter()
+        .filter(|a| seen.insert(a.harness.clone()))
+        .filter_map(|a| adapter_for(&a.harness, AgentConfig::from(a)))
         .collect()
 }
 
-pub fn adapter_for(name: &str, cfg: AgentConfig) -> Option<Box<dyn AgentAdapter>> {
-    match name {
+/// The adapter for one harness, configured with one agent's settings.
+pub fn adapter_for(harness: &str, cfg: AgentConfig) -> Option<Box<dyn AgentAdapter>> {
+    match harness {
         "opencode" => Some(Box::new(opencode::OpenCode::new(cfg))),
         "claude" => Some(Box::new(claude::Claude::new(cfg))),
         "codex" => Some(Box::new(codex::Codex::new(cfg))),
@@ -269,6 +294,34 @@ pub fn adapter_for(name: &str, cfg: AgentConfig) -> Option<Box<dyn AgentAdapter>
 }
 
 pub const KNOWN: &[&str] = &["opencode", "claude", "codex"];
+
+/// Shared implementation of [`AgentAdapter::prepare_skill`].
+pub fn prepare_skill_in(dirs: &[PathBuf], skill: &Path) -> Result<String> {
+    let name = crate::config::validate::skill_name(skill);
+    let folder = skill
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("skill {} has no folder", skill.display()))?;
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let folder_c = canon(folder);
+    if dirs.iter().any(|d| folder_c.starts_with(canon(d))) {
+        return Ok(name);
+    }
+    let Some(target_dir) = dirs.first() else {
+        return Ok(name);
+    };
+    std::fs::create_dir_all(target_dir)?;
+    let link = target_dir.join(&name);
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.file_type().is_symlink() && canon(&link) == folder_c => {}
+        Ok(_) => bail!(
+            "{} exists and is not a link to {}: rename the skill or remove it",
+            link.display(),
+            folder.display()
+        ),
+        Err(_) => std::os::unix::fs::symlink(&folder_c, &link)?,
+    }
+    Ok(name)
+}
 
 /// Shared helper: shell-quote a command line.
 pub fn shell_line(parts: Vec<String>) -> String {

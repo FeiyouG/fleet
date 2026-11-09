@@ -107,9 +107,16 @@ impl AgentAdapter for Claude {
 
     fn launch(&self, spec: &LaunchSpec) -> String {
         let mut parts = vec![self.bin()];
-        // Only `build` may edit; anything else (choices rejects other names) stays read-only.
-        if spec.mode != Mode::Build {
-            parts.extend(["--permission-mode".to_string(), "plan".to_string()]);
+        // fleet mode -> Claude permission mode. Anything not build/yolo stays read-only
+        // (choices rejects other names anyway).
+        let permission = match spec.mode {
+            Mode::Build => "acceptEdits",
+            Mode::Yolo => "bypassPermissions",
+            Mode::Plan | Mode::Custom(_) => "plan",
+        };
+        parts.extend(["--permission-mode".to_string(), permission.to_string()]);
+        if !spec.system.trim().is_empty() {
+            parts.extend(["--append-system-prompt".to_string(), spec.system.clone()]);
         }
         if let Some(m) = spec.model.as_ref().or(self.cfg.model.as_ref()) {
             parts.extend(["--model".to_string(), m.clone()]);
@@ -118,6 +125,10 @@ impl AgentAdapter for Claude {
         parts.push("--".into());
         parts.push(spec.prompt.clone());
         shell_line(parts)
+    }
+
+    fn skill_dirs(&self) -> Vec<PathBuf> {
+        vec![crate::config::home().join(".claude").join("skills")]
     }
 
     async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
@@ -152,6 +163,7 @@ mod tests {
             cwd: "/w".into(),
             mode: Mode::Plan,
             model: None,
+            system: String::new(),
             prompt: "do \"it\"".into(),
             port: 0,
         });
@@ -163,9 +175,25 @@ mod tests {
             cwd: "/w".into(),
             mode: Mode::Build,
             model: Some("sonnet".into()),
+            system: String::new(),
             prompt: "x".into(),
             port: 0,
         });
-        assert_eq!(s, "claude --model sonnet -- x");
+        assert_eq!(
+            s,
+            "claude --permission-mode acceptEdits --model sonnet -- x"
+        );
+        let s = c.launch(&LaunchSpec {
+            cwd: "/w".into(),
+            mode: Mode::Yolo,
+            model: None,
+            system: String::new(),
+            prompt: "x".into(),
+            port: 0,
+        });
+        assert!(
+            s.starts_with("claude --permission-mode bypassPermissions"),
+            "{s}"
+        );
     }
 }

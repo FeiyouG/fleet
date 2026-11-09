@@ -99,6 +99,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentAdapter for Stub {
+        fn skill_dirs(&self) -> Vec<std::path::PathBuf> {
+            vec![]
+        }
         fn name(&self) -> &'static str {
             "stub"
         }

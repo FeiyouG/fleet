@@ -144,30 +144,31 @@ impl AgentAdapter for Codex {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> String {
-        // Only `build` may write; anything else (choices rejects other names) is read-only.
-        let sandbox = match spec.mode {
-            Mode::Plan | Mode::Custom(_) => "read-only".to_string(),
-            Mode::Build => self
-                .cfg
-                .sandbox
-                .clone()
-                .unwrap_or_else(|| "workspace-write".into()),
+        // fleet mode -> Codex sandbox + approval policy. Anything not build/yolo is read-only.
+        let (sandbox, approval) = match spec.mode {
+            Mode::Build => ("workspace-write", "on-request"),
+            Mode::Yolo => ("danger-full-access", "never"),
+            Mode::Plan | Mode::Custom(_) => ("read-only", "on-request"),
         };
         let mut parts = vec![
             self.bin(),
             "--cd".into(),
             spec.cwd.to_string_lossy().into_owned(),
             "--ask-for-approval".into(),
-            "on-request".into(),
+            approval.into(),
             "--sandbox".into(),
-            sandbox,
+            sandbox.into(),
         ];
         if let Some(m) = spec.model.as_ref().or(self.cfg.model.as_ref()) {
             parts.extend(["--model".to_string(), m.clone()]);
         }
         parts.extend(self.cfg.args.iter().cloned());
-        parts.push(spec.prompt.clone());
+        parts.push(spec.combined());
         shell_line(parts)
+    }
+
+    fn skill_dirs(&self) -> Vec<PathBuf> {
+        vec![crate::config::home().join(".codex").join("skills")]
     }
 
     async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
@@ -210,6 +211,7 @@ mod tests {
             cwd: "/w t".into(),
             mode: Mode::Plan,
             model: None,
+            system: String::new(),
             prompt: "hi".into(),
             port: 0,
         });
@@ -221,23 +223,37 @@ mod tests {
             cwd: "/w".into(),
             mode: Mode::Custom("reviewer".into()),
             model: Some("gpt-5.4".into()),
+            system: String::new(),
             prompt: "hi".into(),
             port: 0,
         });
         assert!(s.contains("--sandbox read-only --model gpt-5.4 hi"), "{s}");
-        let c = Codex::new(AgentConfig {
-            sandbox: Some("danger-full-access".into()),
-            ..Default::default()
+        // yolo = full access, never ask; build = workspace-write, ask on request
+        let c = Codex::new(AgentConfig::default());
+        let yolo = c.launch(&LaunchSpec {
+            cwd: "/w".into(),
+            mode: Mode::Yolo,
+            model: None,
+            system: String::new(),
+            prompt: "x".into(),
+            port: 0,
         });
-        assert!(c
-            .launch(&LaunchSpec {
-                cwd: "/w".into(),
-                mode: Mode::Build,
-                model: None,
-                prompt: "x".into(),
-                port: 0
-            })
-            .contains("--sandbox danger-full-access"));
+        assert!(
+            yolo.contains("--ask-for-approval never --sandbox danger-full-access"),
+            "{yolo}"
+        );
+        let build = c.launch(&LaunchSpec {
+            cwd: "/w".into(),
+            mode: Mode::Build,
+            model: None,
+            system: String::new(),
+            prompt: "x".into(),
+            port: 0,
+        });
+        assert!(
+            build.contains("--ask-for-approval on-request --sandbox workspace-write"),
+            "{build}"
+        );
     }
 
     #[test]

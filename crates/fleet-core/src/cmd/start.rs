@@ -17,12 +17,16 @@ pub struct StartOpts {
     pub name: Option<String>,
     pub prompt: String,
     pub repo: String,
-    /// Adapter name; `None` = `defaults.agent`.
+    /// Task preset (`tasks.<name>`); `None` = `start`.
+    pub task: Option<String>,
+    /// Agent name; `None` = the task's / defaults.agent.
     pub agent: Option<String>,
-    /// `plan` | `build` | an adapter-specific mode; `None` = `defaults.mode`.
+    /// `plan` | `build` | `yolo` | a harness mode; `None` = the task's / defaults.mode.
     pub mode: Option<String>,
-    /// Model in the adapter's naming; `None` = `agents.<name>.model`, else the CLI's default.
+    /// Model in the harness's naming; `None` = the task's / agent's, else the CLI's default.
     pub model: Option<String>,
+    /// `Some(list)` replaces the task's skills (`Some(vec![])` = none).
+    pub skills: Option<Vec<PathBuf>>,
     pub base: Option<String>,
     /// Override `defaults.left_pane` for this start: `Some(None)` = bare shell.
     pub left_pane: Option<Option<String>>,
@@ -37,19 +41,6 @@ pub struct Started {
     pub path: PathBuf,
     pub tmux_session: String,
     pub port: u16,
-}
-
-pub fn prompt_header(slug: &str, repo: &str, branch: &str, base: &str) -> String {
-    let mut h =
-        format!("Task: {slug} · Repo: {repo} · Branch: {branch} · Base: {base} · Started by fleet");
-    if slug::is_temp(slug) {
-        h.push_str(&format!(
-            "\nBefore any other step, pick a short kebab-case name for this task (e.g. fix-sfs-content-type; \
-             a leading feat-/fix-/update-/refactor-/docs-/chore-/test- becomes the branch type) and run: \
-             fleet agent rename {slug} <name>"
-        ));
-    }
-    h
 }
 
 pub fn worktree_path(_cfg: &Config, repo: &Project, slug: &str) -> PathBuf {
@@ -83,36 +74,57 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     if tmux::has_session(&slug).await {
         bail!("tmux session `{slug}` already exists");
     }
-    let agent_name = opts
-        .agent
-        .clone()
-        .unwrap_or_else(|| cfg.defaults.agent.clone());
-    let adapter = engine.agent_adapter(&agent_name).with_context(|| {
-        format!(
-            "agent `{agent_name}` is not enabled (enabled: {})",
-            engine
-                .agent_adapters()
-                .iter()
-                .map(|a| a.name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-    let mode_s = opts
-        .mode
-        .clone()
-        .unwrap_or_else(|| cfg.defaults.mode.clone());
+    let project = Some(repo);
+    let task_name = opts.task.clone().unwrap_or_else(|| "start".into());
+    let mut task = cfg.task(&task_name, project)?;
+    if task.on != crate::config::On::Project {
+        bail!("task `{task_name}` runs on a review; use `fleet task {task_name} <review-id>`");
+    }
+    if let Some(a) = &opts.agent {
+        task.agent = cfg.agent(a, project).with_context(|| {
+            format!(
+                "agent `{a}` is not defined (agents: {})",
+                cfg.agent_names(project).join(", ")
+            )
+        })?;
+        if task.model.is_none() {
+            task.model = task.agent.model.clone();
+        }
+    }
+    if !task.agent.enabled {
+        bail!("agent `{}` is disabled in config", task.agent.name);
+    }
+    if let Some(m) = &opts.mode {
+        task.mode = m.clone();
+    }
+    if let Some(m) = &opts.model {
+        task.model = Some(m.clone());
+    }
+    if let Some(sk) = &opts.skills {
+        task.skills = sk.clone();
+    }
+    let agent_name = task.agent.name.clone();
+    let adapter = engine
+        .adapter_for_agent(&task.agent)
+        .with_context(|| format!("unknown harness `{}`", task.agent.harness))?;
+    let mode_s = task.mode.clone();
     let mode = Mode::parse(&mode_s).context("empty mode")?;
-    // `None` = the adapter's configured model (`agents.<name>.model`), else its CLI's own.
-    let model = opts.model.clone();
-    let effective_model = model.clone().or_else(|| cfg.agents.get(&agent_name).model);
-    // Check mode and model against what the adapter offers in this repo. If discovery
-    // itself fails (CLI slow or missing), go ahead: the CLI reports a bad name itself.
+    let model = task.model.clone();
+    // Check mode and model against what the harness offers in this repo. If discovery itself
+    // fails (CLI slow or missing), go ahead: the CLI reports a bad name itself.
     match adapter.choices(&repo.repo).await {
-        Ok(c) => c.check(Some(mode.as_str()), effective_model.as_deref())?,
+        Ok(c) => c.check(Some(mode.as_str()), model.as_deref())?,
         Err(e) => log(&format!(
             "could not list {agent_name} modes/models ({e:#}); not checking"
         )),
+    }
+    // Skills: link into the harness's skill dir when needed; collect the names.
+    let mut skill_names = vec![];
+    for sk in &task.skills {
+        match adapter.prepare_skill(sk) {
+            Ok(n) => skill_names.push(n),
+            Err(e) => log(&format!("skill {}: {e:#}; not loaded", sk.display())),
+        }
     }
 
     log(&format!("fetch origin {base}"));
@@ -125,6 +137,16 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
     git::worktree_add_branch(&repo.repo, &path, &branch, &format!("origin/{base}")).await?;
 
     let port = free_port()?;
+    let facts = super::prompt::Facts {
+        slug: slug.clone(),
+        repo: repo.name.clone(),
+        branch: branch.clone(),
+        base: base.clone(),
+        agent: agent_name.clone(),
+        temp_slug: slug::is_temp(&slug),
+        ..Default::default()
+    };
+    let system = super::prompt::system(&task, &facts, &skill_names);
     let reg = Registry::open()?;
     reg.insert(&Task {
         slug: slug.clone(),
@@ -137,23 +159,21 @@ pub async fn start(engine: &Engine, opts: StartOpts, log: &Progress) -> Result<S
         port: Some(port),
         agent: agent_name.clone(),
         mode: Some(mode_s.clone()),
+        task: Some(task_name.clone()),
         review_source: None,
         review_id: None,
         head_sha: None,
-        first_prompt: Some(prompt.clone()),
+        first_prompt: Some(super::prompt::combined(&system, &prompt)),
         created_at: Utc::now(),
         closed_at: None,
     })?;
 
-    let full_prompt = format!(
-        "{}\n\n{prompt}",
-        prompt_header(&slug, &repo.name, &branch, &base)
-    );
     let cmd = adapter.launch(&LaunchSpec {
         cwd: path.clone(),
         mode,
         model,
-        prompt: full_prompt,
+        system,
+        prompt,
         port,
     });
 

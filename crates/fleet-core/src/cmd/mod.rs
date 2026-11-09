@@ -4,6 +4,7 @@ pub mod agent_hook;
 pub mod close;
 pub mod gc;
 pub mod project;
+pub mod prompt;
 pub mod rename;
 pub mod review;
 pub mod send;

@@ -15,8 +15,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct ReviewOpts {
     pub id_or_url: String,
-    /// Adapter name; `None` = `defaults.agent`.
+    /// Task preset (`tasks.<name>`, an `on = "review"` one); `None` = `review`.
+    pub task: Option<String>,
+    /// Agent name; `None` = the task's / defaults.agent.
     pub agent: Option<String>,
+    /// `Some(list)` replaces the task's skills.
+    pub skills: Option<Vec<std::path::PathBuf>>,
     /// Repo name; when `None`, the first repo whose source parses the id/url is used.
     pub repo: Option<String>,
     pub attach: bool,
@@ -62,19 +66,6 @@ fn resolve_repo<'a>(engine: &'a Engine, opts: &ReviewOpts) -> Result<(&'a Projec
     )
 }
 
-pub fn review_prompt(
-    display_id: &str,
-    title: &str,
-    url: &str,
-    source: &str,
-    target: &str,
-) -> String {
-    format!(
-        "Review {display_id} \"{title}\" with the review-team-mr skill. URL: {url}. Branch: {source} -> {target}. \
-         Started by fleet in a detached worktree at the review head."
-    )
-}
-
 pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<ReviewOutcome> {
     let cfg = &engine.config;
     let (repo, id) = resolve_repo(engine, &opts)?;
@@ -82,13 +73,33 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     let adapter = engine.review_adapter(&source).context("review adapter")?;
     let review = adapter.review(id).await?;
     let reg = Registry::open()?;
-    let agent_name = opts
-        .agent
-        .clone()
-        .unwrap_or_else(|| cfg.defaults.agent.clone());
+    let project = Some(repo);
+    let task_name = opts.task.clone().unwrap_or_else(|| "review".into());
+    let mut task = cfg.task(&task_name, project)?;
+    if task.on != crate::config::On::Review {
+        bail!("task `{task_name}` runs on a project, not a review; use `fleet task {task_name} --repo …`");
+    }
+    if let Some(a) = &opts.agent {
+        task.agent = cfg.agent(a, project).with_context(|| {
+            format!(
+                "agent `{a}` is not defined (agents: {})",
+                cfg.agent_names(project).join(", ")
+            )
+        })?;
+        if task.model.is_none() {
+            task.model = task.agent.model.clone();
+        }
+    }
+    if !task.agent.enabled {
+        bail!("agent `{}` is disabled in config", task.agent.name);
+    }
+    if let Some(sk) = &opts.skills {
+        task.skills = sk.clone();
+    }
+    let agent_name = task.agent.name.clone();
     let agent = engine
-        .agent_adapter(&agent_name)
-        .with_context(|| format!("agent `{agent_name}` is not enabled"))?;
+        .adapter_for_agent(&task.agent)
+        .with_context(|| format!("unknown harness `{}`", task.agent.harness))?;
 
     log(&format!("fetch origin {}", adapter.fetch_refspec(id)));
     git::fetch(&repo.repo, "origin", &adapter.fetch_refspec(id)).await?;
@@ -186,7 +197,8 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         tmux_session: slug.clone(),
         port: Some(port),
         agent: agent_name.clone(),
-        mode: Some("plan".into()),
+        mode: Some(task.mode.clone()),
+        task: Some(task_name.clone()),
         review_source: Some(source.clone()),
         review_id: Some(id),
         head_sha: Some(review.head_sha.clone()),
@@ -195,17 +207,33 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         closed_at: None,
     })?;
 
-    let prompt = review_prompt(
-        &review.display_id,
-        &review.title,
-        &review.url,
-        &review.source_branch,
-        &review.target_branch,
-    );
+    let mut skill_names = vec![];
+    for sk in &task.skills {
+        match agent.prepare_skill(sk) {
+            Ok(n) => skill_names.push(n),
+            Err(e) => log(&format!("skill {}: {e:#}; not loaded", sk.display())),
+        }
+    }
+    let facts = super::prompt::Facts {
+        slug: slug.clone(),
+        repo: repo.name.clone(),
+        branch: review.source_branch.clone(),
+        base: review.target_branch.clone(),
+        agent: agent_name.clone(),
+        review_id: review.display_id.clone(),
+        review_url: review.url.clone(),
+        review_title: review.title.clone(),
+        source_branch: review.source_branch.clone(),
+        target_branch: review.target_branch.clone(),
+        temp_slug: false,
+    };
+    let system = super::prompt::system(&task, &facts, &skill_names);
+    let prompt = super::prompt::fill(task.prompt.as_deref().unwrap_or(""), &facts);
     let cmd = agent.launch(&LaunchSpec {
         cwd: path.clone(),
-        mode: Mode::Plan,
-        model: None,
+        mode: Mode::parse(&task.mode).unwrap_or(Mode::Plan),
+        model: task.model.clone(),
+        system,
         prompt,
         port,
     });

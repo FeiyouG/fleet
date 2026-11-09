@@ -7,7 +7,7 @@ pub mod plannotator;
 
 use crate::agents::interfaces::state_file::{self, AgentState};
 use crate::agents::interfaces::{
-    shell_line, AgentAdapter, Choices, DiscoverCtx, HookInstall, LaunchSpec, SendMsg,
+    shell_line, AgentAdapter, Choices, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg,
 };
 use crate::config::AgentConfig;
 use crate::model::{Activity, AgentRow};
@@ -225,7 +225,11 @@ impl AgentAdapter for OpenCode {
             "--port".into(),
             spec.port.to_string(),
             "--agent".into(),
-            spec.mode.as_str().into(),
+            // opencode has no permission layer of its own: yolo is build.
+            match spec.mode {
+                Mode::Yolo => "build".to_string(),
+                ref m => m.as_str().to_string(),
+            },
         ];
         if let Some(m) = spec.model.as_ref().or(self.cfg.model.as_ref()) {
             parts.push("--model".into());
@@ -233,8 +237,17 @@ impl AgentAdapter for OpenCode {
         }
         parts.extend(self.cfg.args.iter().cloned());
         parts.push("--prompt".into());
-        parts.push(spec.prompt.clone());
+        parts.push(spec.combined());
         shell_line(parts)
+    }
+
+    fn skill_dirs(&self) -> Vec<PathBuf> {
+        vec![
+            crate::config::xdg_config_home()
+                .join("opencode")
+                .join("skills"),
+            crate::config::home().join(".agents").join("skills"),
+        ]
     }
 
     /// Through the fleet plugin's control endpoint when the process has one (plain and
@@ -367,6 +380,7 @@ mod tests {
             cwd: "/w".into(),
             mode: Mode::Plan,
             model: None,
+            system: String::new(),
             prompt: "Fix the \"thing\"\n\nwith newlines".into(),
             port: 4096,
         };

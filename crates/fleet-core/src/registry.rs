@@ -21,6 +21,8 @@ pub struct Task {
     /// Adapter that was launched (`opencode`, `claude`, `codex`).
     pub agent: String,
     pub mode: Option<String>,
+    /// The task preset (`tasks.<name>`) it was started with.
+    pub task: Option<String>,
     pub review_source: Option<String>,
     pub review_id: Option<u64>,
     pub head_sha: Option<String>,
@@ -54,6 +56,7 @@ impl Registry {
                 port integer,
                 agent text not null default 'opencode',
                 mode text,
+                task text,
                 review_source text,
                 review_id integer,
                 head_sha text,
@@ -72,14 +75,22 @@ impl Registry {
                 "alter table task add column agent text not null default 'opencode';",
             )?;
         }
+        // v0.4: `task` column (the preset a task was started with).
+        let has_task: bool = conn
+            .prepare("select count(*) from pragma_table_info('task') where name = 'task'")?
+            .query_row([], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)?;
+        if !has_task {
+            conn.execute_batch("alter table task add column task text;")?;
+        }
         Ok(Self { conn })
     }
 
     pub fn insert(&self, t: &Task) -> Result<()> {
         self.conn.execute(
             "insert or replace into task (slug, kind, repo, branch, path, old_paths, tmux_session, port, agent, mode, \
-             review_source, review_id, head_sha, first_prompt, created_at, closed_at) \
-             values (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             review_source, review_id, head_sha, first_prompt, created_at, closed_at, task) \
+             values (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 t.slug,
                 t.kind,
@@ -97,6 +108,7 @@ impl Registry {
                 t.first_prompt,
                 t.created_at.timestamp_millis(),
                 t.closed_at.map(|d| d.timestamp_millis()),
+                t.task,
             ],
         )?;
         Ok(())
@@ -105,7 +117,7 @@ impl Registry {
     pub fn open_tasks(&self) -> Result<Vec<Task>> {
         let mut st = self.conn.prepare(
             "select slug, kind, repo, branch, path, old_paths, tmux_session, port, mode, review_source, \
-             review_id, head_sha, first_prompt, created_at, closed_at, agent from task where closed_at is null",
+             review_id, head_sha, first_prompt, created_at, closed_at, agent, task from task where closed_at is null",
         )?;
         let rows = st.query_map([], |r| {
             Ok(Task {
@@ -137,6 +149,7 @@ impl Registry {
                 agent: r
                     .get::<_, Option<String>>(15)?
                     .unwrap_or_else(|| "opencode".into()),
+                task: r.get(16)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -242,6 +255,7 @@ mod tests {
             port: Some(4096),
             agent: "opencode".into(),
             mode: Some("plan".into()),
+            task: None,
             review_source: None,
             review_id: None,
             head_sha: None,
