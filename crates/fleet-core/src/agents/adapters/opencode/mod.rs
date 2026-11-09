@@ -5,8 +5,10 @@ pub mod db;
 pub mod http;
 pub mod plannotator;
 
-use super::state_file::{self, AgentState};
-use super::{shell_line, AgentAdapter, Choices, DiscoverCtx, HookInstall, LaunchSpec, SendMsg};
+use crate::agents::interfaces::state_file::{self, AgentState};
+use crate::agents::interfaces::{
+    shell_line, AgentAdapter, Choices, DiscoverCtx, HookInstall, LaunchSpec, SendMsg,
+};
 use crate::config::AgentConfig;
 use crate::model::{Activity, AgentRow};
 use crate::procs::{canon, ProcTable};
@@ -248,7 +250,7 @@ impl AgentAdapter for OpenCode {
                  run `fleet setup` and restart the agent"
             );
         }
-        super::send_via_tmux(agent, &msg.text).await
+        crate::agents::interfaces::send_via_tmux(agent, &msg.text).await
     }
 
     async fn choices(&self, cwd: &Path) -> Result<Choices> {

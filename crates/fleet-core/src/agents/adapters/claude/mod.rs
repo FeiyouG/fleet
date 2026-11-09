@@ -1,8 +1,10 @@
 //! Claude Code adapter. Live state via `fleet agent-hook claude` in
 //! `~/.claude/settings.json`; fallback identity from `~/.claude/projects/<slug>/*.jsonl`.
 
-use super::hooked::{self, Fallback};
-use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg};
+use super::super::hooked::{self, Fallback};
+use crate::agents::interfaces::{
+    shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg,
+};
 use crate::config::{home, AgentConfig};
 use crate::model::AgentRow;
 use crate::procs::{canon, ProcTable};
@@ -119,14 +121,14 @@ impl AgentAdapter for Claude {
     }
 
     async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
-        super::reject_override("claude", msg)?;
-        super::send_via_tmux(agent, &msg.text).await
+        crate::agents::interfaces::reject_override("claude", msg)?;
+        crate::agents::interfaces::send_via_tmux(agent, &msg.text).await
     }
 
     fn hook_install(&self) -> Option<HookInstall> {
         Some(HookInstall::JsonHooks {
             path: settings_path(),
-            events: super::hooks::EVENTS,
+            events: crate::agents::interfaces::hooks::EVENTS,
             command: "fleet agent-hook claude".into(),
         })
     }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const PLUGIN_SOURCE: &str = include_str!("../../assets/fleet.ts");
+pub const PLUGIN_SOURCE: &str = include_str!("../../../assets/fleet.ts");
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pending {

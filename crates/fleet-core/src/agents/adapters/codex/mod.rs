@@ -2,8 +2,10 @@
 //! fallback identity from `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (`session_meta.cwd`)
 //! and `~/.codex/session_index.jsonl` (thread names). Messages via `codex queue`.
 
-use super::hooked::{self, Fallback};
-use super::{shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg};
+use super::super::hooked::{self, Fallback};
+use crate::agents::interfaces::{
+    shell_line, AgentAdapter, DiscoverCtx, HookInstall, LaunchSpec, Mode, SendMsg,
+};
 use crate::config::{home, AgentConfig};
 use crate::model::AgentRow;
 use crate::procs::{canon, ProcTable};
@@ -169,7 +171,7 @@ impl AgentAdapter for Codex {
     }
 
     async fn send(&self, agent: &AgentRow, msg: &SendMsg) -> Result<()> {
-        super::reject_override("codex", msg)?;
+        crate::agents::interfaces::reject_override("codex", msg)?;
         let text = msg.text.as_str();
         if let Some(id) = &agent.session_id {
             let out = Command::new(self.bin())
@@ -185,13 +187,13 @@ impl AgentAdapter for Codex {
                 bail!("codex queue failed: {}", err.trim());
             }
         }
-        super::send_via_tmux(agent, text).await
+        crate::agents::interfaces::send_via_tmux(agent, text).await
     }
 
     fn hook_install(&self) -> Option<HookInstall> {
         Some(HookInstall::JsonHooks {
             path: hooks_path(),
-            events: super::hooks::EVENTS,
+            events: crate::agents::interfaces::hooks::EVENTS,
             command: "fleet agent-hook codex".into(),
         })
     }

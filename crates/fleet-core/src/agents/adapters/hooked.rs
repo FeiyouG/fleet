@@ -3,8 +3,8 @@
 //! visible but only as `IDLE` with whatever its own session storage reveals.
 
 use super::opencode::plannotator;
-use super::state_file::AgentState;
-use super::DiscoverCtx;
+use crate::agents::interfaces::state_file::AgentState;
+use crate::agents::interfaces::DiscoverCtx;
 use crate::model::{Activity, AgentRow};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
