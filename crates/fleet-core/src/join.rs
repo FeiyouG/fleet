@@ -20,10 +20,14 @@ pub struct Inputs<'a> {
     pub repo_sources: HashMap<String, String>,
 }
 
-/// The worktree whose path is the longest prefix of `p`.
-fn worktree_for<'a>(p: &Path, wts: &'a [WorktreeRow]) -> Option<&'a WorktreeRow> {
+/// The worktree on `machine` whose path is the longest prefix of `p`.
+fn worktree_for<'a>(
+    p: &Path,
+    machine: &Option<String>,
+    wts: &'a [WorktreeRow],
+) -> Option<&'a WorktreeRow> {
     wts.iter()
-        .filter(|w| !w.missing && p.starts_with(&w.path))
+        .filter(|w| !w.missing && w.machine == *machine && p.starts_with(&w.path))
         .max_by_key(|w| w.path.as_os_str().len())
 }
 
@@ -61,7 +65,10 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
     let agents: Vec<AgentRow> = agents
         .into_iter()
         .map(|mut a| {
-            a.pane_target = agent_pane.get(&a.pid).map(|&i| panes[i].target());
+            // A remote agent's pane target comes from its task (`<slug>:1.1` on its machine).
+            if a.machine.is_none() {
+                a.pane_target = agent_pane.get(&a.pid).map(|&i| panes[i].target());
+            }
             a
         })
         .collect();
@@ -86,7 +93,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
             .iter()
             .enumerate()
             .filter(|(_, a)| {
-                worktree_for(&a.cwd, &worktrees)
+                worktree_for(&a.cwd, &a.machine, &worktrees)
                     .map(|x| x.path == w.path)
                     .unwrap_or(false)
             })
@@ -99,7 +106,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                worktree_for(&canon(&p.cwd), &worktrees)
+                worktree_for(&canon(&p.cwd), &p.machine, &worktrees)
                     .map(|x| x.path == w.path)
                     .unwrap_or(false)
             })
@@ -206,7 +213,7 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
         .enumerate()
         .map(|(i, p)| PaneView {
             pane: p.clone(),
-            worktree: worktree_for(&canon(&p.cwd), &worktrees).cloned(),
+            worktree: worktree_for(&canon(&p.cwd), &p.machine, &worktrees).cloned(),
             agent: agents
                 .iter()
                 .find(|a| agent_pane.get(&a.pid) == Some(&i))
@@ -248,6 +255,8 @@ pub fn join(inp: Inputs<'_>) -> Fleet {
         panes: pane_views,
         worktrees: worktree_views,
         reviews: review_views,
+        machines: vec![],
+        tasks: vec![],
         warnings: vec![],
     }
 }
@@ -267,6 +276,7 @@ mod tests {
 
     fn wt(path: &str, branch: Option<&str>) -> WorktreeRow {
         WorktreeRow {
+            machine: None,
             repo: "svc".into(),
             path: path.into(),
             name: Path::new(path)
@@ -288,6 +298,7 @@ mod tests {
     }
     fn agent(pid: u32, cwd: &str, act: Activity) -> AgentRow {
         AgentRow {
+            machine: None,
             adapter: "opencode".into(),
             pid,
             cwd: cwd.into(),
@@ -321,6 +332,7 @@ mod tests {
             agent(12, "/home/me/.dotfiles", Activity::Idle),
         ];
         let panes = vec![PaneRow {
+            machine: None,
             session: "x".into(),
             window: 1,
             window_name: "w".into(),

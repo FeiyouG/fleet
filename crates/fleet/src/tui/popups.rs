@@ -36,6 +36,10 @@ pub enum PopupCmd {
         new: String,
     },
     Stop(String),
+    /// Close a task on a cloud machine (by slug).
+    CloseRemote(String),
+    /// Delete a machine (by name).
+    DeleteMachine(String),
     KillTmux(String),
     TmuxRename {
         old: String,
@@ -1441,6 +1445,7 @@ mod tests {
         let m = Popup::message(
             "t".into(),
             fleet_core::model::AgentRow {
+                machine: None,
                 adapter: "opencode".into(),
                 pid: 1,
                 cwd: "/w".into(),

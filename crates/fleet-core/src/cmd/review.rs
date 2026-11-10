@@ -23,6 +23,8 @@ pub struct ReviewOpts {
     pub skills: Option<Vec<std::path::PathBuf>>,
     /// Repo name; when `None`, the first repo whose source parses the id/url is used.
     pub repo: Option<String>,
+    /// Machine profile (`machines.<name>`); `None` = the task's / defaults.machine.
+    pub machine: Option<String>,
     pub attach: bool,
 }
 
@@ -96,10 +98,47 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     if let Some(sk) = &opts.skills {
         task.skills = sk.clone();
     }
+    if let Some(m) = &opts.machine {
+        task.machine = cfg.machine(m).with_context(|| {
+            format!(
+                "machine `{m}` is not defined (machines: {})",
+                cfg.machines.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+    }
     let agent_name = task.agent.name.clone();
     let agent = engine
         .adapter_for_agent(&task.agent)
         .with_context(|| format!("unknown harness `{}`", task.agent.harness))?;
+
+    let existing = reg.find_review(&source, id)?;
+    if let Some(t) = existing.clone().filter(|t| t.is_remote()) {
+        let old_sha = t.head_sha.clone().unwrap_or_default();
+        let text = format!(
+            "Re-review {}: new commits since {} (now at {}). Diff only what changed, verify your own threads, then plan.",
+            review.display_id,
+            &old_sha[..old_sha.len().min(8)],
+            &review.head_sha[..review.head_sha.len().min(8)]
+        );
+        let slug = t.slug.clone();
+        let r = super::remote_task::reach(cfg, t)?;
+        super::remote_task::rereview(&r, &adapter.fetch_refspec(id), &text, log).await?;
+        reg.set_head(&slug, &review.head_sha)?;
+        if opts.attach {
+            super::remote_task::attach(&r).await?;
+        }
+        return Ok(ReviewOutcome::ReReviewed {
+            slug,
+            old_sha,
+            new_sha: review.head_sha,
+        });
+    }
+    if existing.is_none() && task.machine.provider != "local" {
+        return start_remote(
+            engine, repo, &source, id, review, task, task_name, &opts, log,
+        )
+        .await;
+    }
 
     log(&format!("fetch origin {}", adapter.fetch_refspec(id)));
     git::fetch(&repo.repo, "origin", &adapter.fetch_refspec(id)).await?;
@@ -141,6 +180,7 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
             .flat_map(|r| r.agents.clone())
             .find(|a| a.cwd == crate::procs::canon(&task.path) && a.adapter == task.agent)
             .unwrap_or_else(|| crate::model::AgentRow {
+                machine: None,
                 adapter: task.agent.clone(),
                 pid: 0,
                 cwd: task.path.clone(),
@@ -205,6 +245,8 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
         first_prompt: None,
         created_at: Utc::now(),
         closed_at: None,
+        machine: task.machine.name.clone(),
+        machine_id: task.machine.name.clone(),
     })?;
 
     let mut skill_names = vec![];
@@ -249,6 +291,130 @@ pub async fn start(engine: &Engine, opts: ReviewOpts, log: &Progress) -> Result<
     tmux::select_pane(&target).await.ok();
     if opts.attach {
         tmux::attach(&slug).await?;
+    }
+    Ok(ReviewOutcome::Started { slug, path, port })
+}
+
+/// A new review on a cloud machine: machine, prepare, fetch the review head there, detached
+/// worktree, tmux, agent.
+#[allow(clippy::too_many_arguments)]
+async fn start_remote(
+    engine: &Engine,
+    repo: &Project,
+    source: &str,
+    id: u64,
+    review: crate::model::ReviewRow,
+    task: crate::config::ResolvedTask,
+    task_name: String,
+    opts: &ReviewOpts,
+    log: &Progress,
+) -> Result<ReviewOutcome> {
+    use crate::machines::{adapter_for, remote};
+    let cfg = &engine.config;
+    let forge = engine.review_adapter(source).context("review adapter")?;
+    let agent = engine
+        .adapter_for_agent(&task.agent)
+        .with_context(|| format!("unknown harness `{}`", task.agent.harness))?;
+    let slug = format!("review-{id}");
+    let reg = Registry::open()?;
+    super::start::check_unique(&reg, &slug)?;
+    let origin = git::remote_url(&repo.repo, "origin")
+        .await
+        .context("the repo has no `origin` remote to clone on the machine")?;
+    let machines = adapter_for(&task.machine)?;
+    let m = remote::acquire(&task.machine, machines.as_ref(), &slug, log).await?;
+    let on = remote::On {
+        adapter: machines.as_ref(),
+        id: m.id.clone(),
+    };
+    let layout = remote::Layout::new(&task.machine, &repo.name);
+    log(&format!(
+        "prepare {} (tmux, git, {})",
+        m.name,
+        layout.repo.display()
+    ));
+    remote::prepare(&on, &layout, &origin).await?;
+    match remote::configure_fleet(&on, &task.machine, &layout, &repo.name, &task.agent).await {
+        Ok(true) => log("agent state: published by fleet on the machine"),
+        Ok(false) => log(
+            "agent state: unknown on the laptop (no fleet on the machine, or no publish_key); build a snapshot with `fleet machine snapshot`",
+        ),
+        Err(e) => log(&format!("agent state: could not configure fleet on the machine: {e:#}")),
+    }
+    let refspec = forge.fetch_refspec(id);
+    log(&format!("fetch origin {refspec} on {}", m.name));
+    on.fetch(&layout.repo, "origin", &refspec).await?;
+    let path = layout.worktree(&slug);
+    log(&format!(
+        "worktree add --detach {} FETCH_HEAD on {}",
+        path.display(),
+        m.name
+    ));
+    on.worktree_add_detached(&layout.repo, &path, "FETCH_HEAD")
+        .await?;
+
+    let port = free_port()?;
+    reg.insert(&Task {
+        slug: slug.clone(),
+        kind: "review".into(),
+        repo: repo.name.clone(),
+        branch: None,
+        path: path.clone(),
+        old_paths: vec![],
+        tmux_session: slug.clone(),
+        port: Some(port),
+        agent: task.agent.name.clone(),
+        mode: Some(task.mode.clone()),
+        task: Some(task_name),
+        review_source: Some(source.to_string()),
+        review_id: Some(id),
+        head_sha: Some(review.head_sha.clone()),
+        first_prompt: None,
+        created_at: Utc::now(),
+        closed_at: None,
+        machine: task.machine.name.clone(),
+        machine_id: m.id.clone(),
+    })?;
+    let skill_names: Vec<String> = task
+        .skills
+        .iter()
+        .map(|s| crate::config::validate::skill_name(s))
+        .collect();
+    let facts = super::prompt::Facts {
+        slug: slug.clone(),
+        repo: repo.name.clone(),
+        branch: review.source_branch.clone(),
+        base: review.target_branch.clone(),
+        agent: task.agent.name.clone(),
+        review_id: review.display_id.clone(),
+        review_url: review.url.clone(),
+        review_title: review.title.clone(),
+        source_branch: review.source_branch.clone(),
+        target_branch: review.target_branch.clone(),
+        temp_slug: false,
+    };
+    let system = super::prompt::system(&task, &facts, &skill_names);
+    let prompt = super::prompt::fill(task.prompt.as_deref().unwrap_or(""), &facts);
+    let cmd = agent.launch(&LaunchSpec {
+        cwd: path.clone(),
+        mode: Mode::parse(&task.mode).unwrap_or(Mode::Plan),
+        model: task.model.clone(),
+        system,
+        prompt,
+        port,
+    });
+    super::start::launch_remote(
+        &on,
+        &m.name,
+        &slug,
+        &path,
+        &cmd,
+        cfg.defaults.left_pane.as_deref(),
+        log,
+    )
+    .await?;
+    if opts.attach {
+        super::start::attach_remote(&on, &slug).await?;
     }
     Ok(ReviewOutcome::Started { slug, path, port })
 }

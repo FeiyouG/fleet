@@ -33,6 +33,9 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentDef>,
     /// Tasks by name.
     pub tasks: BTreeMap<String, TaskDef>,
+    /// Machine profiles by the user's name for them (`laptop`, `ibx`).
+    #[serde(default)]
+    pub machines: BTreeMap<String, MachineDef>,
     /// action -> key (see `config/default/keys/mod.lua`).
     pub keys: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "lua_project_list")]
@@ -51,6 +54,10 @@ pub struct Defaults {
     /// user's file must set it (a missing or unknown value is a warning until a task starts).
     #[serde(default)]
     pub agent: String,
+    /// The machine profile (`machines.<name>`) new tasks run on unless the task or project
+    /// says otherwise. Shipped: `laptop`.
+    #[serde(default = "default_machine")]
+    pub machine: String,
     /// `plan` | `build` | `yolo`, or a harness-specific mode (an opencode agent name).
     pub mode: String,
     /// Command typed into the LEFT (shell) pane of a new task; `None` = bare shell.
@@ -71,6 +78,7 @@ pub struct Defaults {
 #[serde(default)]
 pub struct DefaultsPatch {
     pub agent: Option<String>,
+    pub machine: Option<String>,
     pub mode: Option<String>,
     #[serde(deserialize_with = "left_pane_compat", alias = "nvim_pane")]
     pub left_pane: Option<String>,
@@ -116,6 +124,8 @@ pub struct TaskDef {
     pub on: Option<String>,
     pub enabled: Option<bool>,
     pub agent: Option<String>,
+    /// Machine profile the task runs on (`machines.<name>`).
+    pub machine: Option<String>,
     pub mode: Option<String>,
     pub model: Option<String>,
     #[serde(default, deserialize_with = "lua_path_list_opt")]
@@ -237,6 +247,88 @@ impl From<&ResolvedAgent> for AgentConfig {
     }
 }
 
+/// A machine profile as written in config. Every field optional; [`Config::machine`]
+/// resolves it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineDef {
+    /// `local` | `instabox`. Required.
+    pub provider: Option<String>,
+    /// Environment variable holding the provider's API key (instabox: `INSTABOX_API_KEY`).
+    pub api_key_env: Option<String>,
+    /// Provider API base URL (instabox: `https://api.instabox.sh`).
+    pub api_url: Option<String>,
+    /// Template to create from (instabox: `agent-browser`). Ignored when `snapshot` is set.
+    pub template: Option<String>,
+    /// Snapshot to create from (instabox snapshot id or name).
+    pub snapshot: Option<String>,
+    pub size: Option<SizeDef>,
+    /// One machine per started agent (default for cloud providers). `false` = reuse a
+    /// running machine of this profile.
+    pub per_task: Option<bool>,
+    /// Pause after this many idle minutes; 0 = never. Absent = the provider's default.
+    pub idle_min: Option<u32>,
+    /// Pause after this many running minutes; -1 = unlimited. Absent = provider default.
+    pub max_run_min: Option<i64>,
+    /// Proxy secrets granted to the machine, by name.
+    #[serde(default, deserialize_with = "lua_string_list_opt")]
+    pub secrets: Option<Vec<String>>,
+    /// Direct secrets delivered as files: home-relative path -> secret name.
+    pub files: Option<BTreeMap<String, String>>,
+    /// Plain environment variables for every login shell.
+    pub env: Option<BTreeMap<String, String>>,
+    /// Where repos are cloned and worktrees created on the machine.
+    pub workdir: Option<String>,
+    /// Attach with mosh instead of ssh when the provider supports it.
+    pub mosh: Option<bool>,
+    /// Provider secret holding an API key the machine may use to publish its agents' state
+    /// (delivered as `api_key_env` inside the machine). Unset = no remote state.
+    pub publish_key: Option<String>,
+    /// Seconds between in-machine state checks while an agent works (×6 while all wait).
+    pub publish_secs: Option<u64>,
+    /// Where `fleet machine snapshot` installs fleet from (git URL) and which ref.
+    pub fleet_source: Option<String>,
+    pub fleet_ref: Option<String>,
+    /// Extra shell commands `fleet machine snapshot` runs before saving (e.g. image pulls).
+    #[serde(default, deserialize_with = "lua_string_list_opt")]
+    pub setup: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeDef {
+    pub vcpus: u32,
+    pub mem_mib: u32,
+}
+
+/// A machine profile with defaults applied: what a machine adapter is constructed with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineConfig {
+    pub name: String,
+    pub provider: String,
+    pub api_key_env: Option<String>,
+    pub api_url: Option<String>,
+    pub template: Option<String>,
+    pub snapshot: Option<String>,
+    pub size: Option<SizeDef>,
+    pub per_task: bool,
+    pub idle_min: Option<u32>,
+    pub max_run_min: Option<i64>,
+    pub secrets: Vec<String>,
+    pub files: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+    pub workdir: Option<String>,
+    pub mosh: bool,
+    pub publish_key: Option<String>,
+    pub publish_secs: u64,
+    pub fleet_source: String,
+    pub fleet_ref: String,
+    pub setup: Vec<String>,
+}
+
+fn default_machine() -> String {
+    "laptop".into()
+}
+
 /// A task with every layer applied: everything `fleet task <name>` needs.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedTask {
@@ -246,6 +338,8 @@ pub struct ResolvedTask {
     pub key: Option<String>,
     pub enabled: bool,
     pub agent: ResolvedAgent,
+    /// The machine profile the task runs on.
+    pub machine: MachineConfig,
     pub mode: String,
     pub model: Option<String>,
     /// Agent skills then task skills, deduplicated, in order.
@@ -495,6 +589,9 @@ impl Config {
             if let Some(v) = &o.agent {
                 d.agent = v.clone();
             }
+            if let Some(v) = &o.machine {
+                d.machine = v.clone();
+            }
             if let Some(v) = &o.mode {
                 d.mode = v.clone();
             }
@@ -587,6 +684,47 @@ impl Config {
             .collect()
     }
 
+    /// One machine profile with defaults applied. `None` when it is not defined or names no
+    /// provider.
+    pub fn machine(&self, name: &str) -> Option<MachineConfig> {
+        let m = self.machines.get(name)?;
+        let provider = m.provider.clone()?;
+        let cloud = provider != "local";
+        Some(MachineConfig {
+            name: name.to_string(),
+            api_key_env: m.api_key_env.clone(),
+            api_url: m.api_url.clone(),
+            template: m.template.clone(),
+            snapshot: m.snapshot.clone(),
+            size: m.size,
+            per_task: m.per_task.unwrap_or(cloud),
+            idle_min: m.idle_min,
+            max_run_min: m.max_run_min,
+            secrets: m.secrets.clone().unwrap_or_default(),
+            files: m.files.clone().unwrap_or_default(),
+            env: m.env.clone().unwrap_or_default(),
+            workdir: m.workdir.clone(),
+            mosh: m.mosh.unwrap_or(false),
+            publish_key: m.publish_key.clone(),
+            publish_secs: m.publish_secs.unwrap_or(10).max(2),
+            fleet_source: m
+                .fleet_source
+                .clone()
+                .unwrap_or_else(|| "https://github.com/FeiyouG/fleet".into()),
+            fleet_ref: m.fleet_ref.clone().unwrap_or_else(|| "main".into()),
+            setup: m.setup.clone().unwrap_or_default(),
+            provider,
+        })
+    }
+
+    /// Every resolvable machine profile, by name.
+    pub fn machine_profiles(&self) -> Vec<MachineConfig> {
+        self.machines
+            .keys()
+            .filter_map(|n| self.machine(n))
+            .collect()
+    }
+
     /// Names of every task known globally or in the project.
     pub fn task_names(&self, project: Option<&Project>) -> Vec<String> {
         let mut names: BTreeSet<String> = self.tasks.keys().cloned().collect();
@@ -628,6 +766,13 @@ impl Config {
                 }
             )
         })?;
+        let machine_name = pick(|t| t.machine.clone()).unwrap_or_else(|| d.machine.clone());
+        let machine = self.machine(&machine_name).with_context(|| {
+            format!(
+                "task `{name}`: machine `{machine_name}` is not defined (machines: {})",
+                self.machines.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
         let mut skills = agent.skills.clone();
         for s in p
             .and_then(|t| t.skills.clone())
@@ -659,6 +804,7 @@ impl Config {
             instructions: pick(|t| t.instructions.clone()),
             prompt: pick(|t| t.prompt.clone()),
             agent,
+            machine,
         })
     }
 
@@ -1001,6 +1147,59 @@ mod tests {
         .contains("twice"));
         assert!(err("return {").contains("expected"));
         assert!(err("x = 1").contains("return"));
+    }
+
+    #[test]
+    fn machine_profiles() {
+        let base = r#"agents = { opencode = { harness = "opencode" } }, defaults = { agent = "opencode" },"#;
+        // Shipped: `laptop` (local) is the default and every task runs there.
+        let c = Config::from_lua(&format!("return {{ {base} }}"), "t").unwrap();
+        assert_eq!(c.defaults.machine, "laptop");
+        let t = c.task("start", None).unwrap();
+        assert_eq!(t.machine.name, "laptop");
+        assert_eq!(t.machine.provider, "local");
+        assert!(!t.machine.per_task);
+
+        // A cloud profile merges next to `laptop`; a task picks it; per_task defaults on.
+        let c = Config::from_lua(
+            &format!(
+                r#"return {{ {base} machines = {{ ibx = {{ provider = "instabox", size = {{ vcpus = 4, mem_mib = 8192 }},
+                     secrets = {{ "GITLAB_TOKEN" }}, files = {{ ["a/auth.json"] = "AUTH" }} }} }},
+                     tasks = {{ review = {{ machine = "ibx" }} }} }}"#
+            ),
+            "t",
+        )
+        .unwrap();
+        assert!(c.machine("laptop").is_some());
+        let m = c.task("review", None).unwrap().machine;
+        assert_eq!(m.name, "ibx");
+        assert!(m.per_task);
+        assert_eq!(
+            m.size,
+            Some(SizeDef {
+                vcpus: 4,
+                mem_mib: 8192
+            })
+        );
+        assert_eq!(m.secrets, vec!["GITLAB_TOKEN"]);
+        assert_eq!(m.files["a/auth.json"], "AUTH");
+        assert_eq!(c.task("start", None).unwrap().machine.name, "laptop");
+
+        // Errors: unknown provider, missing provider, unknown default machine.
+        let err = |src: String| Config::from_lua(&src, "t").unwrap_err().to_string();
+        assert!(err(format!(
+            r#"return {{ {base} machines = {{ x = {{ provider = "e2b" }} }} }}"#
+        ))
+        .contains("unknown provider \"e2b\""));
+        assert!(
+            err(format!(r#"return {{ {base} machines = {{ x = {{}} }} }}"#))
+                .contains("machines.x: `provider` is required")
+        );
+        let e = err(
+            r#"return { agents = { opencode = { harness = "opencode" } }, defaults = { agent = "opencode", machine = "ghost" } }"#
+                .to_string(),
+        );
+        assert!(e.contains("defaults.machine"), "{e}");
     }
 
     #[test]

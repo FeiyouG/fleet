@@ -29,6 +29,18 @@ pub struct Task {
     pub first_prompt: Option<String>,
     pub created_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
+    /// The machine profile it runs on (`laptop`, `ibx`).
+    pub machine: String,
+    /// The machine's id at its provider (`laptop` locally, `box_…` on InstaBox).
+    pub machine_id: String,
+}
+
+impl Task {
+    /// Runs on a machine other than this computer. The local machine's id is its profile
+    /// name (`laptop`); a cloud machine's id is its provider id.
+    pub fn is_remote(&self) -> bool {
+        self.machine_id != self.machine
+    }
 }
 
 pub struct Registry {
@@ -83,14 +95,28 @@ impl Registry {
         if !has_task {
             conn.execute_batch("alter table task add column task text;")?;
         }
+        // v0.5: the machine a task runs on. Older rows ran on the laptop.
+        for col in ["machine", "machine_id"] {
+            let has: bool = conn
+                .prepare(&format!(
+                    "select count(*) from pragma_table_info('task') where name = '{col}'"
+                ))?
+                .query_row([], |r| r.get::<_, i64>(0))
+                .map(|n| n > 0)?;
+            if !has {
+                conn.execute_batch(&format!(
+                    "alter table task add column {col} text not null default 'laptop';"
+                ))?;
+            }
+        }
         Ok(Self { conn })
     }
 
     pub fn insert(&self, t: &Task) -> Result<()> {
         self.conn.execute(
             "insert or replace into task (slug, kind, repo, branch, path, old_paths, tmux_session, port, agent, mode, \
-             review_source, review_id, head_sha, first_prompt, created_at, closed_at, task) \
-             values (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+             review_source, review_id, head_sha, first_prompt, created_at, closed_at, task, machine, machine_id) \
+             values (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 t.slug,
                 t.kind,
@@ -109,6 +135,8 @@ impl Registry {
                 t.created_at.timestamp_millis(),
                 t.closed_at.map(|d| d.timestamp_millis()),
                 t.task,
+                t.machine,
+                t.machine_id,
             ],
         )?;
         Ok(())
@@ -117,7 +145,7 @@ impl Registry {
     pub fn open_tasks(&self) -> Result<Vec<Task>> {
         let mut st = self.conn.prepare(
             "select slug, kind, repo, branch, path, old_paths, tmux_session, port, mode, review_source, \
-             review_id, head_sha, first_prompt, created_at, closed_at, agent, task from task where closed_at is null",
+             review_id, head_sha, first_prompt, created_at, closed_at, agent, task, machine, machine_id from task where closed_at is null",
         )?;
         let rows = st.query_map([], |r| {
             Ok(Task {
@@ -150,9 +178,21 @@ impl Registry {
                     .get::<_, Option<String>>(15)?
                     .unwrap_or_else(|| "opencode".into()),
                 task: r.get(16)?,
+                machine: r.get(17)?,
+                machine_id: r.get(18)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Open tasks on this computer. Local-path logic (gc, close, discovery) uses these: a
+    /// remote task's path is a path on its machine.
+    pub fn local_tasks(&self) -> Result<Vec<Task>> {
+        Ok(self
+            .open_tasks()?
+            .into_iter()
+            .filter(|t| !t.is_remote())
+            .collect())
     }
 
     pub fn get(&self, slug: &str) -> Result<Option<Task>> {
@@ -189,7 +229,7 @@ impl Registry {
     pub fn tasks_for_path(&self, path: &Path) -> Result<Vec<Task>> {
         let want = crate::procs::canon(path);
         Ok(self
-            .open_tasks()?
+            .local_tasks()?
             .into_iter()
             .filter(|t| {
                 crate::procs::canon(&t.path) == want
@@ -262,11 +302,48 @@ mod tests {
             first_prompt: Some("do it".into()),
             created_at: Utc::now(),
             closed_at: None,
+            machine: "laptop".into(),
+            machine_id: "laptop".into(),
         })
         .unwrap();
+        // A task on a cloud machine: open, but not a local path.
+        r.insert(&Task {
+            slug: "feat-b".into(),
+            kind: "start".into(),
+            repo: "svc".into(),
+            branch: Some("feat/b".into()),
+            path: "/data/home/src/wt/feat-b".into(),
+            old_paths: vec![],
+            tmux_session: "feat-b".into(),
+            port: None,
+            agent: "opencode".into(),
+            mode: None,
+            task: None,
+            review_source: None,
+            review_id: None,
+            head_sha: None,
+            first_prompt: None,
+            created_at: Utc::now(),
+            closed_at: None,
+            machine: "ibx".into(),
+            machine_id: "box_1".into(),
+        })
+        .unwrap();
+        assert_eq!(r.open_tasks().unwrap().len(), 2);
+        let local: Vec<String> = r
+            .local_tasks()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.slug)
+            .collect();
+        assert_eq!(local, vec!["wip-abcd"]);
+        let b = r.get("feat-b").unwrap().unwrap();
+        assert!(b.is_remote());
+        assert_eq!(b.machine_id, "box_1");
         r.rename("wip-abcd", "fix-x", Some("fix/x"), Path::new("/w/fix-x"))
             .unwrap();
         let t = r.get("fix-x").unwrap().unwrap();
+        assert!(!t.is_remote());
         assert_eq!(t.tmux_session, "fix-x");
         assert_eq!(t.old_paths, vec![PathBuf::from("/w/wip-abcd")]);
         assert_eq!(t.port, Some(4096));

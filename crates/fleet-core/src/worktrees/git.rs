@@ -111,6 +111,7 @@ async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow 
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut row = WorktreeRow {
+            machine: None,
             repo: repo.name.clone(),
             is_main: path == *main_path,
             path: path.clone(),
@@ -179,6 +180,14 @@ async fn row_for(repo: &Project, main_path: &Path, e: Porcelain) -> WorktreeRow 
         }
         row
     }
+}
+
+/// The URL of `remote` (`git remote get-url`).
+pub async fn remote_url(repo: &Path, remote: &str) -> Result<String> {
+    Ok(git(repo, &["remote", "get-url", remote])
+        .await?
+        .trim()
+        .to_string())
 }
 
 pub async fn fetch(repo: &Path, remote: &str, refspec: &str) -> Result<()> {

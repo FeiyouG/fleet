@@ -1,5 +1,9 @@
 # `fleet` — a Rust TUI that tracks and launches your local coding agents (design, v1 = view + start + review + gc)
 
+> **Since 2026-11-09 behaviour and design live in OpenSpec** (`openspec/specs/**`, changes in
+> `openspec/changes/**`). This file is the history of earlier decisions and is no longer
+> appended to.
+
 **Settled, not repeated:** name = `fleet` · Rust, new repo · **ratatui + crossterm**, clap · no daemon · library boundary (`fleet-core` + `fleet` binary; `fleet serve` later) · view-only, no auto-reviewer · **macOS banner + tmux status counter** · one slug for branch + folder + tmux session, central worktrees dir with override · optional name = temp slug + agent renames itself · **collectors = three adapter families: agents (opencode), reviews (GitLab), worktrees (git)**; tmux is a small shared helper · **tabs: Overview (joined, local-first) · Tmux · Worktrees · Reviews (with a source picker)** · **several repos** in config · which-key prefix menus generated from `[keys]` · opencode todos unused · Linear later.
 
 > Correction: the previous plan file was corrupted (it contained text from an unrelated review). This is the full plan, resubmitted from line 1. Only Q1 (nouns) is still open.

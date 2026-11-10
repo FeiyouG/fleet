@@ -125,7 +125,7 @@ task_open() { [ "$(sqlite3 "$FLEET_DATA_DIR/fleet.db" "select count(*) from task
 out_has() { grep -q -- "$1" "$T/out"; }
 agent_pid() { pgrep -f "opencode --port .*$1" | head -1 || true; }
 start() {
-  f agent start "$1" -m "e2e $1" --repo demo --no-nvim --no-attach || die "start $1"
+  f agent start "$1" -m "e2e $1" --repo demo --no-left-pane --no-attach || die "start $1"
   sleep 1
   # The agent must be the stub, never a real agent from your PATH.
   local pid; pid=$(agent_pid "$1")

@@ -1,12 +1,13 @@
-//! Worktrees tab: [project section] → worktree → agents (when 2+), plus "outside projects".
+//! Worktrees tab: [project section] → worktree, plus "outside projects" (agents in no
+//! project's worktree).
 
 use super::{
-    agent_cell, branch_cell, pane_cell, render_table, review_cell, tree_label, Node, NodeData,
-    RowKey, TreeNode, OUTSIDE,
+    in_machine_scope, machine_cell, overall_cell, render_table, review_cell, state_cell,
+    state_spans, tree_label, where_cell, Node, NodeData, RowKey, TreeNode, OUTSIDE,
 };
 use crate::tui::app::{App, SortMode};
-use crate::tui::util::{self, dim, overall_style, trunc};
-use fleet_core::model::{GcVerdict, Overall, WorktreeView};
+use crate::tui::util::{self, dim, trunc};
+use fleet_core::model::{Overall, WorktreeView};
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, Row};
 
@@ -16,6 +17,7 @@ pub fn scoped(app: &App) -> Vec<&WorktreeView> {
         .fleet
         .worktrees
         .iter()
+        .filter(|w| in_machine_scope(app, w.worktree.machine.as_deref()))
         .filter(|w| {
             app.tabs
                 .project
@@ -50,34 +52,9 @@ pub fn scoped(app: &App) -> Vec<&WorktreeView> {
 }
 
 fn worktree_node(v: &WorktreeView) -> TreeNode {
-    let children = if v.agents.len() >= 2 {
-        v.agents
-            .iter()
-            .map(|a| {
-                let pane = a
-                    .pane_target
-                    .as_ref()
-                    .and_then(|t| v.panes.iter().find(|p| p.target() == *t))
-                    .cloned();
-                TreeNode::leaf(
-                    RowKey::Agent(a.pid),
-                    NodeData::Agent {
-                        agent: a.clone(),
-                        worktree: Some(v.worktree.clone()),
-                        review: v.review.clone(),
-                        pane,
-                        project: Some(v.worktree.repo.clone()),
-                    },
-                )
-            })
-            .collect()
-    } else {
-        vec![]
-    };
-    TreeNode::new(
+    TreeNode::leaf(
         RowKey::Dir(v.worktree.path.clone()),
         NodeData::Worktree(v.clone()),
-        children,
     )
 }
 
@@ -123,23 +100,26 @@ pub fn build(app: &App) -> Vec<TreeNode> {
                 .iter()
                 .filter(|r| r.worktree.is_none())
                 .flat_map(|r| {
-                    r.agents.iter().map(move |a| {
-                        let pane = a
-                            .pane_target
-                            .as_ref()
-                            .and_then(|t| r.panes.iter().find(|p| p.target() == *t))
-                            .cloned();
-                        TreeNode::leaf(
-                            RowKey::Agent(a.pid),
-                            NodeData::Agent {
-                                agent: a.clone(),
-                                worktree: None,
-                                review: None,
-                                pane,
-                                project: None,
-                            },
-                        )
-                    })
+                    r.agents
+                        .iter()
+                        .filter(|a| in_machine_scope(app, a.machine.as_deref()))
+                        .map(move |a| {
+                            let pane = a
+                                .pane_target
+                                .as_ref()
+                                .and_then(|t| r.panes.iter().find(|p| p.target() == *t))
+                                .cloned();
+                            TreeNode::leaf(
+                                RowKey::Agent(a.pid),
+                                NodeData::Agent {
+                                    agent: a.clone(),
+                                    worktree: None,
+                                    review: None,
+                                    pane,
+                                    project: None,
+                                },
+                            )
+                        })
                 })
                 .collect();
             if !outside.is_empty() {
@@ -166,9 +146,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, nodes: &[Node], selected: 
         .iter()
         .map(|n| match &n.data {
             NodeData::Project { name, summary } => Row::new(vec![
-                Cell::from(""),
                 Cell::from(Line::from(vec![
-                    Span::styled("▾ ".replace('▾', if n.unfolded { "▾" } else { "▸" }), dim()),
+                    Span::styled(if n.unfolded { "▾ " } else { "▸ " }, dim()),
                     Span::styled(
                         name.clone(),
                         Style::default()
@@ -185,60 +164,61 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, nodes: &[Node], selected: 
                 } else {
                     w.name.clone()
                 };
-                let agent = match v.agents.first() {
-                    Some(a) if v.agents.len() > 1 => Cell::from(Line::from(vec![
-                        Span::styled(format!("{:<5} ", a.mode.as_deref().unwrap_or("?")), dim()),
-                        Span::styled(
-                            format!("{} {}", a.activity.glyph(), a.activity.label()),
-                            util::activity_style(a.activity),
-                        ),
-                        Span::styled(format!(" +{}", v.agents.len() - 1), dim()),
-                    ])),
-                    Some(a) => agent_cell(a),
-                    None => Cell::from(Span::styled("—     NONE", dim())),
-                };
-                let pane_t = v
-                    .agents
-                    .first()
-                    .and_then(|a| a.pane_target.clone())
-                    .or_else(|| v.panes.first().map(|p| p.target()));
-                let attached = v.panes.iter().any(|p| p.attached);
-                let gc = match &v.gc {
-                    GcVerdict::Yes(r) => {
-                        Span::styled(format!("gc: {r}"), Style::default().fg(Color::Yellow))
+                let agents = match v.agents.first() {
+                    Some(a) => {
+                        let mut c = vec![Span::styled(
+                            format!("{:<5} ", a.mode.as_deref().unwrap_or("?")),
+                            dim(),
+                        )];
+                        c.extend(state_spans(app, a));
+                        if v.agents.len() > 1 {
+                            c.push(Span::styled(format!(" +{}", v.agents.len() - 1), dim()));
+                        }
+                        Cell::from(Line::from(c))
                     }
-                    GcVerdict::No(_) => Span::raw(""),
+                    None => Cell::from(Span::styled("—", dim())),
                 };
                 Row::new(vec![
-                    Cell::from(Span::styled(
-                        v.overall.label().to_string(),
-                        overall_style(v.overall),
-                    )),
                     Cell::from(tree_label(n, &trunc(&name, name_w))),
-                    branch_cell(w, 26),
-                    agent,
-                    pane_cell(pane_t.as_deref(), attached),
+                    Cell::from(Span::raw(trunc(
+                        w.branch.as_deref().unwrap_or("(detached)"),
+                        30,
+                    ))),
+                    Cell::from(Span::styled(w.sync_glyph(), dim())),
+                    Cell::from(if w.dirty {
+                        Span::styled("modified", Style::default().fg(Color::Yellow))
+                    } else {
+                        Span::styled("clean", dim())
+                    }),
+                    overall_cell(v.overall, &v.gc),
                     review_cell(v.review.as_ref()),
-                    Cell::from(gc),
+                    agents,
+                    machine_cell(app, w.machine.as_deref()),
                 ])
             }
             NodeData::Agent { agent, pane, .. } => Row::new(vec![
-                Cell::from(""),
                 Cell::from(tree_label(
                     n,
                     &trunc(agent.title.as_deref().unwrap_or("(no title)"), name_w),
                 )),
                 Cell::from(""),
-                agent_cell(agent),
-                pane_cell(
-                    agent.pane_target.as_deref(),
-                    pane.as_ref().map(|p| p.attached).unwrap_or(false),
-                ),
+                Cell::from(""),
                 Cell::from(Span::styled(
                     format!("{} ago", util::ago(agent.last_activity)),
                     dim(),
                 )),
+                state_cell(app, agent),
                 Cell::from(""),
+                Cell::from(Span::styled(
+                    agent.mode.as_deref().unwrap_or("?").to_string(),
+                    dim(),
+                )),
+                where_cell(
+                    app,
+                    agent.machine.as_deref(),
+                    agent.pane_target.as_deref(),
+                    pane.as_ref().map(|p| p.attached).unwrap_or(false),
+                ),
             ]),
             _ => Row::new(vec![Cell::from("")]),
         })
@@ -247,22 +227,24 @@ pub fn draw(f: &mut Frame, area: Rect, app: &mut App, nodes: &[Node], selected: 
         f,
         area,
         vec![
-            "OVERALL",
-            if show_paths { "PATH" } else { "NAME" },
+            if show_paths { "PATH" } else { "WORKTREE" },
             "BRANCH",
-            "AGENT",
-            "TMUX",
+            "SYNC",
+            "CHANGES",
+            "STATE",
             "REVIEW",
-            "",
+            "AGENTS",
+            "MACHINE",
         ],
         vec![
-            Constraint::Length(10),
-            Constraint::Length(name_w as u16),
-            Constraint::Length(34),
-            Constraint::Length(22),
-            Constraint::Length(27),
-            Constraint::Min(24),
+            Constraint::Length(name_w as u16 + 4),
+            Constraint::Length(30),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Length(16),
+            Constraint::Min(22),
+            Constraint::Length(20),
+            Constraint::Length(30),
         ],
         rows,
         selected,

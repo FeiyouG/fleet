@@ -97,6 +97,7 @@ mod tests {
 
     fn wt(ahead: u32, behind: u32, dirty: bool) -> WorktreeRow {
         WorktreeRow {
+            machine: None,
             repo: "r".into(),
             path: "/w/x".into(),
             name: "x".into(),
@@ -114,6 +115,7 @@ mod tests {
     }
     fn agent(a: Activity) -> AgentRow {
         AgentRow {
+            machine: None,
             adapter: "opencode".into(),
             pid: 1,
             cwd: "/w/x".into(),

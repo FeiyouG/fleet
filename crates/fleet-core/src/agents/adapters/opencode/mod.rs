@@ -88,6 +88,7 @@ pub fn row_from_facts(
         }
     };
     AgentRow {
+        machine: None,
         adapter: "opencode".into(),
         pid,
         cwd,

@@ -1,6 +1,9 @@
 //! Reviews tab: [project section] → review → local worktrees → agents.
 
-use super::{pane_cell, render_table, tree_label, Node, NodeData, RowKey, TreeNode};
+use super::{
+    in_machine_scope, machine_cell, render_table, state_cell, tree_label, where_cell, Node,
+    NodeData, RowKey, TreeNode,
+};
 use crate::tui::app::{App, SortMode};
 use crate::tui::util::{self, dim, review_style, trunc};
 use fleet_core::model::{ReviewStatus, ReviewView};
@@ -62,6 +65,13 @@ pub fn scoped(app: &App) -> Vec<&ReviewView> {
         .reviews
         .iter()
         .filter(|r| sources.contains(&r.review.source.as_str()))
+        // A machine scope keeps reviews with a worktree on that machine.
+        .filter(|r| {
+            matches!(app.tabs.machine, super::MachineScope::All)
+                || r.worktrees
+                    .iter()
+                    .any(|w| super::in_machine_scope(app, w.machine.as_deref()))
+        })
         .filter(|r| match preset {
             "local" => !r.worktrees.is_empty(),
             "mine" => is_me(&r.review.author),
@@ -97,60 +107,71 @@ pub fn scoped(app: &App) -> Vec<&ReviewView> {
     rows
 }
 
+/// Review → Agent (spec tui-machines). Each agent row carries its worktree, so it shows
+/// where the agent runs; a local worktree with no agent stays as a leaf (it can be closed).
 fn review_node(app: &App, v: &ReviewView) -> TreeNode {
-    let children: Vec<TreeNode> = v
-        .worktrees
+    let wt_of = |a: &fleet_core::model::AgentRow| {
+        v.worktrees
+            .iter()
+            .find(|w| w.machine == a.machine && a.cwd.starts_with(&w.path))
+    };
+    let mut children: Vec<TreeNode> = v
+        .agents
         .iter()
-        .map(|w| {
-            let view = app
-                .fleet
-                .worktrees
-                .iter()
-                .find(|x| x.worktree.path == w.path);
-            let agents: Vec<TreeNode> = v
-                .agents
-                .iter()
-                .filter(|a| a.cwd.starts_with(&w.path))
-                .map(|a| {
-                    let pane = view.and_then(|vw| {
-                        a.pane_target
-                            .as_ref()
-                            .and_then(|t| vw.panes.iter().find(|p| p.target() == *t))
-                            .cloned()
-                    });
-                    TreeNode::leaf(
-                        RowKey::Agent(a.pid),
-                        NodeData::Agent {
-                            agent: a.clone(),
-                            worktree: Some(w.clone()),
-                            review: Some(v.review.clone()),
-                            pane,
-                            project: Some(w.repo.clone()),
-                        },
-                    )
+        .filter(|a| in_machine_scope(app, a.machine.as_deref()))
+        .map(|a| {
+            let w = wt_of(a);
+            let pane = w
+                .and_then(|w| {
+                    app.fleet
+                        .worktrees
+                        .iter()
+                        .find(|x| x.worktree.path == w.path)
                 })
-                .collect();
-            match view {
-                Some(vw) => TreeNode::new(
-                    RowKey::Dir(w.path.clone()),
-                    NodeData::Worktree(vw.clone()),
-                    agents,
-                ),
-                None => TreeNode::new(
-                    RowKey::Dir(w.path.clone()),
-                    NodeData::Worktree(fleet_core::model::WorktreeView {
-                        worktree: w.clone(),
-                        overall: fleet_core::model::Overall::Dead,
-                        agents: vec![],
-                        panes: vec![],
-                        review: Some(v.review.clone()),
-                        gc: fleet_core::model::GcVerdict::No("unknown".into()),
-                    }),
-                    agents,
-                ),
-            }
+                .and_then(|vw| {
+                    a.pane_target
+                        .as_ref()
+                        .and_then(|t| vw.panes.iter().find(|p| p.target() == *t))
+                        .cloned()
+                });
+            TreeNode::leaf(
+                RowKey::Agent(a.pid),
+                NodeData::Agent {
+                    agent: a.clone(),
+                    worktree: w.cloned(),
+                    review: Some(v.review.clone()),
+                    pane,
+                    project: w.map(|w| w.repo.clone()),
+                },
+            )
         })
         .collect();
+    for w in v.worktrees.iter().filter(|w| {
+        in_machine_scope(app, w.machine.as_deref())
+            && !v
+                .agents
+                .iter()
+                .any(|a| wt_of(a).is_some_and(|x| x.path == w.path))
+    }) {
+        let view = app
+            .fleet
+            .worktrees
+            .iter()
+            .find(|x| x.worktree.path == w.path)
+            .cloned()
+            .unwrap_or_else(|| fleet_core::model::WorktreeView {
+                worktree: w.clone(),
+                overall: fleet_core::model::Overall::Dead,
+                agents: vec![],
+                panes: vec![],
+                review: Some(v.review.clone()),
+                gc: fleet_core::model::GcVerdict::No("unknown".into()),
+            });
+        children.push(TreeNode::leaf(
+            RowKey::Dir(w.path.clone()),
+            NodeData::Worktree(view),
+        ));
+    }
     TreeNode::new(
         RowKey::Review(v.review.source.clone(), v.review.id),
         NodeData::Review(v.clone()),
@@ -202,7 +223,7 @@ pub fn build(app: &App) -> Vec<TreeNode> {
     }
 }
 
-pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected: usize) {
+pub fn draw(f: &mut Frame, area: Rect, app: &mut App, nodes: &[Node], selected: usize) {
     let rows: Vec<Row> = nodes
         .iter()
         .map(|n| match &n.data {
@@ -285,7 +306,10 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
                     },
                 );
                 Row::new(vec![
-                    Cell::from(tree_label(n, &format!("{:<6}", r.display_id))),
+                    Cell::from(tree_label(
+                        n,
+                        &format!("{} {:<6}", util::icon::REVIEW, r.display_id),
+                    )),
                     Cell::from(trunc(&r.title, 44)),
                     Cell::from(author),
                     Cell::from(Span::styled(
@@ -301,12 +325,12 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
             NodeData::Worktree(v) => {
                 let w = &v.worktree;
                 Row::new(vec![
-                    Cell::from(tree_label(n, "wt")),
+                    Cell::from(tree_label(n, &format!("{} wt", util::icon::BRANCH))),
                     Cell::from(Line::from(vec![
                         Span::raw(trunc(&w.name, 24)),
                         Span::styled(
                             format!(
-                                " · {} {}{}",
+                                " · {} {}{} · no agent",
                                 w.branch.as_deref().unwrap_or("(detached)"),
                                 w.sync_glyph(),
                                 if w.dirty { " *" } else { "" }
@@ -315,46 +339,41 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
                         ),
                     ])),
                     Cell::from(""),
-                    Cell::from(Span::styled(
-                        v.overall.label().to_string(),
-                        util::overall_style(v.overall),
-                    )),
                     Cell::from(""),
                     Cell::from(""),
-                    Cell::from(Span::styled(format!("{} agents", v.agents.len()), dim())),
-                    pane_cell(
-                        v.agents.first().and_then(|a| a.pane_target.as_deref()).or(v
-                            .panes
-                            .first()
-                            .map(|p| p.target())
-                            .as_deref()),
-                        v.panes.iter().any(|p| p.attached),
-                    ),
+                    Cell::from(""),
+                    Cell::from(""),
+                    machine_cell(app, w.machine.as_deref()),
                 ])
             }
-            NodeData::Agent { agent, pane, .. } => Row::new(vec![
-                Cell::from(tree_label(n, "agent")),
+            NodeData::Agent {
+                agent,
+                worktree,
+                pane,
+                ..
+            } => Row::new(vec![
+                Cell::from(tree_label(n, agent.mode.as_deref().unwrap_or("agent"))),
                 Cell::from(Line::from(vec![
-                    Span::raw(trunc(agent.title.as_deref().unwrap_or("(no title)"), 30)),
+                    Span::raw(trunc(agent.title.as_deref().unwrap_or("(no title)"), 26)),
                     Span::styled(
-                        format!(
-                            " · {} {} {}",
-                            agent.mode.as_deref().unwrap_or("?"),
-                            agent.activity.glyph(),
-                            agent.activity.label()
-                        ),
-                        util::activity_style(agent.activity),
+                        worktree
+                            .as_ref()
+                            .map(|w| format!(" · {}", w.name))
+                            .unwrap_or_default(),
+                        dim(),
                     ),
                 ])),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
                 Cell::from(Span::styled(
                     format!("{} ago", util::ago(agent.last_activity)),
                     dim(),
                 )),
-                pane_cell(
+                state_cell(app, agent),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                where_cell(
+                    app,
+                    agent.machine.as_deref(),
                     agent.pane_target.as_deref(),
                     pane.as_ref().map(|p| p.attached).unwrap_or(false),
                 ),
@@ -366,7 +385,14 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
         f,
         area,
         vec![
-            "ID", "TITLE", "AUTHOR", "STATUS", "CI", "👍", "COMMENTS", "LOCAL",
+            "ID",
+            "TITLE",
+            "AUTHOR",
+            "STATUS",
+            "CI",
+            "👍",
+            "COMMENTS",
+            "LOCAL / WHERE",
         ],
         vec![
             Constraint::Length(14),
@@ -376,7 +402,7 @@ pub fn draw(f: &mut Frame, area: Rect, _app: &mut App, nodes: &[Node], selected:
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(12),
-            Constraint::Min(26),
+            Constraint::Min(34),
         ],
         rows,
         selected,
